@@ -64,17 +64,63 @@ class DiscordMessageSink(Sink):
         message,
         edit_interval: float = 1.2,
         max_length: int = 1900,
+        continuation_marker: str = "…",
     ) -> None:
-        self.message = message
+        # `messages` grows as the reply overflows past `max_length`. The
+        # first element is the placeholder we were handed; subsequent ones
+        # are sent via channel.send as continuations land.
+        self.messages = [message]
         self.edit_interval = edit_interval
         self.max_length = max_length
+        self.continuation = continuation_marker
         self._last_edit = 0.0
         self._last_text = ""
 
-    def _truncate(self, text: str) -> str:
-        if len(text) <= self.max_length:
-            return text
-        return text[: self.max_length - 20] + "\n\n…[truncated]"
+    def _chunk(self, text: str) -> list[str]:
+        """Split text into <=max_length chunks, preferring natural boundaries
+        (paragraph > newline > sentence > word > hard cut)."""
+        if not text:
+            return [""]
+        chunks: list[str] = []
+        remaining = text
+        min_break = self.max_length // 3  # avoid tiny first chunks
+        while len(remaining) > self.max_length:
+            window = remaining[: self.max_length]
+            candidates = [
+                window.rfind("\n\n"),
+                window.rfind("\n"),
+                (window.rfind(". ") + 2) if window.rfind(". ") >= 0 else -1,
+                (window.rfind("? ") + 2) if window.rfind("? ") >= 0 else -1,
+                window.rfind(" "),
+            ]
+            split_at = max(
+                (c for c in candidates if c > min_break),
+                default=self.max_length,
+            )
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip()
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    async def _flush(self, text: str, finalizing: bool) -> None:
+        chunks = self._chunk(text)
+        channel = self.messages[0].channel
+        # Add placeholders for new overflow chunks.
+        while len(self.messages) < len(chunks):
+            try:
+                new_msg = await channel.send(self.continuation)
+                self.messages.append(new_msg)
+            except Exception:
+                return  # couldn't allocate — skip this flush, try again next tick
+        # Edit each message to its chunk content.
+        empty_placeholder = "*(no output)*" if finalizing else self.continuation
+        for msg, chunk in zip(self.messages, chunks):
+            content = chunk[: self.max_length] if chunk else empty_placeholder
+            try:
+                await msg.edit(content=content)
+            except Exception:
+                pass
 
     async def update(self, text: str) -> None:
         now = time.monotonic()
@@ -82,19 +128,12 @@ class DiscordMessageSink(Sink):
             return
         if text == self._last_text:
             return
-        try:
-            await self.message.edit(content=self._truncate(text) or "…")
-            self._last_edit = now
-            self._last_text = text
-        except Exception:
-            # Rate-limited or transient — next update will retry.
-            pass
+        await self._flush(text, finalizing=False)
+        self._last_edit = now
+        self._last_text = text
 
     async def finalize(self, text: str) -> None:
-        try:
-            await self.message.edit(content=self._truncate(text) or "*(no output)*")
-        except Exception:
-            pass
+        await self._flush(text, finalizing=True)
 
 
 # ---- Trajectory logger ------------------------------------------------

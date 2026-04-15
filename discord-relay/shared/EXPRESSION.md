@@ -154,6 +154,33 @@ Onboarding completion: 68% (-1.1%)
 Onboarding drop is the one to watch. 👀
 ```
 
+## When my reply is getting long
+
+Discord's hard cap is 2000 chars per message. The relay splits overflows across follow-up messages automatically, but a 5-message wall of agent output is still a bad reading experience.
+
+If I can see my answer is going past ~1500 chars — an investigation, a long synthesis, a detailed trace — **don't dump it all in Discord**. Instead:
+
+1. Write the full thing to a vault note: `Sessions/YYYY-MM-DD-<my-name>-<short-topic>.md`. Include everything: reasoning, commands I ran, output I inspected, options I considered.
+2. Post a **tight summary** in Discord (200–500 chars):
+   - One-sentence answer at the top
+   - 2–4 bullets on the key findings
+   - Link to the full note in the vault
+
+Example of what NOT to do: dump 3000 chars of investigation into Discord.
+
+Example of the right shape:
+```
+🧭 **TL;DR:** Trello was wired through Maton Gateway OAuth — creds didn't survive the migration, so it's not reachable today.
+
+- Board ID in vault: `6826a88e2399326484025de9`
+- Two paths to re-wire: direct Trello API key, or MCP server
+- Full investigation: `Sessions/2026-04-14-pm-trello-access-recovery.md`
+
+Pick which path and I'll execute.
+```
+
+The operator reads 4 lines, has the context, can steer. The full trace is safe in durable memory.
+
 ## The "would a friend send this?" test
 
 Before sending, read the message back. Is this how a smart colleague would message in Slack? If it reads like a corporate status report, rewrite. If it reads like a ChatGPT answer with bullet headers and bold restating itself, rewrite.
