@@ -3,12 +3,16 @@ ClaudeAgentOptions. One agent per Discord channel."""
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+_CRONTAB_RE = re.compile(r"\bcrontab\b")
+_CRONTAB_READONLY_RE = re.compile(r"^\s+(-l|--list)\b")
+
 import yaml
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
 ROOT = Path(__file__).parent
 AGENTS_DIR = ROOT / "agents"
@@ -46,7 +50,7 @@ def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
 
 
 # Order matters: identity first, then how to behave, who you serve,
-# workspace contract, env-specific config, connected services.
+# workspace contract, env-specific config, connected services, protocols.
 LAYERED_FILES = [
     "IDENTITY.md",
     "SOUL.md",
@@ -54,7 +58,44 @@ LAYERED_FILES = [
     "AGENTS.md",
     "TOOLS.md",
     "INTEGRATIONS.md",
+    "SCHEDULING.md",
 ]
+
+
+def _has_unsafe_crontab(cmd: str) -> bool:
+    """Scan every `crontab` occurrence. Anything other than -l/--list writes."""
+    for m in _CRONTAB_RE.finditer(cmd):
+        if not _CRONTAB_READONLY_RE.match(cmd[m.end() :]):
+            return True
+    return False
+
+
+async def _block_raw_crontab(input_data, tool_use_id, context):
+    """PreToolUse hook: deny raw `crontab` write invocations. Agents must go
+    through `cron/install.py` which only touches the managed block."""
+    if input_data.get("tool_name") != "Bash":
+        return {}
+    cmd = input_data.get("tool_input", {}).get("command", "") or ""
+    if "crontab" not in cmd:
+        return {}
+    # Whitelist: anything through the managed installer.
+    if "cron/install.py" in cmd:
+        return {}
+    # Allow read-only crontab usage.
+    if not _has_unsafe_crontab(cmd):
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                "Raw `crontab` write is blocked. Use `python "
+                "/Users/celainc/Developers/ClaudeAgentSDK/discord-relay/"
+                "cron/install.py` to manage the discord-relay block. "
+                "See SCHEDULING.md."
+            ),
+        }
+    }
 
 
 def _load_layered_prompt(agent_dir: Path) -> str:
@@ -125,6 +166,13 @@ def load_agent(name: str) -> AgentConfig:
 
     mcp_servers = agent_cfg.get("mcp_servers") or {}
 
+    add_dirs = list(
+        {
+            *(defaults.get("add_dirs") or []),
+            *(agent_cfg.get("add_dirs") or []),
+        }
+    )
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -134,7 +182,13 @@ def load_agent(name: str) -> AgentConfig:
         max_turns=agent_cfg.get("max_turns") or defaults.get("max_turns"),
         model=agent_cfg.get("model") or defaults.get("model"),
         cwd=cwd,
+        add_dirs=add_dirs,
         mcp_servers=mcp_servers,
+        hooks={
+            "PreToolUse": [
+                HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
+            ],
+        },
         include_partial_messages=True,  # enable token-level streaming
     )
 

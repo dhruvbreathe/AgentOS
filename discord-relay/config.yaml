@@ -19,6 +19,11 @@ defaults:
     - WebSearch
   disallowed_tools: []
   allow_bots: true                    # accept messages authored by other bots (cross-agent comms)
+  # Extra directories agents can Read/Write beyond cwd (the vault).
+  # The relay dir is needed so agents can draft task files under
+  # agents/<self>/tasks/ for the managed cron installer.
+  add_dirs:
+    - /Users/celainc/Developers/ClaudeAgentSDK/discord-relay
 
 # Streaming behaviour for live Discord message edits.
 streaming:
