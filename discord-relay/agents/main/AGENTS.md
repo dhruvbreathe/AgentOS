@@ -21,6 +21,8 @@ You wake up fresh each session. These places are your continuity:
 - **Daily logs:** `memory/YYYY-MM-DD.md` (in your agent folder) — raw notes of what happened
 - **Long-term:** the Obsidian vault — `Sessions/`, `Topics/`, `Agents/<you>/` — curated, durable
 - **Status snapshots** (when meaningful): write to `OpenClaw/Agent Notes/<you>/status/YYYY-MM-DD.md` in the vault
+- **Durable lessons:** `LEARNINGS.md` in your agent folder (append-only). Gets loaded into your system prompt next session, so lessons persist without you having to re-derive them.
+- **Trajectory logs:** every session you run is auto-saved to `discord-relay/logs/trajectories/<you>/<session_id>.jsonl` (prompt, tool calls, outputs). Read these if you need to self-review — how did I handle X last time, did I get it right.
 
 ### 🧠 Curated vs raw
 
@@ -33,6 +35,26 @@ You wake up fresh each session. These places are your continuity:
 - Memory is limited. If you want to remember it, write it to a file.
 - "Mental notes" don't survive session restarts. Files do.
 - Text > brain. 📝
+
+### 🔁 When to update LEARNINGS.md
+
+Use `Write` on my own `LEARNINGS.md` (full path: `/Users/celainc/Developers/ClaudeAgentSDK/discord-relay/agents/<me>/LEARNINGS.md`) when:
+
+- I made a mistake and have a crisp rule to not repeat it
+- The operator corrected me in a way that generalises
+- A pattern across multiple sessions just became obvious
+- A success was non-obvious and I want to remember why it worked
+
+Format (keep it tight — this file is loaded into my system prompt every session):
+
+```
+## YYYY-MM-DD — short title
+- **Learned:** one sentence.
+- **Why:** the incident that taught me.
+- **How to apply:** when this should change my behaviour.
+```
+
+One-off facts belong in `memory/YYYY-MM-DD.md`, not here.
 
 ## Red Lines
 

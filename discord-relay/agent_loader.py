@@ -59,6 +59,7 @@ LAYERED_FILES = [
     "TOOLS.md",
     "INTEGRATIONS.md",
     "SCHEDULING.md",
+    "LEARNINGS.md",
 ]
 
 

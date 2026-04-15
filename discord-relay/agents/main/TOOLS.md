@@ -11,6 +11,8 @@
 - Canonical: `Company/OPERATING-SYSTEM.md`, `Company/CONTEXT.md`, `Company/DECISIONS.md`, `Company/STRATEGY.md`
 - Active control plane: `Agents/TASKS.md`, `Agents/HANDOFFS.md`, `Daily/YYYY-MM-DD.md`
 - My daily memory: `agents/main/memory/YYYY-MM-DD.md` (this workspace)
+- My durable lessons: `agents/main/LEARNINGS.md` (loaded into my system prompt)
+- My trajectories (what I did, per session): `logs/trajectories/main/<session_id>.jsonl`
 - My status log: `OpenClaw/Agent Notes/main/status/YYYY-MM-DD.md` (vault)
 
 ## Discord
