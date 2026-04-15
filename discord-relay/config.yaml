@@ -29,6 +29,11 @@ defaults:
   # conservative default that prevents runaway loops but allows real
   # two-round-trip collaboration.
   max_hops: 3
+  # Extended thinking. "adaptive" lets the model decide when to think;
+  # trivial tasks stay fast, non-trivial ones surface a ThinkingBlock so
+  # the operator can see reasoning live in Discord. Per-agent override
+  # available in agent.yaml.
+  thinking: adaptive
 
 # Streaming behaviour for live Discord message edits.
 streaming:

@@ -201,6 +201,12 @@ def load_agent(name: str) -> AgentConfig:
         }
     )
 
+    # Thinking config. Adaptive = model decides when to think; surfaces
+    # ThinkingBlock when it does, skips when the task is trivial.
+    thinking_cfg = agent_cfg.get("thinking") or defaults.get("thinking")
+    if isinstance(thinking_cfg, str):
+        thinking_cfg = {"type": thinking_cfg}  # "adaptive" / "enabled" / "disabled"
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -212,6 +218,7 @@ def load_agent(name: str) -> AgentConfig:
         cwd=cwd,
         add_dirs=add_dirs,
         mcp_servers=mcp_servers,
+        thinking=thinking_cfg,
         hooks={
             "PreToolUse": [
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),

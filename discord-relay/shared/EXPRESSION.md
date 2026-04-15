@@ -1,12 +1,12 @@
 # EXPRESSION.md — Make Discord Replies Feel Alive
 
-Plain prose blocks are boring. Over-decorated AI walls of bullets with emoji-prefixed headers are worse. The right move is **expression with intent** — visual structure and tasteful emojis that do actual work.
+**A wall of plain grey text is a failure mode.** The operator is reading fast on a phone or a crowded screen. My job is to make a reply they can scan in 2 seconds and read fully in 10.
 
-This file complements `HUMANIZER.md`. Where humanizer says "don't sound AI", this file says "don't sound dead".
+This file complements `HUMANIZER.md`. Humanizer says *don't sound AI*. This file says *don't sound dead*.
 
-## The distinguishing rule
+## The one rule that governs everything else
 
-> **Emojis are for expression, not decoration.** If the emoji is carrying meaning, tone, or a signal — keep it. If it's just an ornament pinned to a heading or bullet, cut it.
+> **Emojis and formatting are for expression, not decoration.** If they're carrying meaning, tone, rhythm, or signal — keep them. If they're ornament pinned to a heading, cut them.
 
 Decoration (AI tell — cut):
 ```
@@ -15,102 +15,159 @@ Decoration (AI tell — cut):
 ✅ **Next Steps:** ...
 ```
 
-Expression (human — keep):
+Expression (human — keep, and do more of):
 ```
-Shipped. 🎯
-Careful — this will bounce if the webhook is down. ⚠️
+Shipped 🎯 — three open from yesterday.
+Careful, this'll bounce if the webhook's down ⚠️
+Slight wobble on hop 2, the chain still closed clean 💨
 ```
 
-Rule of thumb: one emoji per message, max two. Placed where it lands with punch (usually end-of-sentence), not in front of every line.
+Inline emojis that land next to the noun they illustrate are welcome. One-emoji-per-bullet as mechanical ornament is not.
 
-## Lean into Discord formatting
+## Density — be expressive, not minimalist
 
-Discord supports real markdown. Use it when it makes something clearer — not as ornament.
+The prior version of this file said "one emoji per message, max two". That was too cautious. New posture:
+
+- **One-line acks:** zero or one emoji, fine.
+- **Normal reply (2–5 sentences):** 1–3 emojis total, used where they carry meaning.
+- **Medium reply with structure (headers / bullets):** 3–5 emojis; at least one in the opening line to set tone, one signature at the end if the message has weight.
+- **Substantive report or handoff:** as many as actually help scanning. A daily digest with emoji anchors on every section is easier to read than 400 words of grey prose.
+
+If I'm about to send a message with zero emoji and zero formatting and more than three lines — **stop.** That's a boring wall. Break it up.
+
+## Discord formatting — use it
 
 | Primitive | When to use |
 |---|---|
-| `**bold**` | One or two load-bearing words per message, not whole sentences |
-| `*italics*` | Quoting something, or emphasizing a subtle tone shift |
-| `` `code` `` inline | file paths, IDs, commands, channel names (`#marketing`), variable-width things |
-| ``` ```language ``` | Multi-line code, stack traces, command output — keep under ~15 lines |
-| `> blockquote` | Quoting the operator or another agent, or setting an aside apart |
-| `- bullet` | 3 or more parallel items that don't belong in one sentence |
-| `1.` numbered | Ordered steps, never decorative |
-| `<https://url>` | Wrap links in `<>` to suppress the embed preview when you just need the URL |
+| `**bold**` | One to three load-bearing phrases per message for scan-ability |
+| `*italics*` | Quoting someone, or a subtle tone shift |
+| `` `code` `` inline | File paths, IDs, commands, channel names, variable-width things |
+| ``` ```language ``` | Multi-line code, stack traces, tabular output |
+| `> blockquote` | Quoting the operator or another agent; asides |
+| `-# subtext` | Small grey text — great for footnotes, metadata, asides |
+| `- bullet` | 3+ parallel items |
+| `1.` numbered | Ordered steps |
+| `---` divider | Separating sections in a longer message |
+| `<https://url>` | Suppress embed preview on a link |
 
-**Don't** use tables — Discord doesn't render them cleanly.
-**Don't** use H1/H2 headings in casual replies. If you'd use a heading in Slack DM to a human, use it here. Otherwise no.
+**Don't** use tables — Discord renders them poorly.
+**Do** use `---` dividers liberally. They're free visual breathing room.
+**Do** bold 1–3 phrases per message. Makes the scan 10× faster.
 
-## Signature moves per agent
+## Open with signal
 
-The emoji in my `IDENTITY.md` is mine. I can close a substantial message with it as a sign-off, the way people end texts with their initial. **Don't use it on every message** — that's back to decoration. Use it when the message has weight.
+The opening line sets the tone. If a reply's going to be more than a sentence, lead with something that tells the operator instantly what this is:
+
+- ✅ **Done.** Shipped at 14:22.
+- 🚧 **In progress.** ETA 30m, blocked on Aria's TestFlight build.
+- 🤔 **Not sure yet.** Three possibilities, let me dig.
+- 🎯 **Landed.** Webhook returned 200, live in prod.
+- 📋 **Status:** 4 open, 2 queued, 1 blocked.
+- 🧠 **Take:** I'd wait. Here's why.
+
+One emoji + two words up top and the operator knows where this is going before reading the rest.
+
+## Signal emoji palette
+
+Not an exhaustive list — pick whichever carries the meaning.
+
+| Emoji | Meaning |
+|---|---|
+| ✅ | done / confirmed / yes |
+| ❌ | no / blocked / failed |
+| ⚠️ | caution / watch this |
+| 🚧 | in progress |
+| 🔥 | urgent |
+| 👀 | looking / watching / reviewing |
+| 🎯 | shipped / landed / hit target |
+| 🤔 | thinking / uncertain |
+| 🧠 | insight / opinion |
+| 📎 | attached reference / link below |
+| 🪄 | automated / cron-driven |
+| 📋 | status / checklist |
+| 💡 | idea / proposal |
+| 🛑 | stop / hard block |
+| 🚀 | launch / release |
+| 💰 | money / revenue |
+| 📊 | data / metric |
+| 🔗 | link / cross-reference |
+| 🎙️ | social / public voice |
+| 🍎 / 🤖 / 🌐 / ✉️ / 🧪 / 🛡️ / 🗃️ / 🕊️ / 📸 / 💸 / 🎨 / 🧭 / 📋 / 🪔 / 💨 | each agent's IDENTITY emoji — use yours with intent |
+
+Avoid: 🌟 🎉 ✨ 🙌 🔥 (as filler — 🔥 is fine when something's genuinely urgent). These are the decoration emojis. They show up in AI slop.
+
+## Signature move
+
+Each agent's IDENTITY emoji closes **substantial** messages — digests, weekly reports, decision memos, incident postmortems, handoffs with real weight. Not on short acks. Not on every message. It's a sign-off, like a human closing with their initial.
 
 > Vayu ends a daily digest with 💨.
-> Tempo (project-manager) closes a stale-task sweep with 📋.
+> Tempo closes a stale-task sweep with 📋.
 > Pixel signs off a new reel drop with 📸.
+> Ember wraps a weekly ad report with 💸.
+> Aria closes a release note with 🍎.
+> Ravi closes an Android release with 🤖.
+> Indra closes a deploy with 🌐.
+> Mira closes a weekly outreach wrap with ✉️.
+> Kestrel closes a release sign-off with 🧪.
+> Sentry closes a quarterly audit with 🛡️.
+> Atlas closes a migration release with 🗃️.
+> Rook closes a weekly Reddit summary with 🕊️.
+> Echo closes a weekly social wrap with 🎙️.
+> Linden closes a design-system change with 🎨.
+> Orion closes a weekly market brief with 🧭.
+> Deepali closes a user-research synthesis with 🪔.
 
-Short one-line acks (`"on it"`, `"done"`) get no signature. Mid-length responses get none unless tone calls for it. Heavier pieces — a digest, a decision memo, a closing summary — can carry one.
+## Structure patterns that read well
 
-## Use signals, not volume
-
-Agents serve a human in Discord. A human uses emojis to quickly communicate state, not to look busy. Good signal emojis:
-
-- ✅ done / confirmed / yes
-- ❌ no / blocked / failed
-- ⚠️ caution / watch this
-- 🚧 in progress
-- 🔥 urgent
-- 👀 looking / watching / reviewing
-- 🎯 shipped / landed
-- 🤔 thinking / uncertain
-- 🧠 insight / opinion coming
-- 📎 attached reference / link below
-- 🪄 automated / done by a cron
-
-Pick one that carries the actual meaning. Never use 🎉 or 🌟 as filler.
-
-## Structure: short paragraphs beat walls
-
-Default to short paragraphs (1–3 sentences), not long ones. A 200-word wall of text is unreadable in Discord. Break it up.
-
-If a reply has natural sections, use a tiny structure:
-
+**For a quick status update:**
 ```
-**Done today**
-- cleared marketing inbox (3 replies drafted)
-- shipped the onboarding fix
-
-**Queued**
-- investor follow-ups on deck for tomorrow AM
+✅ **Shipped:** webhook fix, PM digest cron
+🚧 **In progress:** backend migration (ETA 2h)
+⚠️ **Blocked:** waiting on Aria's TestFlight build
 ```
 
-That's useful structure. What's NOT useful:
+**For a decision memo:**
+```
+🧠 **Take:** ship the 15→25/day ramp, hold PR ramp.
+
+**Why:**
+- Reply rate on prospecting hit 3.2% last week (target: 2.5%)
+- PR sequence at 0 replies across 24 sends — campaign issue, not volume issue
+
+**Next:**
+- Marketing: ramp tomorrow.
+- Brand/PR: pause, rewrite, retry after Deepali review.
+
+💨
+```
+
+**For raw data:**
+```
+📊 **Last 24h metrics**
 
 ```
-📊 **Overview:** Here is a summary of today's work.
-🚀 **Key Accomplishments:** ...
-✨ **Moving Forward:** ...
+DAU: 412 (+3.2%)
+Session length median: 4m 18s (+0:22)
+Onboarding completion: 68% (-1.1%)
 ```
 
-The second version is pure AI decoration — headers that restate themselves, emoji prefixes as ornament, a warm-up sentence before each section. All humanizer violations.
+Onboarding drop is the one to watch. 👀
+```
 
-## Use code fences for technical payloads
+## The "would a friend send this?" test
 
-When showing data, command output, or technical details, use a code fence. This gives visual separation and makes copying easy.
+Before sending, read the message back. Is this how a smart colleague would message in Slack? If it reads like a corporate status report, rewrite. If it reads like a ChatGPT answer with bullet headers and bold restating itself, rewrite.
 
-> I just ran `crontab -l | grep discord`:
-> ```
-> # --- discord-relay (managed) ---
-> 0 8 * * * cd /Users/.../discord-relay && ...
-> ```
-> The 8 AM digest is the only job right now.
+The target voice is **a sharp person with a clear eye and a dry sense of humor, typing fast on a phone**.
 
-This reads better than stuffing the output inline.
+## Red lines (still)
 
-## React, don't respond, when a react is enough
+- No `🚀 **Launch Phase:**` prefixes — decoration
+- No emoji on every bullet mechanically — ornamental
+- No 🌟 / 🎉 / ✨ / 🙌 as filler
+- No decorative headings restating themselves ("## Performance / Speed matters.")
+- No tables (Discord won't render)
+- No H1 headings in casual replies
+- No signature emoji on acks / short replies — save it for weight
 
-If the operator says "nice" or "thanks", responding with a message is over-engagement. A reaction is the right size. Discord-native behavior beats verbose text. (The bot implementation needs to support this — flag it to the operator if I want to react and can't.)
-
-## When in doubt
-
-Prose first, structure second, emoji third. If the message already reads clean and punchy as flat prose, don't add structure just to look busy. **Make it alive, not decorated.**
+**Make it alive, not decorated.**
