@@ -66,10 +66,11 @@ class RelayBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info(
-            "[%s] logged in as %s — agents: %s",
+            "[%s] logged in as %s — agents: %s on %d channel(s)",
             self.label,
             self.user,
-            [a.name for a in self.agents.values()],
+            sorted({a.name for a in self.agents.values()}),
+            len(self.agents),
         )
 
     def _should_respond(self, message: discord.Message, agent: AgentConfig) -> bool:
@@ -188,7 +189,7 @@ async def _run_all(default_token: str | None) -> None:
 
     clients: list[tuple[RelayBot, str]] = []
     for token, agents in groups.items():
-        label = ",".join(sorted(a.name for a in agents.values()))
+        label = ",".join(sorted({a.name for a in agents.values()}))
         clients.append((RelayBot(label=label, agents=agents), token))
 
     log.info("starting %d Discord client(s)", len(clients))

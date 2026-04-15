@@ -27,7 +27,7 @@ SHARED_FILES = ["HUMANIZER.md", "EXPRESSION.md", "AGENT_COMMS.md"]
 @dataclass
 class AgentConfig:
     name: str
-    channel_id: str
+    channel_ids: list[str]  # primary first, any extras after
     webhook_url: str | None
     system_prompt: str
     options: ClaudeAgentOptions
@@ -35,6 +35,12 @@ class AgentConfig:
     allow_bots: bool = True
     tasks_dir: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def channel_id(self) -> str:
+        """Primary channel — used for webhook creation and as the canonical
+        target for `send_to_agent`."""
+        return self.channel_ids[0]
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -214,9 +220,13 @@ def load_agent(name: str) -> AgentConfig:
         include_partial_messages=True,  # enable token-level streaming
     )
 
+    primary = str(agent_cfg["channel_id"])
+    extras = [str(c) for c in (agent_cfg.get("extra_channel_ids") or [])]
+    channel_ids = [primary, *extras]
+
     return AgentConfig(
         name=name,
-        channel_id=str(agent_cfg["channel_id"]),
+        channel_ids=channel_ids,
         webhook_url=webhook_url,
         system_prompt=system_prompt,
         options=options,
@@ -240,7 +250,8 @@ def load_all_agents() -> dict[str, AgentConfig]:
             continue  # skip _template/, _base/, hidden dirs
         if child.is_dir() and (child / "agent.yaml").exists():
             cfg = load_agent(child.name)
-            out[cfg.channel_id] = cfg
+            for cid in cfg.channel_ids:
+                out[cid] = cfg
     return out
 
 

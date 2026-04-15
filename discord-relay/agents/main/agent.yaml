@@ -1,6 +1,10 @@
 name: main
-channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main
-# Env var holding the outbound webhook URL (defined in .env)
+channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main (primary)
+# Additional channels Vayu also responds in, with the same persona + bot identity.
+extra_channel_ids:
+  - "1477129158114152570"           # #research-labs
+# Env var holding the outbound webhook URL (defined in .env). Webhook lives
+# in the primary channel — that's where cross-agent comms target.
 webhook_url_env: MAIN_WEBHOOK_URL
 
 # Using layered files (SOUL/IDENTITY/AGENTS/USER/TOOLS/INTEGRATIONS) —
