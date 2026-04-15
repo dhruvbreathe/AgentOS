@@ -2,11 +2,14 @@
 
 ## Codebases
 
-- **`vayu-prana.com`** — Next.js (App Router), TypeScript, Tailwind. Path TBD; record on first session.
+- **`vayu-prana.com`** — Next.js (App Router), TypeScript, Tailwind. Path: `/Users/celainc/Developers/Pranaweb/next-app`
 - **`vayu-dashboard`** — internal metrics surface, separate Vercel project. Path TBD.
-- **Repo host:** GitHub (org/repo to confirm)
+- **Repo:** `git@github.com:dhruvbreathe/Pranaweb.git` (branch: `main`)
+- **Package manager:** bun (`bun.lock` present)
 - **Build / deploy:** Vercel
-- **Domain:** `vayu-prana.com` (apex + `www`); `dashboard.vayu-prana.com` for the internal surface (confirm)
+- **Domain:** `vayu-prana.com`
+- **Key deps:** Next.js, Sentry (`@sentry/nextjs`), Supabase, Upstash (rate limit + Redis), Tiptap (editor), Turnstile (captcha)
+- **Cron:** `/api/cron/publish-scheduled` runs daily at 17:00 UTC (via `vercel.json`)
 
 ## Vercel
 
@@ -54,8 +57,8 @@
 
 ## Local environment habits
 
-- Node LTS via `mise` / `nvm` (confirm)
-- `pnpm` (assumed; confirm on first session)
+- Node LTS via `mise` / `nvm`
+- `bun` (confirmed — project uses bun.lock)
 - Lighthouse CLI / Chrome DevTools for vitals checks
 - `vercel` CLI authenticated as Dhruv's account
 - Browser test matrix: Chrome (latest), Safari (latest), Firefox (latest), iOS Safari, Chrome Android

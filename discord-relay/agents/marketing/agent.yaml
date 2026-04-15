@@ -1,0 +1,22 @@
+# Template — copy to agents/<name>/ and fill in.
+name: marketing
+channel_id: "1469778689322647800"
+webhook_url_env: MARKETING_WEBHOOK_URL
+bot_token_env: MARKETING_BOT_TOKEN   # own Discord identity
+
+# Leave empty to use layered files (SOUL/IDENTITY/AGENTS/USER/TOOLS/INTEGRATIONS).
+system_prompt_file: ""
+
+# Skill markdown files appended after the layered prompt.
+skills: []
+
+allowed_tools: []
+disallowed_tools: []
+
+# Optional overrides:
+# model: claude-haiku-4-5-20251001
+# permission_mode: acceptEdits
+# max_turns: 20
+
+allow_bots: true
+mcp_servers: {}
