@@ -22,11 +22,12 @@ _status() {
     echo "bot: ✅ running"
     ps -o pid,lstart,cmd -p $pids 2>/dev/null | head -5 || true
     if [ -f "$LOG" ]; then
-        local up
+        local up want
         up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
-        local want
-        want="$(ls -1 agents/ | grep -Ev '^(_|\.)' | wc -l | tr -d ' ')"
-        echo "clients: $up / $want declared"
+        up="${up:-0}"
+        want="$(grep -oE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+        want="${want:-?}"
+        echo "clients: $up / $want"
     fi
     return 0
 }
@@ -51,11 +52,19 @@ BOT_PID=$!
 echo "pid: $BOT_PID"
 
 echo "── waiting for clients to connect ──"
-want="$(ls -1 agents/ | grep -Ev '^(_|\.)' | wc -l | tr -d ' ')"
+# `want` = the N the bot announces at startup ("starting N Discord client(s)").
+# That's agents grouped by unique bot_token, which is the real Discord client count.
+want=""
+for i in $(seq 1 10); do
+    want="$(grep -oE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+    [ -n "$want" ] && break
+    sleep 1
+done
+want="${want:-0}"
 for i in $(seq 1 40); do
     up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
     up="${up:-0}"
-    if [ "${up:-0}" -ge "${want:-0}" ]; then
+    if [ "$want" -gt 0 ] && [ "${up:-0}" -ge "${want:-0}" ]; then
         echo "✅ $up/$want clients up"
         break
     fi

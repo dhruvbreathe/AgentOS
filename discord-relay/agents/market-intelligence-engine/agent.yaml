@@ -19,4 +19,7 @@ disallowed_tools: []
 # max_turns: 20
 
 allow_bots: true
-mcp_servers: {}
+mcp_servers:
+  biorxiv:
+    type: "mcp"
+    note: "bioRxiv access for monitoring research trends, competitor publications, and emerging science"

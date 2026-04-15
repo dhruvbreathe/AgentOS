@@ -1,0 +1,16 @@
+name: research-labs
+channel_id: "1477129158114152570"
+webhook_url_env: RESEARCH_LABS_WEBHOOK_URL
+
+system_prompt_file: ""
+
+skills: []
+
+allowed_tools: []
+disallowed_tools: []
+
+allow_bots: true
+mcp_servers:
+  biorxiv:
+    type: "mcp"
+    note: "bioRxiv access for monitoring new preprints and searching life sciences literature"

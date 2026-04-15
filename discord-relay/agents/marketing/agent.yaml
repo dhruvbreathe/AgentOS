@@ -19,4 +19,10 @@ disallowed_tools: []
 # max_turns: 20
 
 allow_bots: true
-mcp_servers: {}
+mcp_servers:
+  apollo:
+    type: "mcp"
+    note: "Apollo.io CRM access for prospect search, contact enrichment, and outreach campaigns"
+  gmail:
+    type: "mcp"
+    note: "Gmail access for sending and managing outreach emails"

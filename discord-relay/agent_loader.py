@@ -221,8 +221,34 @@ def load_agent(name: str) -> AgentConfig:
     global_cfg = load_global()
     defaults = global_cfg.get("defaults", {}) or {}
 
+    # Parse mcp_servers early so note-only entries can be folded into the
+    # system prompt as "integrations available" hints.
+    raw_mcp = agent_cfg.get("mcp_servers") or {}
+    mcp_servers: dict[str, Any] = {}
+    mcp_notes: list[tuple[str, str]] = []
+    for mcp_name, mcp_cfg in raw_mcp.items():
+        if isinstance(mcp_cfg, dict) and (
+            "command" in mcp_cfg or "url" in mcp_cfg or "instance" in mcp_cfg
+        ):
+            mcp_servers[mcp_name] = mcp_cfg
+        else:
+            note = (
+                (mcp_cfg or {}).get("note") if isinstance(mcp_cfg, dict) else str(mcp_cfg)
+            )
+            mcp_notes.append((mcp_name, note or "(no description)"))
+
+    mcp_note_block = ""
+    if mcp_notes:
+        lines = [f"- **{n}** — {d}" for n, d in mcp_notes]
+        mcp_note_block = (
+            "## Integrations available via parent MCP\n\n"
+            "These services are reachable through the Claude Code CLI's "
+            "shared MCP servers (not a per-agent stdio transport). Use them "
+            "when the task requires them.\n\n" + "\n".join(lines)
+        )
+
     # System prompt: shared universals + layered per-agent files + optional
-    # legacy system_prompt.md + skills.
+    # legacy system_prompt.md + skills + inline integration notes.
     shared = _load_shared_prompt()
     layered = _load_layered_prompt(agent_dir)
     legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
@@ -234,7 +260,10 @@ def load_agent(name: str) -> AgentConfig:
     skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
 
     system_prompt = "\n\n".join(
-        [p for p in (shared, layered, legacy_sp.rstrip(), skills) if p]
+        [
+            p for p in (shared, layered, legacy_sp.rstrip(), skills, mcp_note_block)
+            if p
+        ]
     )
 
     # Webhook URL (for outbound posting via cron or cross-agent replies)
@@ -261,7 +290,7 @@ def load_agent(name: str) -> AgentConfig:
 
     cwd = agent_cfg.get("cwd") or _resolve_vault_path(global_cfg)
 
-    mcp_servers = agent_cfg.get("mcp_servers") or {}
+    # mcp_servers was parsed above (split into valid configs + prompt notes).
 
     add_dirs = list(
         {

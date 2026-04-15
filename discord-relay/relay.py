@@ -268,6 +268,7 @@ async def run_agent(
 
     buffer = ""
     session_id: str | None = None
+    stop_reason: str | None = None
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -298,16 +299,27 @@ async def run_agent(
                 elif isinstance(msg, ResultMessage):
                     if getattr(msg, "session_id", None):
                         session_id = msg.session_id
+                    stop_reason = getattr(msg, "stop_reason", None)
                     traj.result(
                         {
                             "session_id": session_id,
-                            "stop_reason": getattr(msg, "stop_reason", None),
+                            "stop_reason": stop_reason,
                             "usage": getattr(msg, "usage", None),
                         }
                     )
     finally:
         traj.close()
 
-    final = buffer.strip() or "*(agent returned no text)*"
+    # If the turn ended for a non-normal reason (max_turns hit, error,
+    # interrupt), append a visible marker so the operator sees it rather
+    # than getting a silent wall of tool calls.
+    footer = ""
+    if stop_reason and stop_reason not in ("end_turn", "stop_sequence", None):
+        footer = (
+            f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
+            f"final text reply. Ask me to continue and I'll pick up from here."
+        )
+
+    final = (buffer.strip() or "*(agent returned no text)*") + footer
     await sink.finalize(final)
     return final, session_id

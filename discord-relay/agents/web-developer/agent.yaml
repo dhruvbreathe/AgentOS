@@ -19,4 +19,7 @@ disallowed_tools: []
 # max_turns: 20
 
 allow_bots: true
-mcp_servers: {}
+mcp_servers:
+  vercel:
+    type: "mcp"
+    note: "Vercel access for deploying, managing, and monitoring web projects"

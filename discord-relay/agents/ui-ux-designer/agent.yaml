@@ -19,4 +19,7 @@ disallowed_tools: []
 # max_turns: 20
 
 allow_bots: true
-mcp_servers: {}
+mcp_servers:
+  figma:
+    type: "mcp"
+    note: "Figma access via ClaudeTalkToFigma for reading designs, components, and pushing UI changes"
