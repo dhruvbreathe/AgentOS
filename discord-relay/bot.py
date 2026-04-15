@@ -18,6 +18,7 @@ import discord
 from dotenv import load_dotenv
 
 from agent_loader import AgentConfig, load_all_agents, load_global
+from agent_tools import parse_routing_header
 from relay import DiscordMessageSink, run_agent
 
 load_dotenv()
@@ -93,10 +94,45 @@ class RelayBot(discord.Client):
         if not self._should_respond(message, agent):
             return
 
-        author = f"{message.author.display_name} ({message.author.id})"
-        prompt = (
-            f"[Discord #{message.channel.name} — from {author}]\n\n{message.content}"
+        # Parse agent-to-agent routing header if present.
+        routing = parse_routing_header(message.content)
+        max_hops = int(
+            (self.global_cfg.get("defaults", {}) or {}).get("max_hops", 3)
         )
+        current_hop = 0
+        sender = None
+        body = message.content
+
+        if routing:
+            # Self-reflection guard.
+            if routing["sender"] == agent.name:
+                return
+            # Route-target mismatch: shouldn't happen (webhooks post to target's
+            # channel), but guard anyway.
+            if routing["target"] != agent.name:
+                return
+            current_hop = routing["hop"]
+            max_hops = routing["max"]
+            sender = routing["sender"]
+            body = routing["body"].strip()
+            # Hard stop: if the incoming message is already at max_hops,
+            # the agent may read it but cannot route further. The MCP tool
+            # enforces this too; we just log for observability.
+            if current_hop >= max_hops:
+                log.info(
+                    "[%s] %s received at max_hops (%d/%d) — no outbound routing",
+                    self.label,
+                    agent.name,
+                    current_hop,
+                    max_hops,
+                )
+
+        author = (
+            f"@{sender} (agent, hop {current_hop}/{max_hops})"
+            if sender
+            else f"{message.author.display_name} ({message.author.id})"
+        )
+        prompt = f"[Discord #{message.channel.name} — from {author}]\n\n{body}"
 
         placeholder = await message.channel.send(
             self.streaming_cfg.get("thinking_indicator", "…")
@@ -112,7 +148,12 @@ class RelayBot(discord.Client):
             try:
                 await message.channel.typing()
                 _, session_id = await run_agent(
-                    agent, prompt, sink, resume_session_id=resume
+                    agent,
+                    prompt,
+                    sink,
+                    resume_session_id=resume,
+                    current_hop=current_hop,
+                    max_hops=max_hops,
                 )
                 if session_id:
                     self.sessions[channel_id] = session_id

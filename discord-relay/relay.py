@@ -28,6 +28,7 @@ from claude_agent_sdk import (
 )
 
 from agent_loader import AgentConfig
+from agent_tools import build_comms_server
 
 ROOT = Path(__file__).parent
 TRAJECTORY_ROOT = ROOT / "logs" / "trajectories"
@@ -181,8 +182,15 @@ async def run_agent(
     prompt: str,
     sink: Sink,
     resume_session_id: str | None = None,
+    current_hop: int = 0,
+    max_hops: int = 3,
 ) -> tuple[str, str | None]:
     """Run `prompt` through the agent and stream into `sink`.
+
+    `current_hop` is the hop value of the incoming message (0 for human input,
+    1+ for agent-to-agent). `max_hops` caps the chain. The agent_comms MCP
+    server is mounted fresh each turn with these values closure-captured,
+    so the `send_to_agent` tool enforces the hop limit automatically.
 
     Returns (final_text, session_id). session_id can be persisted by the
     caller to resume a conversation in the same Discord thread next time.
@@ -190,6 +198,19 @@ async def run_agent(
     options = agent.options
     if resume_session_id:
         options.resume = resume_session_id
+
+    # Mount the agent-comms MCP server with this turn's hop context.
+    comms_server = build_comms_server(
+        sender_name=agent.name, current_hop=current_hop, max_hops=max_hops
+    )
+    mcp_servers = dict(options.mcp_servers) if isinstance(options.mcp_servers, dict) else {}
+    mcp_servers["agent_comms"] = comms_server
+    options.mcp_servers = mcp_servers
+
+    # Pre-approve the tool so Claude doesn't hit a permission prompt.
+    tool_id = "mcp__agent_comms__send_to_agent"
+    if tool_id not in options.allowed_tools:
+        options.allowed_tools = [*options.allowed_tools, tool_id]
 
     traj = TrajectoryLogger(agent.name, resume_session_id)
     traj.prompt(prompt)

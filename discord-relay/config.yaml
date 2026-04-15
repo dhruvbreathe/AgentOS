@@ -24,6 +24,11 @@ defaults:
   # agents/<self>/tasks/ for the managed cron installer.
   add_dirs:
     - /Users/celainc/Developers/ClaudeAgentSDK/discord-relay
+  # Cap for agent-to-agent message chains. A hop chain of N means up to
+  # N+1 messages total (root human prompt + N agent bounces). 3 is a
+  # conservative default that prevents runaway loops but allows real
+  # two-round-trip collaboration.
+  max_hops: 3
 
 # Streaming behaviour for live Discord message edits.
 streaming:
