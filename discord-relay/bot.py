@@ -196,15 +196,20 @@ class RelayBot(discord.Client):
         async with self._channel_lock(channel_id):
             resume = self.sessions.get(channel_id)
             try:
-                await message.channel.typing()
-                _, session_id = await run_agent(
-                    agent,
-                    prompt,
-                    sink,
-                    resume_session_id=resume,
-                    current_hop=current_hop,
-                    max_hops=max_hops,
-                )
+                # `async with channel.typing():` keeps Discord's "typing..."
+                # indicator alive for the whole turn. The single-shot
+                # channel.typing() call it replaces expires after ~10s,
+                # which made long tool chains feel stuck even though work
+                # was happening.
+                async with message.channel.typing():
+                    _, session_id = await run_agent(
+                        agent,
+                        prompt,
+                        sink,
+                        resume_session_id=resume,
+                        current_hop=current_hop,
+                        max_hops=max_hops,
+                    )
                 if session_id:
                     self.sessions[channel_id] = session_id
                     _save_sessions(self.sessions)
