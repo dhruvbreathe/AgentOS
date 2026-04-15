@@ -171,10 +171,12 @@ async def _block_raw_crontab(input_data, tool_use_id, context):
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                "Raw `crontab` write is blocked. Use `python "
+                "Raw `crontab` write blocked. Run `python "
                 "/Users/celainc/Developers/ClaudeAgentSDK/discord-relay/"
-                "cron/install.py` to manage the discord-relay block. "
-                "See SCHEDULING.md."
+                "cron/install.py --apply` from your Bash tool instead — "
+                "it's whitelisted and passes this guard. YOU run it "
+                "yourself; do not ask the operator to run it from their "
+                "terminal. See SCHEDULING.md."
             ),
         }
     }

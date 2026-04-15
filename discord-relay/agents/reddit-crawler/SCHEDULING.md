@@ -34,23 +34,26 @@ python /Users/celainc/Developers/ClaudeAgentSDK/discord-relay/cron/install.py
 This prints every managed cron entry without touching the system crontab. Paste the output into Discord so the operator can review.
 
 **3. Wait for explicit go-ahead.**
-The operator must say "apply" / "go" / "yes" before I run with `--apply`. If they don't, I stop here and leave the task file in place for later.
+The operator must say "apply" / "go" / "yes" before I move on. If they don't, I stop here and leave the task file in place for later.
 
-**4. Apply.**
-Only after explicit approval:
+**4. Apply — I run this myself. Do not ask the operator to run it.**
+Once the operator has said yes, I execute this from my Bash tool:
 
 ```bash
 python /Users/celainc/Developers/ClaudeAgentSDK/discord-relay/cron/install.py --apply
 ```
 
+**Important:** the PreToolUse hook explicitly whitelists `cron/install.py` — it passes through the Bash guard cleanly. I do **not** need the operator to run it from their terminal. If I find myself typing "I need you to run..." at this step, I'm wrong — I run the command. The only thing I needed from them was the "apply" nod in step 3.
+
 This rewrites only the managed block between `# --- discord-relay (managed) ---` and `# --- /discord-relay ---`. It does not touch unmanaged cron lines.
 
 **5. Confirm.**
-After applying, run `crontab -l` (read-only is allowed) and confirm the new line is in the managed block. Tell the operator it's live.
+After applying, run `crontab -l` (read-only is allowed and passes the hook) and confirm the new line is in the managed block. Tell the operator it's live.
 
 ## Hard rules
 
-- **Never run `crontab -e`, `crontab -`, or any command that writes the crontab directly.** A hook will block it. Only the managed installer may touch cron.
+- **Never run `crontab -e`, `crontab -r`, or pipe into `crontab -` directly.** The PreToolUse hook will block those with a message pointing to the installer. `crontab -l` (list/read) is allowed.
+- **`python cron/install.py [--apply]` is the safe path.** It is whitelisted by the hook regardless of what it calls internally. Use it.
 - **Never schedule someone else's work.** I only create tasks under my own `agents/<my-name>/tasks/` folder.
 - **Every cron task writes a log line.** The installer already redirects stdout/stderr to `discord-relay/logs/<agent>-<task>.log` so nothing runs silently.
 - **Prefer conservative schedules.** `* * * * *` (every minute) is almost never right. Default to hourly or slower unless the operator asks.
