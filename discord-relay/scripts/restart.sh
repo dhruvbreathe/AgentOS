@@ -23,7 +23,7 @@ _status() {
     ps -o pid,lstart,cmd -p $pids 2>/dev/null | head -5 || true
     if [ -f "$LOG" ]; then
         local up
-        up="$(grep -c 'logged in as' "$LOG" 2>/dev/null || echo 0)"
+        up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
         local want
         want="$(ls -1 agents/ | grep -Ev '^(_|\.)' | wc -l | tr -d ' ')"
         echo "clients: $up / $want declared"
@@ -53,8 +53,9 @@ echo "pid: $BOT_PID"
 echo "── waiting for clients to connect ──"
 want="$(ls -1 agents/ | grep -Ev '^(_|\.)' | wc -l | tr -d ' ')"
 for i in $(seq 1 40); do
-    up="$(grep -c 'logged in as' "$LOG" 2>/dev/null || echo 0)"
-    if [ "$up" -ge "$want" ]; then
+    up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
+    up="${up:-0}"
+    if [ "${up:-0}" -ge "${want:-0}" ]; then
         echo "✅ $up/$want clients up"
         break
     fi
