@@ -6,8 +6,13 @@ guild_id_env: DISCORD_GUILD_ID
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
   model: null                         # null = let CLI pick (subscription default)
+  fallback_model: claude-sonnet-4-6   # if Opus rate-limits or 5xxs, fall back
   permission_mode: acceptEdits
   max_turns: 20
+  # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the
+  # project-layer (repo's .claude) is enough. Prevents your personal Claude
+  # Code hooks/MCP from leaking into agent runs.
+  setting_sources: [project]
   allowed_tools:
     - Read
     - Write

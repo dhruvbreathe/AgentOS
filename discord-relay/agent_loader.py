@@ -207,6 +207,28 @@ def load_agent(name: str) -> AgentConfig:
     if isinstance(thinking_cfg, str):
         thinking_cfg = {"type": thinking_cfg}  # "adaptive" / "enabled" / "disabled"
 
+    # Settings-source isolation. [project] means agents won't inherit
+    # ~/.claude/settings.json (the operator's personal Claude Code env).
+    setting_sources = agent_cfg.get("setting_sources") or defaults.get(
+        "setting_sources"
+    )
+
+    # Per-agent env vars. Two ways to declare them in agent.yaml:
+    #   env_passthrough: [VAR1, VAR2]  → forwarded from current shell
+    #   env: {LITERAL: "value"}        → literal key/value pairs
+    env_out: dict[str, str] = {}
+    for var in agent_cfg.get("env_passthrough", []) or []:
+        val = os.environ.get(var)
+        if val is not None:
+            env_out[var] = val
+    for k, v in (agent_cfg.get("env") or {}).items():
+        env_out[k] = str(v)
+
+    # Sandbox settings — macOS/Linux bash sandboxing. Opt-in per agent
+    # (default off); when enabled, bash is isolated from filesystem/network
+    # beyond declared permissions.
+    sandbox_cfg = agent_cfg.get("sandbox") or defaults.get("sandbox")
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -215,8 +237,13 @@ def load_agent(name: str) -> AgentConfig:
         or defaults.get("permission_mode"),
         max_turns=agent_cfg.get("max_turns") or defaults.get("max_turns"),
         model=agent_cfg.get("model") or defaults.get("model"),
+        fallback_model=agent_cfg.get("fallback_model")
+        or defaults.get("fallback_model"),
         cwd=cwd,
         add_dirs=add_dirs,
+        env=env_out,
+        setting_sources=setting_sources,
+        sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
         thinking=thinking_cfg,
         hooks={
