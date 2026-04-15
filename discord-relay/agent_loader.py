@@ -31,6 +31,7 @@ class AgentConfig:
     webhook_url: str | None
     system_prompt: str
     options: ClaudeAgentOptions
+    bot_token: str | None = None  # None → use default DISCORD_BOT_TOKEN
     allow_bots: bool = True
     tasks_dir: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -165,6 +166,10 @@ def load_agent(name: str) -> AgentConfig:
     webhook_env = agent_cfg.get("webhook_url_env")
     webhook_url = os.environ.get(webhook_env) if webhook_env else None
 
+    # Per-agent bot token (optional — falls back to DISCORD_BOT_TOKEN in bot.py)
+    bot_token_env = agent_cfg.get("bot_token_env")
+    bot_token = os.environ.get(bot_token_env) if bot_token_env else None
+
     # Merge tool lists: defaults + agent-specific
     allowed = list(
         {
@@ -215,6 +220,7 @@ def load_agent(name: str) -> AgentConfig:
         webhook_url=webhook_url,
         system_prompt=system_prompt,
         options=options,
+        bot_token=bot_token,
         allow_bots=bool(
             agent_cfg.get("allow_bots", defaults.get("allow_bots", True))
         ),
