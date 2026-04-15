@@ -16,7 +16,12 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
 ROOT = Path(__file__).parent
 AGENTS_DIR = ROOT / "agents"
+SHARED_DIR = ROOT / "shared"
 GLOBAL_CONFIG = ROOT / "config.yaml"
+
+# Universal files that get prepended to every agent's system prompt.
+# Concise, hard rules that don't vary per agent (writing style, safety, etc.).
+SHARED_FILES = ["HUMANIZER.md"]
 
 
 @dataclass
@@ -111,6 +116,16 @@ def _load_layered_prompt(agent_dir: Path) -> str:
     return "\n\n".join(chunks)
 
 
+def _load_shared_prompt() -> str:
+    """Universal rules that apply to every agent (writing style, etc.)."""
+    chunks: list[str] = []
+    for name in SHARED_FILES:
+        p = SHARED_DIR / name
+        if p.exists():
+            chunks.append(p.read_text().rstrip())
+    return "\n\n".join(chunks)
+
+
 def load_global() -> dict[str, Any]:
     return _load_yaml(GLOBAL_CONFIG)
 
@@ -130,8 +145,9 @@ def load_agent(name: str) -> AgentConfig:
     global_cfg = load_global()
     defaults = global_cfg.get("defaults", {}) or {}
 
-    # System prompt: layered files (SOUL/IDENTITY/AGENTS/...) + optional
+    # System prompt: shared universals + layered per-agent files + optional
     # legacy system_prompt.md + skills.
+    shared = _load_shared_prompt()
     layered = _load_layered_prompt(agent_dir)
     legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
     legacy_sp = ""
@@ -142,7 +158,7 @@ def load_agent(name: str) -> AgentConfig:
     skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
 
     system_prompt = "\n\n".join(
-        [p for p in (layered, legacy_sp.rstrip(), skills) if p]
+        [p for p in (shared, layered, legacy_sp.rstrip(), skills) if p]
     )
 
     # Webhook URL (for outbound posting via cron or cross-agent replies)
