@@ -1,0 +1,139 @@
+"""Loads agent configurations from agents/<name>/agent.yaml into
+ClaudeAgentOptions. One agent per Discord channel."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+from claude_agent_sdk import ClaudeAgentOptions
+
+ROOT = Path(__file__).parent
+AGENTS_DIR = ROOT / "agents"
+GLOBAL_CONFIG = ROOT / "config.yaml"
+
+
+@dataclass
+class AgentConfig:
+    name: str
+    channel_id: str
+    webhook_url: str | None
+    system_prompt: str
+    options: ClaudeAgentOptions
+    allow_bots: bool = True
+    tasks_dir: Path | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return yaml.safe_load(f) or {}
+
+
+def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
+    """Concatenate skill markdown files into one block appended to the
+    system prompt. Mirrors how CLAUDE.md skills are surfaced."""
+    parts: list[str] = []
+    for rel in skill_files:
+        p = (agent_dir / rel).resolve()
+        if p.exists():
+            parts.append(f"## Skill: {p.stem}\n\n{p.read_text()}")
+    return "\n\n".join(parts)
+
+
+def load_global() -> dict[str, Any]:
+    return _load_yaml(GLOBAL_CONFIG)
+
+
+def _resolve_vault_path(global_cfg: dict[str, Any]) -> str | None:
+    env_var = global_cfg.get("vault_path_env", "VAULT_PATH")
+    return os.environ.get(env_var)
+
+
+def load_agent(name: str) -> AgentConfig:
+    agent_dir = AGENTS_DIR / name
+    cfg_path = agent_dir / "agent.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"No agent config at {cfg_path}")
+
+    agent_cfg = _load_yaml(cfg_path)
+    global_cfg = load_global()
+    defaults = global_cfg.get("defaults", {}) or {}
+
+    # System prompt: base file + skills appended
+    sp_file = agent_dir / agent_cfg.get("system_prompt_file", "system_prompt.md")
+    base_sp = sp_file.read_text() if sp_file.exists() else ""
+    skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
+    system_prompt = base_sp + ("\n\n" + skills if skills else "")
+
+    # Webhook URL (for outbound posting via cron or cross-agent replies)
+    webhook_env = agent_cfg.get("webhook_url_env")
+    webhook_url = os.environ.get(webhook_env) if webhook_env else None
+
+    # Merge tool lists: defaults + agent-specific
+    allowed = list(
+        {
+            *(defaults.get("allowed_tools") or []),
+            *(agent_cfg.get("allowed_tools") or []),
+        }
+    )
+    disallowed = list(
+        {
+            *(defaults.get("disallowed_tools") or []),
+            *(agent_cfg.get("disallowed_tools") or []),
+        }
+    )
+
+    cwd = agent_cfg.get("cwd") or _resolve_vault_path(global_cfg)
+
+    mcp_servers = agent_cfg.get("mcp_servers") or {}
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt or None,
+        allowed_tools=allowed,
+        disallowed_tools=disallowed,
+        permission_mode=agent_cfg.get("permission_mode")
+        or defaults.get("permission_mode"),
+        max_turns=agent_cfg.get("max_turns") or defaults.get("max_turns"),
+        model=agent_cfg.get("model") or defaults.get("model"),
+        cwd=cwd,
+        mcp_servers=mcp_servers,
+        include_partial_messages=True,  # enable token-level streaming
+    )
+
+    return AgentConfig(
+        name=name,
+        channel_id=str(agent_cfg["channel_id"]),
+        webhook_url=webhook_url,
+        system_prompt=system_prompt,
+        options=options,
+        allow_bots=bool(
+            agent_cfg.get("allow_bots", defaults.get("allow_bots", True))
+        ),
+        tasks_dir=agent_dir / "tasks",
+        raw=agent_cfg,
+    )
+
+
+def load_all_agents() -> dict[str, AgentConfig]:
+    """Load every agent.yaml under agents/. Returns dict keyed by channel_id
+    for fast routing in the bot."""
+    if not AGENTS_DIR.exists():
+        return {}
+    out: dict[str, AgentConfig] = {}
+    for child in AGENTS_DIR.iterdir():
+        if child.is_dir() and (child / "agent.yaml").exists():
+            cfg = load_agent(child.name)
+            out[cfg.channel_id] = cfg
+    return out
+
+
+def load_agent_by_channel(channel_id: str) -> AgentConfig | None:
+    for cfg in load_all_agents().values():
+        if cfg.channel_id == str(channel_id):
+            return cfg
+    return None

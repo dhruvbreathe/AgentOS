@@ -1,0 +1,29 @@
+name: main
+channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main
+# Env var holding the outbound webhook URL (defined in .env)
+webhook_url_env: MAIN_WEBHOOK_URL
+
+system_prompt_file: system_prompt.md
+
+# Optional: list of skill markdown files appended to the system prompt.
+skills: []
+
+# Tools on top of the defaults in config.yaml.
+allowed_tools: []
+disallowed_tools: []
+
+# Optional per-agent overrides (otherwise inherits config.yaml/defaults).
+# model: claude-opus-4-6
+# permission_mode: acceptEdits
+# max_turns: 30
+
+# Whether to accept messages authored by other bots (cross-agent comms).
+allow_bots: true
+
+# MCP servers specific to this agent. Example:
+# mcp_servers:
+#   obsidian:
+#     type: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-obsidian"]
+mcp_servers: {}

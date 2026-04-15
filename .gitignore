@@ -1,0 +1,25 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Vendored SDK clone (install via pip instead; keeps repo small & tidy)
+claude-agent-sdk-python/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Relay runtime state
+discord-relay/logs/
+
+# macOS
+.DS_Store
+
+# Claude workspace cruft
+.claude/
+.mcp_data/
