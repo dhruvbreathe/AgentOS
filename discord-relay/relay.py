@@ -171,9 +171,21 @@ def _block_text(block) -> str | None:
     if isinstance(block, TextBlock):
         return block.text
     if isinstance(block, ThinkingBlock):
-        return None  # don't surface thinking in Discord
+        # Surface a condensed thinking summary in Discord (small text)
+        snippet = (block.thinking or "")[:200].replace("\n", " ").strip()
+        if snippet:
+            return f"\n-# 🤔 {snippet}{'...' if len(block.thinking or '') > 200 else ''}\n"
+        return None
     if isinstance(block, ToolUseBlock):
-        return f"\n🔧 `{block.name}`"
+        # Show tool name + key args for visibility
+        args_preview = ""
+        if isinstance(block.input, dict):
+            for k in ("command", "file_path", "pattern", "query", "agent", "message"):
+                if k in block.input:
+                    val = str(block.input[k])[:80]
+                    args_preview = f" → `{val}`"
+                    break
+        return f"\n🔧 `{block.name}`{args_preview}"
     return None
 
 
