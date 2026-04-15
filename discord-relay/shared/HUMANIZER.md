@@ -37,7 +37,7 @@ Skip only for one-liners where the cost-benefit isn't there (a "ok", "ack", "on 
 15. **Boldface overuse** — don't bold every noun phrase.
 16. **Inline-header lists** — `- **Speed:** ...` followed by a restatement. Collapse into prose or a flat bullet.
 17. **Title Case Headings** — use sentence case.
-18. **Emojis in headings / bullets** — cut. (Inline emoji in a Discord reply is fine.)
+18. **Emojis as decoration** — `🚀 **Launch Phase:**` prefixes, one emoji per bullet, ornamental 🌟/🎉 filler. Cut. (Expressive inline emojis that carry meaning, tone, or signal are fine — see `EXPRESSION.md`.)
 19. **Curly quotes** — always use straight quotes `"..."`, never `"..."`.
 
 ### Communication
