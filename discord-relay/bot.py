@@ -78,7 +78,9 @@ class RelayBot(discord.Client):
             return False
         if message.author.bot and not agent.allow_bots:
             return False
-        if not message.content.strip():
+        # Empty text is fine as long as there's at least an attachment —
+        # dropping a file with no caption should still trigger a response.
+        if not message.content.strip() and not message.attachments:
             return False
         return True
 
@@ -86,6 +88,36 @@ class RelayBot(discord.Client):
         if channel_id not in self._locks:
             self._locks[channel_id] = asyncio.Lock()
         return self._locks[channel_id]
+
+    async def _download_attachments(
+        self, message: discord.Message
+    ) -> list[Path]:
+        """Save any Discord attachments to local disk so the agent can Read
+        them. One dir per channel, timestamped names keep history + avoid
+        collisions. Returns local paths, or [] on no attachments / failure."""
+        if not message.attachments:
+            return []
+        from datetime import datetime
+        attach_dir = ROOT / "logs" / "attachments" / str(message.channel.id)
+        attach_dir.mkdir(parents=True, exist_ok=True)
+        paths: list[Path] = []
+        for att in message.attachments:
+            ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+            safe_name = "".join(
+                c for c in att.filename if c.isalnum() or c in "._-"
+            ) or "attachment"
+            local_path = attach_dir / f"{ts}-{safe_name}"
+            try:
+                await att.save(local_path)
+                paths.append(local_path)
+                log.info(
+                    "[%s] saved attachment %s (%d bytes) -> %s",
+                    self.label, att.filename, att.size, local_path
+                )
+            except Exception as e:
+                log.warning("[%s] failed to save attachment %s: %s",
+                            self.label, att.filename, e)
+        return paths
 
     async def on_message(self, message: discord.Message) -> None:
         channel_id = str(message.channel.id)
@@ -133,7 +165,24 @@ class RelayBot(discord.Client):
             if sender
             else f"{message.author.display_name} ({message.author.id})"
         )
-        prompt = f"[Discord #{message.channel.name} — from {author}]\n\n{body}"
+
+        # Attachments — download and inject paths into the prompt so the
+        # agent can Read them (PDFs, images, text, etc.). Discord delivers
+        # these as .attachments, not in .content, so they're invisible
+        # unless we surface them explicitly.
+        attach_paths = await self._download_attachments(message)
+        attach_block = ""
+        if attach_paths:
+            lines = [f"- `{p}`" for p in attach_paths]
+            attach_block = (
+                "\n\n**Attached files** (saved locally, you can `Read` "
+                "them directly):\n" + "\n".join(lines)
+            )
+
+        prompt = (
+            f"[Discord #{message.channel.name} — from {author}]\n\n{body}"
+            + attach_block
+        )
 
         placeholder = await message.channel.send(
             self.streaming_cfg.get("thinking_indicator", "…")

@@ -23,9 +23,9 @@ _status() {
     ps -o pid,lstart,cmd -p $pids 2>/dev/null | head -5 || true
     if [ -f "$LOG" ]; then
         local up want
-        up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
+        up="$(grep -ac 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
         up="${up:-0}"
-        want="$(grep -oE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+        want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
         want="${want:-?}"
         echo "clients: $up / $want"
     fi
@@ -56,13 +56,13 @@ echo "── waiting for clients to connect ──"
 # That's agents grouped by unique bot_token, which is the real Discord client count.
 want=""
 for i in $(seq 1 10); do
-    want="$(grep -oE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+    want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
     [ -n "$want" ] && break
     sleep 1
 done
 want="${want:-0}"
 for i in $(seq 1 40); do
-    up="$(grep -c 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
+    up="$(grep -ac 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
     up="${up:-0}"
     if [ "$want" -gt 0 ] && [ "${up:-0}" -ge "${want:-0}" ]; then
         echo "✅ $up/$want clients up"
@@ -71,10 +71,10 @@ for i in $(seq 1 40); do
     sleep 1
 done
 
-if grep -qE "Error|Traceback" "$LOG"; then
+if grep -aqE "Error|Traceback" "$LOG"; then
     echo ""
     echo "⚠️  errors in log:"
-    grep -E "Error|Traceback" "$LOG" | head -5
+    grep -aE "Error|Traceback" "$LOG" | head -5
 fi
 
 echo ""
