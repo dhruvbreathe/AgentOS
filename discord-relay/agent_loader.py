@@ -21,7 +21,13 @@ GLOBAL_CONFIG = ROOT / "config.yaml"
 
 # Universal files that get prepended to every agent's system prompt.
 # Concise, hard rules that don't vary per agent (writing style, safety, etc.).
-SHARED_FILES = ["HUMANIZER.md", "EXPRESSION.md", "AGENT_COMMS.md", "SUBAGENTS.md"]
+SHARED_FILES = [
+    "HUMANIZER.md",
+    "EXPRESSION.md",
+    "AGENT_COMMS.md",
+    "SUBAGENTS.md",
+    "MEMORY.md",
+]
 
 
 @dataclass
