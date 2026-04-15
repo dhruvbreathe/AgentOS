@@ -2,13 +2,18 @@
 
 ## Codebase
 
-- **Repo:** Vayu Android (path TBD — confirm with Dhruv on first session and record here)
-- **Stack:** Kotlin, Jetpack Compose, MVVM, Hilt, Room, Retrofit, Coroutines + Flow
-- **Min SDK:** Android 8 (API 26) unless changed in `build.gradle.kts`
-- **Target SDK:** latest stable Android API
-- **Build system:** Gradle (Kotlin DSL)
+- **Repo:** `/Users/celainc/Developers/Vayu2.0_Android`
+- **Package:** `com.prana.vayu`
+- **Current version:** 2.2.5 (versionCode 54)
+- **Stack:** Kotlin, Jetpack Compose, Supabase (via secrets.properties), Firebase, kotlinx.serialization
+- **Modules:** `app` (phone), `vayuwear` (WearOS companion)
+- **Min SDK:** 26 (Android 8) · **Target/Compile SDK:** 36
+- **Build system:** Gradle (Kotlin DSL) with version catalog (`libs.plugins.*`)
+- **Signing:** `vayu-release.jks` + `keystore.properties` (gitignored via `.example`)
+- **Secrets:** `secrets.properties` — Supabase, Google OAuth, Flowise, Brevo, Segment, Mixpanel, Sentry, OneSignal
+- **Key packages:** `auth`, `billing`, `analytics`, `meditation`, `onboarding`, `screens`, `navigation`, `data/api`, `watch`, `audio`, `notifications`, `deeplink`, `email`
 - **Distribution:** Play Store (internal → closed → open beta → production)
-- **Crash + vitals:** Firebase Crashlytics, Play Console vitals dashboard
+- **Crash + vitals:** Sentry (DSN in secrets), Firebase Crashlytics, Play Console vitals
 
 ## Obsidian vault (my durable memory)
 

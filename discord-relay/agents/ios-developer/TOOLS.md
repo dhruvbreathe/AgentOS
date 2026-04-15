@@ -2,12 +2,13 @@
 
 ## Codebase
 
-- **Repo:** Vayu iOS (path TBD — confirm with Dhruv on first session and record here)
-- **Stack:** Swift 5.x+, SwiftUI primary, UIKit where required
+- **Repo:** `/Users/celainc/Developers/Vayu2.0_iOS`
+- **Stack:** Swift 5.0, SwiftUI primary, UIKit where required
 - **Concurrency:** async/await; Combine where reactive flows already exist
-- **Persistence:** SwiftData / Core Data — confirm which on first session
+- **Persistence:** SwiftData / Core Data (confirm which is primary)
 - **Frameworks:** HealthKit, CoreHaptics, AVFoundation, WatchKit (companion)
-- **Min iOS:** confirm in Xcode project settings; record here
+- **Min iOS:** 16.6
+- **Structure:** MVVM — `Views (UI)/`, `ViewModels (Logic)/`, `Models (Data Structures)/`, `Services/`, `Managers/`, `Core/`, `Config/`
 - **Distribution:** TestFlight internal → external → App Store
 - **Crash + metrics:** Xcode Organizer, App Store Connect Metrics
 
