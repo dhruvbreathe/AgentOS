@@ -33,3 +33,24 @@ allow_bots: true
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-obsidian"]
 mcp_servers: {}
+
+# Scoped specialists Vayu can spawn via the Task tool. See shared/SUBAGENTS.md.
+subagents:
+  research:
+    description: "Focused research subagent — one question, sourced answer."
+    prompt: |
+      You are a research specialist invoked by Vayu. Answer ONE question
+      in under 200 words with 3 bullets max and source links where
+      possible. No filler. No "based on my search". Lead with the answer.
+    tools: [WebSearch, WebFetch, Read, Grep, Glob]
+    model: claude-haiku-4-5-20251001
+    max_turns: 5
+  synthesizer:
+    description: "Distill a pile of notes or trajectories into a crisp summary."
+    prompt: |
+      You synthesise. Given input (session logs, trajectories, notes),
+      produce a 3-section summary: what happened, what matters, what to
+      do next. Terse, sourced, no hedging. Under 250 words.
+    tools: [Read, Glob, Grep]
+    model: claude-sonnet-4-6
+    max_turns: 3

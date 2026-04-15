@@ -12,7 +12,7 @@ _CRONTAB_RE = re.compile(r"\bcrontab\b")
 _CRONTAB_READONLY_RE = re.compile(r"^\s+(-l|--list)\b")
 
 import yaml
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
 
 ROOT = Path(__file__).parent
 AGENTS_DIR = ROOT / "agents"
@@ -21,7 +21,7 @@ GLOBAL_CONFIG = ROOT / "config.yaml"
 
 # Universal files that get prepended to every agent's system prompt.
 # Concise, hard rules that don't vary per agent (writing style, safety, etc.).
-SHARED_FILES = ["HUMANIZER.md", "EXPRESSION.md", "AGENT_COMMS.md"]
+SHARED_FILES = ["HUMANIZER.md", "EXPRESSION.md", "AGENT_COMMS.md", "SUBAGENTS.md"]
 
 
 @dataclass
@@ -81,6 +81,69 @@ def _has_unsafe_crontab(cmd: str) -> bool:
         if not _CRONTAB_READONLY_RE.match(cmd[m.end() :]):
             return True
     return False
+
+
+def _load_subagents(agent_dir: Path, cfg: dict) -> dict[str, AgentDefinition] | None:
+    """Build AgentDefinition map from agent.yaml `subagents:` entries.
+
+    Each subagent has a name, description, prompt, optional tool list and
+    model. Lets the parent agent spawn a scoped specialist via the SDK's
+    Task tool without polluting any channel.
+    """
+    subs_cfg = cfg.get("subagents")
+    if not subs_cfg:
+        return None
+    out: dict[str, AgentDefinition] = {}
+    for name, sub in subs_cfg.items():
+        prompt = sub.get("prompt", "")
+        # Allow `prompt_file: skills/research.md` pattern — resolve relative to agent dir.
+        pf = sub.get("prompt_file")
+        if pf:
+            p = (agent_dir / pf).resolve()
+            if p.is_file():
+                prompt = p.read_text() + ("\n\n" + prompt if prompt else "")
+        out[name] = AgentDefinition(
+            description=sub.get("description", ""),
+            prompt=prompt,
+            tools=sub.get("tools"),
+            model=sub.get("model"),
+            maxTurns=sub.get("max_turns"),
+        )
+    return out or None
+
+
+def _build_session_log_hooks(agent_name: str):
+    """Stop + PreCompact hooks that persist a lightweight session marker
+    to agents/<name>/memory/YYYY-MM-DD.md at end-of-turn and before
+    auto-compaction. The full trajectory is already JSONL-logged; this
+    drops a human-readable breadcrumb the agent reads next session."""
+
+    mem_dir = AGENTS_DIR / agent_name / "memory"
+
+    def _append(line: str) -> None:
+        try:
+            from datetime import datetime, timezone
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            path = mem_dir / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.md"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    async def on_stop(input_data, tool_use_id, context):
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        _append(f"- {ts}  turn ended")
+        return {}
+
+    async def on_precompact(input_data, tool_use_id, context):
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+        trigger = input_data.get("trigger", "auto") if isinstance(input_data, dict) else "auto"
+        _append(f"- {ts}  PRE-COMPACT ({trigger}) — context about to be compressed")
+        return {}
+
+    return on_stop, on_precompact
 
 
 async def _block_raw_crontab(input_data, tool_use_id, context):
@@ -229,6 +292,9 @@ def load_agent(name: str) -> AgentConfig:
     # beyond declared permissions.
     sandbox_cfg = agent_cfg.get("sandbox") or defaults.get("sandbox")
 
+    subagents = _load_subagents(agent_dir, agent_cfg)
+    on_stop, on_precompact = _build_session_log_hooks(name)
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -246,10 +312,13 @@ def load_agent(name: str) -> AgentConfig:
         sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
         thinking=thinking_cfg,
+        agents=subagents,
         hooks={
             "PreToolUse": [
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
             ],
+            "Stop": [HookMatcher(hooks=[on_stop])],
+            "PreCompact": [HookMatcher(hooks=[on_precompact])],
         },
         include_partial_messages=True,  # enable token-level streaming
     )
