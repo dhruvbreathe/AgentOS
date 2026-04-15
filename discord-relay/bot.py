@@ -192,8 +192,17 @@ async def _run_all(default_token: str | None) -> None:
         label = ",".join(sorted({a.name for a in agents.values()}))
         clients.append((RelayBot(label=label, agents=agents), token))
 
+    # Stagger startup by ~150ms per client so N>~12 websocket handshakes
+    # don't all race DNS resolution at once (saw a gaierror burst at 9).
+    async def _delayed_start(client: RelayBot, token: str, delay: float) -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await client.start(token)
+
     log.info("starting %d Discord client(s)", len(clients))
-    await asyncio.gather(*(c.start(t) for c, t in clients))
+    await asyncio.gather(
+        *(_delayed_start(c, t, i * 0.15) for i, (c, t) in enumerate(clients))
+    )
 
 
 def main() -> None:
