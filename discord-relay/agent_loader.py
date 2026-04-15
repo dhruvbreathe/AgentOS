@@ -45,6 +45,30 @@ def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
     return "\n\n".join(parts)
 
 
+# Order matters: identity first, then how to behave, who you serve,
+# workspace contract, env-specific config, connected services.
+LAYERED_FILES = [
+    "IDENTITY.md",
+    "SOUL.md",
+    "USER.md",
+    "AGENTS.md",
+    "TOOLS.md",
+    "INTEGRATIONS.md",
+]
+
+
+def _load_layered_prompt(agent_dir: Path) -> str:
+    """Concatenate OpenClaw-style per-agent files (if present) into a single
+    system prompt. Each file starts with its own H1, so we just separate with
+    blank lines."""
+    chunks: list[str] = []
+    for name in LAYERED_FILES:
+        p = agent_dir / name
+        if p.exists():
+            chunks.append(p.read_text().rstrip())
+    return "\n\n".join(chunks)
+
+
 def load_global() -> dict[str, Any]:
     return _load_yaml(GLOBAL_CONFIG)
 
@@ -64,11 +88,20 @@ def load_agent(name: str) -> AgentConfig:
     global_cfg = load_global()
     defaults = global_cfg.get("defaults", {}) or {}
 
-    # System prompt: base file + skills appended
-    sp_file = agent_dir / agent_cfg.get("system_prompt_file", "system_prompt.md")
-    base_sp = sp_file.read_text() if sp_file.exists() else ""
+    # System prompt: layered files (SOUL/IDENTITY/AGENTS/...) + optional
+    # legacy system_prompt.md + skills.
+    layered = _load_layered_prompt(agent_dir)
+    legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
+    legacy_sp = ""
+    if legacy_name:
+        legacy_sp_file = agent_dir / legacy_name
+        if legacy_sp_file.is_file():
+            legacy_sp = legacy_sp_file.read_text()
     skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
-    system_prompt = base_sp + ("\n\n" + skills if skills else "")
+
+    system_prompt = "\n\n".join(
+        [p for p in (layered, legacy_sp.rstrip(), skills) if p]
+    )
 
     # Webhook URL (for outbound posting via cron or cross-agent replies)
     webhook_env = agent_cfg.get("webhook_url_env")
@@ -126,6 +159,8 @@ def load_all_agents() -> dict[str, AgentConfig]:
         return {}
     out: dict[str, AgentConfig] = {}
     for child in AGENTS_DIR.iterdir():
+        if child.name.startswith((".", "_")):
+            continue  # skip _template/, _base/, hidden dirs
         if child.is_dir() and (child / "agent.yaml").exists():
             cfg = load_agent(child.name)
             out[cfg.channel_id] = cfg

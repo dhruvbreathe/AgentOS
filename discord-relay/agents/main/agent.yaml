@@ -3,7 +3,9 @@ channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main
 # Env var holding the outbound webhook URL (defined in .env)
 webhook_url_env: MAIN_WEBHOOK_URL
 
-system_prompt_file: system_prompt.md
+# Using layered files (SOUL/IDENTITY/AGENTS/USER/TOOLS/INTEGRATIONS) —
+# no legacy single-file system prompt.
+system_prompt_file: ""
 
 # Optional: list of skill markdown files appended to the system prompt.
 skills: []

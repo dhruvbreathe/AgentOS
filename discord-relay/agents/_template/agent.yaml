@@ -1,0 +1,21 @@
+# Template — copy to agents/<name>/ and fill in.
+name: REPLACE_ME
+channel_id: "REPLACE_WITH_CHANNEL_ID"
+webhook_url_env: REPLACE_WEBHOOK_URL_ENV   # e.g. MARKETING_WEBHOOK_URL
+
+# Leave empty to use layered files (SOUL/IDENTITY/AGENTS/USER/TOOLS/INTEGRATIONS).
+system_prompt_file: ""
+
+# Skill markdown files appended after the layered prompt.
+skills: []
+
+allowed_tools: []
+disallowed_tools: []
+
+# Optional overrides:
+# model: claude-haiku-4-5-20251001
+# permission_mode: acceptEdits
+# max_turns: 20
+
+allow_bots: true
+mcp_servers: {}
