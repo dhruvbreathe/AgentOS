@@ -10,6 +10,7 @@ allowed_tools: []
 disallowed_tools: []
 
 allow_bots: true
+effort: medium
 mcp_servers:
   biorxiv:
     type: "mcp"

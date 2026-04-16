@@ -2,7 +2,7 @@
 
 ## Data + services
 
-- **Supabase project** — confirm project ID / URL on first session and record here
+- **Supabase project** — `yakibuftxtsvqnwnermi` (Prana, West US N. California) — confirmed prod 2026-04-15 by Dhruv
 - **Hosting** — Render (service names + env TBD on first session)
 - **Primary DB** — Postgres via Supabase; pgvector for any embedding work
 - **Storage** — Supabase Storage (buckets TBD)
@@ -15,7 +15,7 @@
 ## Environments
 
 - `local` — docker-compose + Supabase CLI, or direct against the dev project
-- `staging` — if we have one; confirm
+- `staging` — `qzbcaamocrtxtfavistu` (Vayu Staging, West US Oregon)
 - `production` — live
 
 Rule: nothing runs on prod that hasn't first run on staging (or at minimum local with a prod-shaped snapshot).

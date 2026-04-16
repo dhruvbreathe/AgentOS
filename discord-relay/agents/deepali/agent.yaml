@@ -19,6 +19,7 @@ disallowed_tools: []
 # max_turns: 20
 
 allow_bots: true
+effort: medium
 mcp_servers:
   gmail:
     type: "mcp"

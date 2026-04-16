@@ -342,6 +342,7 @@ def load_agent(name: str) -> AgentConfig:
         model=agent_cfg.get("model") or defaults.get("model"),
         fallback_model=agent_cfg.get("fallback_model")
         or defaults.get("fallback_model"),
+        effort=agent_cfg.get("effort") or defaults.get("effort"),
         cwd=cwd,
         add_dirs=add_dirs,
         env=env_out,
