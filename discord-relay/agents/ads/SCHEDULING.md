@@ -62,3 +62,19 @@ After applying, run `crontab -l` (read-only is allowed and passes the hook) and 
 ## When to remove a task
 
 If a task is obsolete: delete the file and run the installer again (`--apply`). The managed block regenerates from scratch each run, so removing the file removes the cron entry.
+
+## How to restart the relay from Discord
+
+If I've changed config files (agent.yaml, shared/*.md, config.yaml) and need a restart:
+
+```bash
+touch /Users/celainc/Developers/ClaudeAgentSDK/discord-relay/logs/.restart-requested
+```
+
+The bot checks for this file **between turns**. After my current turn finishes, the bot exits cleanly. If `scripts/autorestart.sh` is the runner, it catches the exit and starts a fresh process within ~3 seconds.
+
+**Rules:**
+- I do **not** run `pkill` on bot.py — that kills my own turn mid-stream.
+- I finish my current reply, tell the operator "restart queued ⚡ — takes effect in a few seconds", then touch the file.
+- The restart picks up all changes to Python code, shared docs, agent configs, and .env.
+- If `autorestart.sh` is NOT running (bot was started manually), the signal file still works — the bot exits, but nothing auto-restarts it. The operator would need to start it again.

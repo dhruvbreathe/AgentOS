@@ -217,6 +217,17 @@ class RelayBot(discord.Client):
                 log.exception("[%s] agent %s failed", self.label, agent.name)
                 await sink.finalize(f"⚠️ `{agent.name}` error: {e}")
 
+            # Between turns: check for restart signal. An agent can trigger
+            # this by running `touch logs/.restart-requested` from Bash.
+            # The bot exits cleanly here; scripts/autorestart.sh (if
+            # running) catches the exit and brings us back up.
+            restart_signal = ROOT / "logs" / ".restart-requested"
+            if restart_signal.exists():
+                restart_signal.unlink(missing_ok=True)
+                log.info("restart signal detected — exiting cleanly for autorestart")
+                import sys
+                sys.exit(0)
+
 
 def _group_agents_by_token(
     default_token: str | None,
