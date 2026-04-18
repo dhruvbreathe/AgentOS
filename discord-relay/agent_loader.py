@@ -28,6 +28,7 @@ SHARED_FILES = [
     "SUBAGENTS.md",
     "MEMORY_STACK.md",  # architecture doc; distinct from per-agent MEMORY.md
     "MODELS.md",        # catalog of available Claude models + when to use which
+    "APPROVALS.md",     # operator-reaction gate for dangerous Bash
 ]
 
 
@@ -152,6 +153,60 @@ def _build_session_log_hooks(agent_name: str):
         return {}
 
     return on_stop, on_precompact
+
+
+def _build_approval_hook(
+    agent_name: str,
+    webhook_url: str | None,
+    patterns: list,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    enabled: bool,
+):
+    """Build a PreToolUse hook that gates dangerous Bash commands behind
+    a Discord reaction approval. Closure-captures agent context."""
+    from approval_gate import compile_patterns, match_dangerous, request_approval
+
+    if not enabled or not webhook_url or not patterns:
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    compiled = compile_patterns(patterns)
+
+    async def _gate(input_data, tool_use_id, context):
+        if input_data.get("tool_name") != "Bash":
+            return {}
+        cmd = input_data.get("tool_input", {}).get("command", "") or ""
+        hit = match_dangerous(cmd, compiled)
+        if not hit:
+            return {}
+        decision, detail = await request_approval(
+            webhook_url=webhook_url,
+            agent_name=agent_name,
+            tool_name="Bash",
+            command=cmd,
+            reason=f"Matched dangerous pattern: `{hit}`",
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval_seconds,
+        )
+        if decision == "approve":
+            return {}  # pass through
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Approval gate: {decision} ({detail}). The command "
+                    f"matched a dangerous pattern (`{hit}`). If the operator "
+                    f"actually wants this to run, they can react ✅ to the "
+                    f"approval message in Discord, or re-ask with an explicit "
+                    f"operator instruction after approving."
+                ),
+            }
+        }
+
+    return _gate
 
 
 async def _block_raw_crontab(input_data, tool_use_id, context):
@@ -335,6 +390,19 @@ def load_agent(name: str) -> AgentConfig:
     subagents = _load_subagents(agent_dir, agent_cfg)
     on_stop, on_precompact = _build_session_log_hooks(name)
 
+    # Approval gate config — merge per-agent override on top of defaults.
+    _approval_defaults = defaults.get("approval") or {}
+    _approval_override = agent_cfg.get("approval") or {}
+    approval_cfg = {**_approval_defaults, **_approval_override}
+    approval_hook = _build_approval_hook(
+        agent_name=name,
+        webhook_url=webhook_url,
+        patterns=approval_cfg.get("dangerous_patterns") or [],
+        timeout_seconds=float(approval_cfg.get("timeout_seconds", 60)),
+        poll_interval_seconds=float(approval_cfg.get("poll_interval_seconds", 2.5)),
+        enabled=bool(approval_cfg.get("enabled", True)),
+    )
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -356,7 +424,10 @@ def load_agent(name: str) -> AgentConfig:
         agents=subagents,
         hooks={
             "PreToolUse": [
+                # Order matters: crontab guard first (structural rule),
+                # approval gate second (pattern-based, may await user).
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
+                HookMatcher(matcher="Bash", hooks=[approval_hook]),
             ],
             "Stop": [HookMatcher(hooks=[on_stop])],
             "PreCompact": [HookMatcher(hooks=[on_precompact])],

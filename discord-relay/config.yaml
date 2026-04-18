@@ -40,6 +40,36 @@ defaults:
   # available in agent.yaml.
   thinking: adaptive
 
+  # Exec-approval gate. When a Bash command matches one of these regex
+  # patterns, the agent's PreToolUse hook posts an approval request to
+  # the agent's channel and waits for a ✅ / ❌ reaction. Timeout →
+  # auto-deny. Disable per-agent with `approval: {enabled: false}` in
+  # agent.yaml.
+  approval:
+    enabled: true
+    timeout_seconds: 60
+    poll_interval_seconds: 2.5
+    dangerous_patterns:
+      - '\brm\s+-rf?\b'            # rm -rf anything
+      - '\bgit\s+push\s+[^|;&]*--force'
+      - '\bgit\s+push\s+[^|;&]*\s-f\b'
+      - '\bgit\s+reset\s+--hard\b'
+      - '\bgit\s+clean\s+-[a-zA-Z]*f'  # git clean -f / -fd
+      - '\blaunchctl\s+(bootout|remove)\b'
+      - '\bdiskutil\s+erase\b'
+      - '\bmkfs\b'
+      - '\bdd\s+if='
+      - '\|\s*sudo\b'              # anything piped to sudo
+      - '\bcurl\s[^|]*\|\s*(sh|bash|zsh)\b'
+      - '\bwget\s[^|]*\|\s*(sh|bash|zsh)\b'
+      - '\bkillall\s+[A-Za-z]'
+      - '\bshutdown\b'
+      - '\breboot\b'
+      # Production writes outside the relay/vault:
+      - '/Users/celainc/Documents/Vayu/Vayu/Company/DECISIONS\.md'
+      # .env changes require operator sign-off
+      - '\.env\b[^.]'
+
 # Streaming behaviour for live Discord message edits.
 streaming:
   edit_interval_seconds: 1.2          # how often to push an edit to Discord
