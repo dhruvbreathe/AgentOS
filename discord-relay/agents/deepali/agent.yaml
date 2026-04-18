@@ -24,3 +24,6 @@ mcp_servers:
   gmail:
     type: "mcp"
     note: "Gmail access for reading and responding to customer communications"
+  mixpanel:
+    type: "mcp"
+    note: "Mixpanel access for pulling product analytics — DAU, retention, funnels, user behaviour. Prefer the hosted MCP for quick lookups; if it's flaky, fall back to the Mixpanel Query API directly via curl (Basic Auth with MIXPANEL_SERVICE_ACCOUNT:MIXPANEL_SECRET, project 3978085)."

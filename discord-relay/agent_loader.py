@@ -153,15 +153,17 @@ def _build_session_log_hooks(agent_name: str):
 
 
 async def _block_raw_crontab(input_data, tool_use_id, context):
-    """PreToolUse hook: deny raw `crontab` write invocations. Agents must go
-    through `cron/install.py` which only touches the managed block."""
+    """PreToolUse hook: deny raw `crontab` write invocations. Agents should
+    use `scheduler/install.py` (launchd) for new work. The legacy
+    `cron/install.py` is kept whitelisted for backward compat but hangs
+    in-sandbox on macOS due to TCC privacy gating."""
     if input_data.get("tool_name") != "Bash":
         return {}
     cmd = input_data.get("tool_input", {}).get("command", "") or ""
     if "crontab" not in cmd:
         return {}
-    # Whitelist: anything through the managed installer.
-    if "cron/install.py" in cmd:
+    # Whitelist: both the new scheduler and the legacy installer.
+    if "scheduler/install.py" in cmd or "cron/install.py" in cmd:
         return {}
     # Allow read-only crontab usage.
     if not _has_unsafe_crontab(cmd):
@@ -171,12 +173,11 @@ async def _block_raw_crontab(input_data, tool_use_id, context):
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                "Raw `crontab` write blocked. Run `python "
-                "/Users/celainc/Developers/ClaudeAgentSDK/discord-relay/"
-                "cron/install.py --apply` from your Bash tool instead — "
-                "it's whitelisted and passes this guard. YOU run it "
-                "yourself; do not ask the operator to run it from their "
-                "terminal. See SCHEDULING.md."
+                "Raw `crontab` write blocked. Use the launchd-based "
+                "scheduler: `python /Users/celainc/Developers/ClaudeAgentSDK/"
+                "discord-relay/scheduler/install.py --apply`. That bypasses "
+                "the macOS TCC gate that hangs raw `crontab` writes in the "
+                "sandbox. See SCHEDULING.md."
             ),
         }
     }
@@ -382,16 +383,27 @@ def load_agent(name: str) -> AgentConfig:
 
 def load_all_agents() -> dict[str, AgentConfig]:
     """Load every agent.yaml under agents/. Returns dict keyed by channel_id
-    for fast routing in the bot."""
+    for fast routing in the bot. If two agents claim the same channel_id,
+    log a loud warning — silent overwrite previously made research-labs
+    disappear because main had the same channel in extra_channel_ids."""
     if not AGENTS_DIR.exists():
         return {}
+    import logging
+    log = logging.getLogger("agent-loader")
     out: dict[str, AgentConfig] = {}
-    for child in AGENTS_DIR.iterdir():
+    for child in sorted(AGENTS_DIR.iterdir()):
         if child.name.startswith((".", "_")):
             continue  # skip _template/, _base/, hidden dirs
         if child.is_dir() and (child / "agent.yaml").exists():
             cfg = load_agent(child.name)
             for cid in cfg.channel_ids:
+                if cid in out and out[cid].name != cfg.name:
+                    log.warning(
+                        "channel_id %s claimed by both %s and %s — %s wins "
+                        "(loaded later). Remove the duplicate from one of "
+                        "the agent.yaml files.",
+                        cid, out[cid].name, cfg.name, cfg.name,
+                    )
                 out[cid] = cfg
     return out
 

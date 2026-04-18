@@ -8,7 +8,8 @@ bot_token_env: WEB_BOT_TOKEN   # own Discord identity
 system_prompt_file: ""
 
 # Skill markdown files appended after the layered prompt.
-skills: []
+skills:
+  - ../../shared/skills/dev-browser.md
 
 allowed_tools: []
 disallowed_tools: []

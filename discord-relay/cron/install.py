@@ -24,9 +24,14 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = ROOT / "agents"
-PYTHON = sys.executable
 TRIGGER = ROOT / "cron_trigger.py"
 LOG_DIR = ROOT / "logs"
+
+# Prefer the venv Python (has aiohttp, discord.py, claude-agent-sdk, etc.).
+# Fall back to sys.executable only if the venv isn't present — which is the
+# reason crons were silently crashing with ModuleNotFoundError before.
+_VENV_PY = ROOT / ".venv" / "bin" / "python"
+PYTHON = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
 
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 

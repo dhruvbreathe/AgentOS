@@ -1,8 +1,9 @@
 name: main
 channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main (primary)
-# Additional channels Vayu also responds in, with the same persona + bot identity.
-extra_channel_ids:
-  - "1477129158114152570"           # #research-labs
+# NOTE: #research-labs (1477129158114152570) used to be here as an extra
+# channel for Vayu. Since then, `research-labs` has grown into a full
+# standalone agent with its own persona (bioRxiv MCP, research brief
+# cadence). It owns that channel now — see agents/research-labs/.
 # Env var holding the outbound webhook URL (defined in .env). Webhook lives
 # in the primary channel — that's where cross-agent comms target.
 webhook_url_env: MAIN_WEBHOOK_URL
@@ -12,7 +13,8 @@ webhook_url_env: MAIN_WEBHOOK_URL
 system_prompt_file: ""
 
 # Optional: list of skill markdown files appended to the system prompt.
-skills: []
+skills:
+  - ../../shared/skills/dev-browser.md
 
 # Tools on top of the defaults in config.yaml.
 allowed_tools: []

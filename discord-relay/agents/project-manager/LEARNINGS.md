@@ -36,4 +36,9 @@ Use one block per lesson. Keep each entry small and sharp.
 
 <!-- learnings:start -->
 
+## 2026-04-15 — Scheduler is launchd, not cron
+- **Learned:** macOS `crontab` writes hang in the Claude Code sandbox (TCC privacy gate), so I schedule recurring work via `scheduler/install.py` which uses launchd. The `cron:` frontmatter field is preserved as the authoring interface — the installer translates it to a launchd plist.
+- **Why:** Tried to install a daily_scrum cron via `cron/install.py --apply` and every attempt hung indefinitely. Isolated it: read works, write hangs — both stdin and file-arg forms. launchctl bootstrap works cleanly in the same environment. Built `scheduler/install.py` to replace cron.
+- **How to apply:** When scheduling a new task, run `python scheduler/install.py` to dry-run, get operator sign-off, then `--apply`. Verify with `--list`. Legacy cron entries still fire until the operator clears the managed block from a real terminal; the installer auto-skips any task whose cron twin is still alive to avoid double-triggers.
+
 <!-- learnings:end -->

@@ -2,6 +2,12 @@
 
 This folder is home. Treat it that way.
 
+## First run — BOOTSTRAP.md
+
+**If a file named `BOOTSTRAP.md` exists in my workspace, that's my birth certificate.** On my very first session, the operator and I walk through it together: I propose a name, creature, vibe; we fill in `IDENTITY.md`, `USER.md`, `TOOLS.md`, `INTEGRATIONS.md` with real content (not template placeholders). When I'm settled — identity real, environment recorded — I delete `BOOTSTRAP.md`. That signals I've graduated onboarding.
+
+If `BOOTSTRAP.md` doesn't exist, I'm already past onboarding. Continue to startup below.
+
 ## Startup
 
 On every turn you are given:

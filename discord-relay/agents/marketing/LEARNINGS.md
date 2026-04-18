@@ -36,4 +36,24 @@ Use one block per lesson. Keep each entry small and sharp.
 
 <!-- learnings:start -->
 
+## 2026-04-16 — CRM is a sent-log, not a lead list
+- **Learned:** The `CRM/B2B/` and `CRM/Investors/` folders are "everyone Dhruv has already emailed", not "everyone available to email". Almost every file has a `last_contact` and `status: Sent|Sent-T1|Closed Loop|Bounced`.
+- **Why:** My first shortlist picked 10 names from CRM thinking they were "untouched". All 10 had been contacted Feb–Mar. I had to re-pivot mid-task.
+- **How to apply:** Before proposing any cold-touch candidate from the vault, grep the file's frontmatter for `last_contact` and `status`. Only `status: prospect` or empty status = truly fresh. Everything else is revival territory and needs different framing.
+
+## 2026-04-16 — Sample Dhruv's voice before drafting
+- **Learned:** First-pass drafts will sound like AI. Reading 2 of Dhruv's actual recent sent emails (one B2B, one investor) before drafting cuts the humanizer-pass workload by half.
+- **Why:** v1 drafts had "circling back", formulaic triples, em-dash decoration, "happy to send a short deck" — all AI tells. v2 after voice-sampling was noticeably closer to Dhruv's actual cadence.
+- **How to apply:** Every daily batch, before drafting, run `himalaya envelope list -a dhruv --folder "[Gmail]/Sent Mail"` and read one B2B-tier + one investor-tier email. Match subject-line style, proof-point phrasing (Dhruv uses "3x category average", "27,500 downloads", "4.8 stars", "near-zero CAC" — NOT "10x median"), and signature tier.
+
+## 2026-04-16 — Signature tiers by audience
+- **Learned:** Dhruv uses two signature styles. Yoga / local-partner tier gets short (`Dhruv` + `vayu-prana.com`). Investor / enterprise tier gets full (`Dhruv Adhia` / `CEO & Cofounder, Prana Labs Inc.` / URL + deck link).
+- **Why:** Sampling One Yoga email vs Sungkwon Kang (LG Tech Ventures) email showed a clear split.
+- **How to apply:** When drafting, match signature to recipient tier. Cold yoga outreach = short warm. Investor / insurance-broker / enterprise = full. Don't mix.
+
+## 2026-04-16 — Daily 15/day needs a sourcing engine, not the vault
+- **Learned:** A sustainable 15 fresh prospects/day can't come from the vault alone — the vault is historical. It needs Apollo (when stable) or structured web research per batch.
+- **Why:** Option A (revivals + yoga fresh + insurance T2) works for today but exhausts revival-eligible names within a week or two.
+- **How to apply:** When Apollo comes back online, the cron task prompt should prefer Apollo enrichment over CRM revivals. Keep the revival path as fallback only.
+
 <!-- learnings:end -->

@@ -36,4 +36,9 @@ Use one block per lesson. Keep each entry small and sharp.
 
 <!-- learnings:start -->
 
+## 2026-04-16 — Never merge on an ambiguous "go"
+- **Learned:** "Just forward with PR" / "proceed" / "go ahead" can mean *open the PR* OR *merge the PR*. If the verb is ambiguous and the action is irreversible (merge → production), I must ask before acting.
+- **Why:** Read "Just forward with PR" as "merge the PR" and squash-merged #8 into main. Dhruv meant "open the PR and stop." Had to open a revert PR (#9) and queue a re-review, which thrashed the deploy pipeline and wasted his time.
+- **How to apply:** For merge / deploy / send-external / commit-to-main actions, the operator's green light must be unambiguous. "Merge it" / "ship it" / "deploy" are clear. "Forward," "go," "proceed," "continue," "do it" after a multi-option message → ask which option. Default to the less destructive read when in doubt, and check.
+
 <!-- learnings:end -->

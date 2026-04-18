@@ -3,11 +3,23 @@
 ## Stack
 
 - **AI image:** Midjourney, SDXL (with ADETAILER / ControlNet), Flux — pick the right model for the brief
-- **AI video:** Runway Gen-4, Sora, Veo — pick based on shot length and realism target
-- **Voice / TTS:** ElevenLabs (if wired); native macOS voices as fallback
+- **AI video (generative plates):** Veo 3 via Gemini API (confirmed working — model `veo-3.0-generate-001`, 9:16, ~$0.50/clip, ~60s wall time). Runway Gen-4, Sora available but unwired.
+- **Motion / compose (STANDARD — adopted 2026-04-17):** [Hyperframes](https://github.com/heygen-com/hyperframes) — HTML + GSAP + Puppeteer + ffmpeg. `npx hyperframes init|preview|lint|render`. No API keys, fully local. Beat raw ffmpeg in side-by-side test on the 50k brand film. Reference project lives at `/Users/celainc/Developers/vayu-media/50k-celebration/`.
+- **Raw ffmpeg:** reserved for simple concat/trim/mux. When there's typography, counters, or any UI-style motion — use Hyperframes.
+- **Voice / TTS:** Gemini 2.5 Flash TTS (`gemini-2.5-flash-preview-tts`, confirmed — voice "Charon" for calm/weathered; pass text directly, never prepend speech direction or it stretches the audio 3×). ElevenLabs available if wired.
 - **NLE:** confirm on first session — likely Premiere / Final Cut / CapCut / DaVinci
 - **Image editor:** Photoshop / Pixelmator / Affinity — confirm
 - **Vector:** Figma for layout; Illustrator / Affinity for vector work
+
+## Hyperframes idioms (the gotchas I hit)
+
+- `<video>` elements CAN'T be direct children of a root that has `data-start`. Either drop `data-start` from root, or wrap the video in a sub-composition (`data-composition-id=... data-composition-src=...`).
+- Every timed element needs `data-start`, `data-duration`, `data-track-index` AND `class="clip"`. Missing any = silent failure.
+- Timelines must be `gsap.timeline({ paused: true })` and registered on `window.__timelines[<composition-id>]`.
+- Videos need `muted` + separate `<audio>` tracks if you want sound — Veo's native audio is ignored unless you extract it.
+- GSAP tween overlap warnings matter — add `overwrite: "auto"` or restructure.
+- `npx hyperframes lint` ALWAYS before render. `--strict` fails on lint errors.
+- Available example templates: `warm-grain, play-mode, swiss-grid, vignelli, kinetic-type, product-promo, cinematic-zoom, logo-outro, grain-overlay, shimmer-sweep, app-showcase, ui-3d-reveal, light-leak` and a deep transitions library. Pull from these rather than hand-rolling.
 
 ## Asset library (confirm path on first session)
 

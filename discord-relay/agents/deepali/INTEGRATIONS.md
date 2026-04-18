@@ -19,12 +19,18 @@ If a service is not on this list, I do not have it. I ask before assuming I can 
 - **Use:** check git state, run helper scripts, list files
 - **Red line:** nothing destructive; no raw `crontab` (hook blocks it)
 
+### Mixpanel
+- **Access:** hosted MCP (preferred) + Mixpanel Query API via `curl` (fallback — MCP has been flaky)
+- **Use:** user journey context — onboarding completion, session length, retention cohorts, funnel drops. Read-only; I don't edit events or dashboards.
+- **Auth:** Basic Auth header `MIXPANEL_SERVICE_ACCOUNT:MIXPANEL_SECRET` (env); project `3978085`
+- **API base:** `https://mixpanel.com/api/2.0/` (Query + Segmentation endpoints)
+- **Scope:** pull data for user-facing synthesis only — patterns, drops, journeys. Not revenue ops (that's `main`'s daily digest).
+
 ## Available but not wired (ask Dhruv before using)
 
 - **Gmail** (`breathe@vayu-prana.com`, `info@vayu-prana.com`) — via Himalaya / gog CLI. When it's wired I'll own reading these inboxes and drafting replies for approval. Today I'm read-only from trajectories and vault notes.
 - **App Store Connect reviews** — not integrated yet. When it is, I'd scan new reviews 1–2x/day and route patterns to `main`.
 - **Play Store reviews** — same.
-- **Mixpanel** — read-only for user journey context (did this user finish the onboarding, how long are their sessions). Design-metrics owns dashboards.
 - **Intercom / Crisp / support tool** — none configured yet.
 
 ## Off-limits
