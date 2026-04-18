@@ -156,6 +156,13 @@ class TrajectoryLogger:
         self.path = TRAJECTORY_ROOT / agent_name / f"{self.session_id}.jsonl"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp = None
+        # Per-turn tool stats — count + success/failure per tool name. Written
+        # at result() so post-hoc analysis can rank which tools actually help
+        # this agent. Pattern borrowed from Hermes' ShareGPT export.
+        self._tool_stats: dict[str, dict[str, int]] = {}
+        # Track the last tool_use name so tool_result (which arrives as a
+        # separate message) can attribute success/failure to the right tool.
+        self._last_tool_name: str | None = None
 
     def _write(self, obj: dict) -> None:
         obj = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **obj}
@@ -179,6 +186,9 @@ class TrajectoryLogger:
         self._write(
             {"role": "assistant", "type": "tool_use", "name": name, "input": inp}
         )
+        stats = self._tool_stats.setdefault(name, {"count": 0, "success": 0, "failure": 0})
+        stats["count"] += 1
+        self._last_tool_name = name
 
     def tool_result(self, content, is_error: bool | None) -> None:
         if not isinstance(content, str):
@@ -194,9 +204,24 @@ class TrajectoryLogger:
                 "is_error": bool(is_error),
             }
         )
+        if self._last_tool_name:
+            stats = self._tool_stats.setdefault(
+                self._last_tool_name, {"count": 0, "success": 0, "failure": 0}
+            )
+            if is_error:
+                stats["failure"] += 1
+            else:
+                stats["success"] += 1
 
     def result(self, meta: dict) -> None:
-        self._write({"role": "system", "type": "result", **meta})
+        # Include accumulated per-tool stats so post-hoc analysis can see
+        # which tools this agent actually used + success rate.
+        self._write({
+            "role": "system",
+            "type": "result",
+            "tool_stats": dict(self._tool_stats),
+            **meta,
+        })
 
     def close(self) -> None:
         if self._fp is not None:

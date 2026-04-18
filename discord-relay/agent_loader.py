@@ -26,7 +26,8 @@ SHARED_FILES = [
     "EXPRESSION.md",
     "AGENT_COMMS.md",
     "SUBAGENTS.md",
-    "MEMORY.md",
+    "MEMORY_STACK.md",  # architecture doc; distinct from per-agent MEMORY.md
+    "MODELS.md",        # catalog of available Claude models + when to use which
 ]
 
 
@@ -78,6 +79,7 @@ LAYERED_FILES = [
     "INTEGRATIONS.md",
     "SCHEDULING.md",
     "LEARNINGS.md",
+    "MEMORY.md",  # curated facts about people/places/preferences (distinct from LEARNINGS)
 ]
 
 
