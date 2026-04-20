@@ -116,6 +116,15 @@ except Exception as _e:
     print(f"warn: chat router not mounted: {_e}", file=sys.stderr)
     _CHAT_READY = False
 
+# Mount agent config editor router (GET /agents/<name>/edit + save/clone/tasks).
+try:
+    from dashboard_edit import router as edit_router
+    app.include_router(edit_router)
+    _EDIT_READY = True
+except Exception as _e:
+    print(f"warn: edit router not mounted: {_e}", file=sys.stderr)
+    _EDIT_READY = False
+
 
 def esc(s) -> str:
     return html_lib.escape(str(s or ""))
@@ -824,7 +833,13 @@ def agent_detail(name: str):
         traj_html = '<div class="panel meta">no trajectory yet</div>'
 
     body = f"""
-    <h1>{esc(name)}</h1>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1em;flex-wrap:wrap;">
+      <h1>{esc(name)}</h1>
+      <div style="display:flex;gap:0.5em;">
+        <a href="/agents/{esc(name)}/edit" class="pill ok" style="padding:0.4em 0.9em;">✎ edit config</a>
+        <a href="/chat/{esc(name)}" class="pill dim" style="padding:0.4em 0.9em;">💬 chat</a>
+      </div>
+    </div>
     <div class="meta">
       channel: <code>{esc(cfg.get('channel_id','—'))}</code>
       &nbsp; model: <code>{esc(cfg.get('model','—'))}</code>
