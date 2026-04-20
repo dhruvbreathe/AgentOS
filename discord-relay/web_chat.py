@@ -12,10 +12,11 @@ WebSink pushes incremental updates into an asyncio.Queue which the SSE
 endpoint drains. Per-agent locks prevent two simultaneous turns from
 racing the same session.
 
-Session key: "web:<agent>" — separate from Discord's channel-id keyed
-session. Keeps web history clean from Discord history. Shared vault,
-shared memory files, shared identity — just a distinct conversation
-thread.
+Session key: "web:<agent>:<thread_id>" — separate from Discord's channel-id
+keyed session. Each web chat can spawn multiple concurrent threads with
+the same agent (tabs in the UI); each thread gets its own Claude session,
+history file, and lock. Shared vault, memory files, identity — only the
+conversation state is split.
 """
 from __future__ import annotations
 
@@ -60,18 +61,154 @@ def _save_sessions(data: dict[str, str]) -> None:
     SESSIONS_FILE.write_text(json.dumps(data, indent=2))
 
 
-def _session_key(agent: str) -> str:
-    return f"web:{agent}"
+DEFAULT_THREAD = "default"
+
+
+def _session_key(agent: str, thread_id: str = DEFAULT_THREAD) -> str:
+    return f"web:{agent}:{thread_id}"
+
+
+# ---- threads (multiple parallel conversations per agent) -------------------
+#
+# Storage layout:
+#   logs/web_chat/<agent>/<thread_id>.jsonl    ← chat history per thread
+#   logs/web_chat/<agent>/_threads.json        ← metadata (title, timestamps)
+#   logs/web_chat/<agent>.jsonl                ← LEGACY flat per-agent file;
+#                                                migrated into default thread
+#                                                on first read.
+
+def _agent_dir(agent: str) -> Path:
+    d = CHAT_HISTORY_DIR / agent
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _threads_file(agent: str) -> Path:
+    return _agent_dir(agent) / "_threads.json"
+
+
+def _thread_path(agent: str, thread_id: str) -> Path:
+    # Guard against path traversal — allow only safe ids.
+    safe = "".join(c for c in thread_id if c.isalnum() or c in "-_") or DEFAULT_THREAD
+    return _agent_dir(agent) / f"{safe}.jsonl"
+
+
+def _legacy_history_path(agent: str) -> Path:
+    return CHAT_HISTORY_DIR / f"{agent}.jsonl"
+
+
+def _load_threads(agent: str) -> list[dict]:
+    # Migrate legacy flat file on first touch so old chats aren't orphaned.
+    legacy = _legacy_history_path(agent)
+    if legacy.exists() and legacy.is_file():
+        dest = _thread_path(agent, DEFAULT_THREAD)
+        if not dest.exists():
+            dest.write_bytes(legacy.read_bytes())
+        legacy.unlink()
+
+    p = _threads_file(agent)
+    threads: list[dict] = []
+    if p.exists():
+        try:
+            threads = json.loads(p.read_text()) or []
+        except json.JSONDecodeError:
+            threads = []
+
+    # Ensure every on-disk jsonl is represented (and a default exists).
+    known_ids = {t.get("id") for t in threads}
+    for f in _agent_dir(agent).glob("*.jsonl"):
+        tid = f.stem
+        if tid not in known_ids:
+            threads.append({
+                "id": tid,
+                "title": "Default" if tid == DEFAULT_THREAD else tid,
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "last_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            known_ids.add(tid)
+
+    if not threads:
+        threads = [{
+            "id": DEFAULT_THREAD,
+            "title": "Default",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "last_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }]
+    return threads
+
+
+def _save_threads(agent: str, threads: list[dict]) -> None:
+    _threads_file(agent).write_text(json.dumps(threads, indent=2))
+
+
+def _touch_thread(agent: str, thread_id: str) -> None:
+    threads = _load_threads(agent)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    found = False
+    for t in threads:
+        if t["id"] == thread_id:
+            t["last_at"] = now
+            found = True
+            break
+    if not found:
+        threads.append({"id": thread_id, "title": thread_id,
+                        "created_at": now, "last_at": now})
+    _save_threads(agent, threads)
+
+
+def _create_thread(agent: str, title: str | None = None) -> dict:
+    threads = _load_threads(agent)
+    tid = uuid.uuid4().hex[:10]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    entry = {
+        "id": tid,
+        "title": title or f"Thread {len(threads) + 1}",
+        "created_at": now,
+        "last_at": now,
+    }
+    threads.append(entry)
+    _save_threads(agent, threads)
+    # Create empty file so the thread is persisted even before first message.
+    _thread_path(agent, tid).touch()
+    return entry
+
+
+def _delete_thread(agent: str, thread_id: str) -> bool:
+    threads = _load_threads(agent)
+    remaining = [t for t in threads if t["id"] != thread_id]
+    if len(remaining) == len(threads):
+        return False
+    _save_threads(agent, remaining)
+    p = _thread_path(agent, thread_id)
+    if p.exists():
+        p.unlink()
+    # Drop session mapping too.
+    sessions = _load_sessions()
+    sessions.pop(_session_key(agent, thread_id), None)
+    _save_sessions(sessions)
+    return True
+
+
+def _rename_thread(agent: str, thread_id: str, title: str) -> bool:
+    threads = _load_threads(agent)
+    for t in threads:
+        if t["id"] == thread_id:
+            t["title"] = title[:120]
+            _save_threads(agent, threads)
+            return True
+    return False
 
 
 # ---- chat history (operator-visible, survives restarts) --------------------
 
-def _history_path(agent: str) -> Path:
-    return CHAT_HISTORY_DIR / f"{agent}.jsonl"
+def _history_path(agent: str, thread_id: str = DEFAULT_THREAD) -> Path:
+    return _thread_path(agent, thread_id)
 
 
-def _append_history(agent: str, role: str, content: str, meta: dict | None = None) -> None:
-    p = _history_path(agent)
+def _append_history(agent: str, role: str, content: str,
+                    meta: dict | None = None,
+                    thread_id: str = DEFAULT_THREAD) -> None:
+    p = _history_path(agent, thread_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     rec = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -82,10 +219,12 @@ def _append_history(agent: str, role: str, content: str, meta: dict | None = Non
         rec["meta"] = meta
     with p.open("a") as f:
         f.write(json.dumps(rec) + "\n")
+    _touch_thread(agent, thread_id)
 
 
-def _read_history(agent: str, limit: int = 200) -> list[dict]:
-    p = _history_path(agent)
+def _read_history(agent: str, limit: int = 200,
+                  thread_id: str = DEFAULT_THREAD) -> list[dict]:
+    p = _history_path(agent, thread_id)
     if not p.exists():
         return []
     out: list[dict] = []
@@ -98,13 +237,22 @@ def _read_history(agent: str, limit: int = 200) -> list[dict]:
     return out[-limit:]
 
 
-def _clear_history(agent: str) -> int:
-    p = _history_path(agent)
+def _clear_history(agent: str, thread_id: str = DEFAULT_THREAD) -> int:
+    p = _history_path(agent, thread_id)
     if not p.exists():
         return 0
     n = sum(1 for _ in p.open())
     p.unlink()
+    # Re-create empty so the thread still exists.
+    p.touch()
     return n
+
+
+def _history_line_count(agent: str, thread_id: str = DEFAULT_THREAD) -> int:
+    p = _history_path(agent, thread_id)
+    if not p.exists():
+        return 0
+    return sum(1 for _ in p.open())
 
 
 # ---- SSE sink --------------------------------------------------------------
@@ -140,27 +288,30 @@ class WebSink(Sink):
         await self.queue.put({"type": "tool", **ev})
 
 
-# ---- per-agent locks (one turn at a time per agent) ------------------------
+# ---- per-thread locks (one turn at a time per (agent, thread)) -------------
 
 _locks: dict[str, asyncio.Lock] = {}
 
 
-def _lock(agent: str) -> asyncio.Lock:
-    if agent not in _locks:
-        _locks[agent] = asyncio.Lock()
-    return _locks[agent]
+def _lock(agent: str, thread_id: str = DEFAULT_THREAD) -> asyncio.Lock:
+    key = f"{agent}:{thread_id}"
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    return _locks[key]
 
 
 # ---- background runner -----------------------------------------------------
 
-async def _run_turn(agent_cfg, prompt: str, sink: WebSink) -> None:
+async def _run_turn(agent_cfg, prompt: str, sink: WebSink,
+                    thread_id: str = DEFAULT_THREAD) -> None:
     """Drive run_agent and push results into the sink. Session persists
-    under the web:<agent> key so web history stays distinct from Discord."""
+    under the web:<agent>:<thread_id> key so web history stays distinct
+    from Discord and each tab has its own conversation."""
     sessions = _load_sessions()
-    key = _session_key(agent_cfg.name)
+    key = _session_key(agent_cfg.name, thread_id)
     resume = sessions.get(key)
 
-    lock = _lock(agent_cfg.name)
+    lock = _lock(agent_cfg.name, thread_id)
     async with lock:
         try:
             final, session_id = await run_agent(
@@ -173,12 +324,14 @@ async def _run_turn(agent_cfg, prompt: str, sink: WebSink) -> None:
                 sessions[key] = session_id
                 _save_sessions(sessions)
             _append_history(agent_cfg.name, "assistant", final,
-                            meta={"session_id": session_id})
+                            meta={"session_id": session_id},
+                            thread_id=thread_id)
         except Exception as e:
             msg = f"agent error: {e}"
             await sink.error(msg)
             _append_history(agent_cfg.name, "assistant", f"⚠️ {msg}",
-                            meta={"error": True})
+                            meta={"error": True},
+                            thread_id=thread_id)
 
 
 # ---- FastAPI router --------------------------------------------------------
@@ -195,34 +348,114 @@ def _agent_map():
 @router.get("/api/chat/agents")
 def list_chat_agents() -> JSONResponse:
     agents = _agent_map()
-    sessions = _load_sessions()
-    return JSONResponse([
-        {
+    out = []
+    for name in sorted(agents.keys()):
+        threads = _load_threads(name)
+        total_lines = sum(_history_line_count(name, t["id"]) for t in threads)
+        out.append({
             "name": name,
-            "session_id": sessions.get(_session_key(name)),
-            "history_lines": sum(1 for _ in _history_path(name).open())
-                             if _history_path(name).exists() else 0,
-        }
-        for name in sorted(agents.keys())
-    ])
+            "thread_count": len(threads),
+            "history_lines": total_lines,
+        })
+    return JSONResponse(out)
+
+
+@router.get("/api/chat/{agent}/threads")
+def list_threads(agent: str) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    sessions = _load_sessions()
+    threads = _load_threads(agent)
+    # Sort: most recently active first, but keep default pinned at top.
+    threads.sort(key=lambda t: (t["id"] != DEFAULT_THREAD, -_ts_key(t.get("last_at", ""))))
+    return JSONResponse({
+        "agent": agent,
+        "threads": [
+            {
+                **t,
+                "session_id": sessions.get(_session_key(agent, t["id"])),
+                "history_lines": _history_line_count(agent, t["id"]),
+            }
+            for t in threads
+        ],
+    })
+
+
+def _ts_key(ts: str) -> float:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+@router.post("/api/chat/{agent}/threads")
+async def create_thread(agent: str, request: Request) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    title = (body.get("title") or "").strip() or None
+    entry = _create_thread(agent, title=title)
+    return JSONResponse({"agent": agent, "thread": entry})
+
+
+@router.patch("/api/chat/{agent}/threads/{thread_id}")
+async def rename_thread(agent: str, thread_id: str, request: Request) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    body = await request.json()
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "empty title")
+    ok = _rename_thread(agent, thread_id, title)
+    if not ok:
+        raise HTTPException(404, "no such thread")
+    return JSONResponse({"agent": agent, "thread_id": thread_id, "title": title})
+
+
+@router.delete("/api/chat/{agent}/threads/{thread_id}")
+def delete_thread(agent: str, thread_id: str) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    if thread_id == DEFAULT_THREAD:
+        # Don't remove the default — just clear it so the tab stays.
+        removed = _clear_history(agent, DEFAULT_THREAD)
+        sessions = _load_sessions()
+        sessions.pop(_session_key(agent, DEFAULT_THREAD), None)
+        _save_sessions(sessions)
+        return JSONResponse({"agent": agent, "thread_id": thread_id,
+                             "cleared_lines": removed, "deleted": False})
+    ok = _delete_thread(agent, thread_id)
+    if not ok:
+        raise HTTPException(404, "no such thread")
+    return JSONResponse({"agent": agent, "thread_id": thread_id, "deleted": True})
 
 
 @router.get("/api/chat/{agent}/history")
-def chat_history(agent: str, limit: int = 200) -> JSONResponse:
+def chat_history(agent: str, limit: int = 200,
+                 thread: str = DEFAULT_THREAD) -> JSONResponse:
     if agent not in _agent_map():
         raise HTTPException(404, "no such agent")
-    return JSONResponse({"agent": agent, "history": _read_history(agent, limit)})
+    return JSONResponse({
+        "agent": agent,
+        "thread_id": thread,
+        "history": _read_history(agent, limit, thread_id=thread),
+    })
 
 
 @router.post("/api/chat/{agent}/clear")
-def chat_clear(agent: str) -> JSONResponse:
+def chat_clear(agent: str, thread: str = DEFAULT_THREAD) -> JSONResponse:
     if agent not in _agent_map():
         raise HTTPException(404, "no such agent")
     sessions = _load_sessions()
-    sessions.pop(_session_key(agent), None)
+    sessions.pop(_session_key(agent, thread), None)
     _save_sessions(sessions)
-    removed = _clear_history(agent)
-    return JSONResponse({"agent": agent, "cleared_lines": removed, "session_reset": True})
+    removed = _clear_history(agent, thread_id=thread)
+    return JSONResponse({"agent": agent, "thread_id": thread,
+                         "cleared_lines": removed, "session_reset": True})
 
 
 # ---- slash commands --------------------------------------------------------
@@ -357,7 +590,8 @@ async def _tail_trajectory_live(agent: str, sink: WebSink, stop_event: asyncio.E
 
 
 @router.post("/api/chat/{agent}/stream")
-async def chat_stream(agent: str, request: Request) -> StreamingResponse:
+async def chat_stream(agent: str, request: Request,
+                      thread: str = DEFAULT_THREAD) -> StreamingResponse:
     agents = _agent_map()
     if agent not in agents:
         raise HTTPException(404, "no such agent")
@@ -365,8 +599,20 @@ async def chat_stream(agent: str, request: Request) -> StreamingResponse:
     body = await request.json()
     prompt = (body.get("prompt") or "").strip()
     attachments = body.get("attachments") or []
+    # Allow thread id in body too (makes the JS call site simpler).
+    thread = (body.get("thread") or thread or DEFAULT_THREAD).strip() or DEFAULT_THREAD
     if not prompt and not attachments:
         raise HTTPException(400, "empty prompt")
+
+    # Auto-title a freshly-created thread from its first user prompt.
+    threads = _load_threads(agent)
+    matched = next((t for t in threads if t["id"] == thread), None)
+    is_new_thread = matched and matched.get("title", "").startswith("Thread ") \
+                    and _history_line_count(agent, thread) == 0
+    if is_new_thread and prompt:
+        snippet = prompt.splitlines()[0][:48].strip()
+        if snippet:
+            _rename_thread(agent, thread, snippet)
 
     # Inject attachment paths into the prompt so the agent can Read them.
     if attachments:
@@ -382,8 +628,10 @@ async def chat_stream(agent: str, request: Request) -> StreamingResponse:
     # Short-circuit slash commands — return a canned reply without invoking the SDK.
     slash_result = _try_slash(agent, prompt)
     if slash_result:
-        _append_history(agent, "user", prompt, meta={"turn_id": turn_id, "slash": True})
-        _append_history(agent, "assistant", slash_result["reply"], meta={"slash": True})
+        _append_history(agent, "user", prompt,
+                        meta={"turn_id": turn_id, "slash": True}, thread_id=thread)
+        _append_history(agent, "assistant", slash_result["reply"],
+                        meta={"slash": True}, thread_id=thread)
 
         async def slash_stream() -> AsyncIterator[bytes]:
             yield f"data: {json.dumps({'type': 'start', 'turn_id': turn_id})}\n\n".encode()
@@ -394,10 +642,10 @@ async def chat_stream(agent: str, request: Request) -> StreamingResponse:
                                  headers={"Cache-Control": "no-cache"})
 
     # Log the user prompt before kicking the turn so it survives crashes.
-    _append_history(agent, "user", prompt, meta={"turn_id": turn_id})
+    _append_history(agent, "user", prompt, meta={"turn_id": turn_id}, thread_id=thread)
 
     sink = WebSink()
-    task = asyncio.create_task(_run_turn(agent_cfg, prompt, sink))
+    task = asyncio.create_task(_run_turn(agent_cfg, prompt, sink, thread_id=thread))
     stop_tail = asyncio.Event()
     tail_task = asyncio.create_task(_tail_trajectory_live(agent_cfg.name, sink, stop_tail))
 
@@ -526,6 +774,18 @@ CHAT_CSS = """
   .chat-header .meta{flex:1;}
   .chat-header button{background:var(--panel-2);border:1px solid var(--border);color:var(--fg-dim);padding:0.3em 0.8em;border-radius:6px;cursor:pointer;font-size:0.8em;}
   .chat-header button:hover{color:var(--fg);border-color:var(--accent);}
+  /* Tab bar — one row of thread tabs + "+ new" button. */
+  .chat-tabs{display:flex;align-items:stretch;gap:0;border-bottom:1px solid var(--border);background:var(--panel);overflow-x:auto;scrollbar-width:thin;}
+  .chat-tabs::-webkit-scrollbar{height:4px;}
+  .chat-tabs::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+  .chat-tab{display:inline-flex;align-items:center;gap:0.4em;padding:0.55em 0.8em 0.55em 0.9em;border-right:1px solid var(--border);background:transparent;color:var(--fg-dim);cursor:pointer;font-size:0.85em;max-width:220px;white-space:nowrap;user-select:none;}
+  .chat-tab:hover{background:var(--panel-2);color:var(--fg);}
+  .chat-tab.active{background:var(--panel-2);color:var(--fg);border-bottom:2px solid var(--accent);margin-bottom:-1px;}
+  .chat-tab .title{overflow:hidden;text-overflow:ellipsis;max-width:180px;}
+  .chat-tab .close{background:none;border:none;color:var(--fg-mute);padding:0 0.2em;margin-left:0.2em;cursor:pointer;border-radius:4px;font-size:1em;line-height:1;}
+  .chat-tab .close:hover{background:var(--panel);color:var(--fail);}
+  .chat-tab-new{display:inline-flex;align-items:center;justify-content:center;width:40px;border:none;border-right:1px solid var(--border);background:transparent;color:var(--fg-mute);cursor:pointer;font-size:1.1em;font-weight:500;}
+  .chat-tab-new:hover{background:var(--panel-2);color:var(--accent);}
   .chat-messages{flex:1;overflow-y:auto;padding:1em 1.2em;scroll-behavior:smooth;}
   .msg{margin-bottom:1.2em;max-width:90%;}
   .msg.user{margin-left:auto;}
@@ -582,7 +842,11 @@ CHAT_PAGE_JS = r"""
   const fileInput = document.getElementById('chat-file');
   const fileBtn = document.getElementById('chat-attach');
   const attachChips = document.getElementById('chat-attach-chips');
+  const tabsBar = document.getElementById('chat-tabs');
+  const threadMeta = document.getElementById('chat-thread-meta');
   let pendingAttachments = [];  // paths of uploaded files
+  let threads = [];             // [{id, title, last_at, ...}]
+  let activeThread = 'default';
 
   // Register PWA service worker (silent fail in dev).
   if ('serviceWorker' in navigator){
@@ -642,7 +906,7 @@ CHAT_PAGE_JS = r"""
 
   async function loadHistory(){
     try{
-      const r = await fetch(`/api/chat/${agentName}/history?limit=200`);
+      const r = await fetch(`/api/chat/${agentName}/history?limit=200&thread=${encodeURIComponent(activeThread)}`);
       const data = await r.json();
       messages.innerHTML = '';
       for (const m of data.history){
@@ -654,6 +918,126 @@ CHAT_PAGE_JS = r"""
     } catch(e){
       messages.innerHTML = '<div class="chat-empty">Failed to load history: ' + escapeHtml(e.message) + '</div>';
     }
+  }
+
+  // ---- tabs ----
+  function renderTabs(){
+    tabsBar.innerHTML = '';
+    for (const t of threads){
+      const tab = document.createElement('div');
+      tab.className = 'chat-tab' + (t.id === activeThread ? ' active' : '');
+      tab.dataset.tid = t.id;
+      const title = el('span', 'title', escapeHtml(t.title || t.id));
+      title.title = (t.history_lines || 0) + ' msgs · last ' + (t.last_at || '—');
+      tab.appendChild(title);
+      const x = el('button', 'close');
+      x.textContent = '×';
+      x.title = t.id === 'default' ? 'Clear this thread' : 'Close thread';
+      x.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const label = t.id === 'default' ? 'Clear the default thread?' : 'Close "' + (t.title || t.id) + '"?';
+        if (!confirm(label)) return;
+        await fetch(`/api/chat/${agentName}/threads/${encodeURIComponent(t.id)}`, {method: 'DELETE'});
+        if (t.id === activeThread && t.id !== 'default'){
+          // Fall back to the default thread.
+          activeThread = 'default';
+          setHash(activeThread);
+        }
+        await loadThreads();
+      });
+      tab.appendChild(x);
+      tab.addEventListener('click', () => switchThread(t.id));
+      // Double-click title to rename.
+      title.addEventListener('dblclick', async (ev) => {
+        ev.stopPropagation();
+        const next = prompt('Rename thread:', t.title || '');
+        if (next && next.trim()){
+          await fetch(`/api/chat/${agentName}/threads/${encodeURIComponent(t.id)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({title: next.trim()}),
+          });
+          await loadThreads();
+        }
+      });
+      tabsBar.appendChild(tab);
+    }
+    const plus = el('button', 'chat-tab-new');
+    plus.textContent = '+';
+    plus.title = 'New thread (Cmd/Ctrl+T)';
+    plus.addEventListener('click', () => newThread());
+    tabsBar.appendChild(plus);
+    updateThreadMeta();
+  }
+
+  function updateThreadMeta(){
+    const active = threads.find(t => t.id === activeThread);
+    if (!active){
+      threadMeta.textContent = 'thread ' + activeThread;
+      return;
+    }
+    const n = active.history_lines || 0;
+    threadMeta.textContent = (active.title || active.id) + ' · ' + n + ' msg' + (n === 1 ? '' : 's');
+  }
+
+  async function loadThreads(preserveActive){
+    try {
+      const r = await fetch(`/api/chat/${agentName}/threads`);
+      const data = await r.json();
+      threads = data.threads || [];
+      if (!threads.length){
+        threads = [{id: 'default', title: 'Default'}];
+      }
+      const want = preserveActive || activeThread;
+      if (!threads.find(t => t.id === want)){
+        activeThread = threads[0].id;
+        setHash(activeThread);
+      } else {
+        activeThread = want;
+      }
+      renderTabs();
+      await loadHistory();
+    } catch(e){
+      threadMeta.textContent = 'thread load failed';
+    }
+  }
+
+  async function newThread(){
+    try {
+      const r = await fetch(`/api/chat/${agentName}/threads`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+      });
+      const data = await r.json();
+      activeThread = data.thread.id;
+      setHash(activeThread);
+      await loadThreads(activeThread);
+      input.focus();
+    } catch(e){
+      alert('Failed to create thread: ' + e.message);
+    }
+  }
+
+  function switchThread(tid){
+    if (tid === activeThread) return;
+    activeThread = tid;
+    setHash(tid);
+    renderTabs();
+    loadHistory();
+    input.focus();
+  }
+
+  function setHash(tid){
+    const target = '#t=' + encodeURIComponent(tid);
+    if (location.hash !== target){
+      history.replaceState(null, '', target);
+    }
+  }
+
+  function readHash(){
+    const m = /^#t=([^&]+)/.exec(location.hash);
+    return m ? decodeURIComponent(m[1]) : null;
   }
 
   function renderChips(){
@@ -762,10 +1146,10 @@ CHAT_PAGE_JS = r"""
     const hasStreams = !isIOS && typeof ReadableStream !== 'undefined' && typeof TextDecoder !== 'undefined';
 
     try {
-      const resp = await fetch(`/api/chat/${agentName}/stream`, {
+      const resp = await fetch(`/api/chat/${agentName}/stream?thread=${encodeURIComponent(activeThread)}`, {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({prompt, attachments}),
+        body: JSON.stringify({prompt, attachments, thread: activeThread}),
       });
       if (!resp.ok){
         throw new Error('HTTP ' + resp.status);
@@ -795,10 +1179,12 @@ CHAT_PAGE_JS = r"""
           new Notification('@' + agentName + ' replied', {
             body: currentText.slice(0, 140),
             icon: '/static/icon-192.png',
-            tag: 'agentos-' + agentName,
+            tag: 'agentos-' + agentName + ':' + activeThread,
           });
         }
       }
+      // Refresh tab metadata (message counts, timestamps, auto-titled threads).
+      loadThreads(activeThread).catch(()=>{});
     } catch(e){
       assistantBubble.innerHTML = '<span style="color:var(--fail)">⚠️ ' + escapeHtml(e.message) + '</span>';
     } finally {
@@ -820,9 +1206,33 @@ CHAT_PAGE_JS = r"""
   send.addEventListener('click', sendPrompt);
 
   clearBtn.addEventListener('click', async () => {
-    if (!confirm('Reset session and clear chat history for @' + agentName + '?')) return;
-    await fetch(`/api/chat/${agentName}/clear`, {method: 'POST'});
-    await loadHistory();
+    const label = 'Reset session and clear the current thread for @' + agentName + '?';
+    if (!confirm(label)) return;
+    await fetch(`/api/chat/${agentName}/clear?thread=${encodeURIComponent(activeThread)}`, {method: 'POST'});
+    await loadThreads(activeThread);
+  });
+
+  // Keyboard shortcuts: Cmd/Ctrl+T = new thread; Cmd/Ctrl+W = close current tab.
+  document.addEventListener('keydown', (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod || e.altKey) return;
+    if (e.key === 't' || e.key === 'T'){
+      e.preventDefault();
+      newThread();
+    } else if ((e.key === 'w' || e.key === 'W') && activeThread !== 'default'){
+      e.preventDefault();
+      const active = threads.find(t => t.id === activeThread);
+      if (active && confirm('Close "' + (active.title || active.id) + '"?')){
+        fetch(`/api/chat/${agentName}/threads/${encodeURIComponent(active.id)}`, {method: 'DELETE'})
+          .then(() => { activeThread = 'default'; setHash('default'); return loadThreads(); });
+      }
+    }
+  });
+  window.addEventListener('hashchange', () => {
+    const hashTid = readHash();
+    if (hashTid && hashTid !== activeThread && threads.find(t => t.id === hashTid)){
+      switchThread(hashTid);
+    }
   });
 
   fileBtn.addEventListener('click', () => fileInput.click());
@@ -883,7 +1293,10 @@ CHAT_PAGE_JS = r"""
     }
   });
 
-  loadHistory();
+  // Bootstrap: honour #t=<id> in the URL if present.
+  const initial = readHash();
+  if (initial) activeThread = initial;
+  loadThreads(activeThread);
   input.focus();
 })();
 """
@@ -913,9 +1326,10 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
     <div class="chat-main" id="chat-pane">
       <div class="chat-header">
         <h2>@{esc(agent)}</h2>
-        <span class="meta">direct chat</span>
-        <button id="chat-clear">reset</button>
+        <span class="meta" id="chat-thread-meta">loading threads…</span>
+        <button id="chat-clear" title="Reset the current thread">reset</button>
       </div>
+      <div id="chat-tabs" class="chat-tabs"></div>
       <div id="chat-messages" class="chat-messages"></div>
       <div id="chat-attach-chips" class="chat-attach-chips"></div>
       <div class="chat-input">
