@@ -9,7 +9,7 @@ system_prompt_file: ""
 
 # Skill markdown files appended after the layered prompt.
 skills:
-  - ../../shared/skills/dev-browser.md
+  - skill:dev-browser
 
 allowed_tools: []
 disallowed_tools: []
@@ -17,7 +17,7 @@ disallowed_tools: []
 # Optional overrides:
 # model: claude-haiku-4-5-20251001
 # permission_mode: acceptEdits
-# max_turns: 20
+max_turns: 40  # bumped 2026-04-19 — outbound posting (browser automation) needs more room than read-only monitoring
 
 allow_bots: true
 effort: low

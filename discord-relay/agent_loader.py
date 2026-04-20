@@ -27,8 +27,10 @@ SHARED_FILES = [
     "AGENT_COMMS.md",
     "SUBAGENTS.md",
     "MEMORY_STACK.md",  # architecture doc; distinct from per-agent MEMORY.md
+    "WORKSPACE.md",     # canonical per-agent folder layout (doctor/status/audit depend on this)
     "MODELS.md",        # catalog of available Claude models + when to use which
     "APPROVALS.md",     # operator-reaction gate for dangerous Bash
+    "CAVEMAN.md",       # compressed communication mode (~75% token cut on non-customer output)
 ]
 
 
@@ -58,14 +60,48 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _resolve_skill_ref(agent_dir: Path, ref: str) -> Path | None:
+    """Resolve a skill reference into a filesystem path.
+
+    Supported forms:
+      - `skill:<name>` → shared/skills/<name>/SKILL.md   (bundle convention)
+      - `local:<name>` → <agent_dir>/skills/<name>/SKILL.md (per-agent)
+      - `<relative-path>.md` → legacy path form, resolved against agent_dir
+
+    Returns the resolved Path or None if nothing matched.
+    """
+    if ref.startswith("skill:"):
+        name = ref.split(":", 1)[1].strip()
+        candidate = SHARED_DIR / "skills" / name / "SKILL.md"
+        if candidate.exists():
+            return candidate
+        # Back-compat: flat file form shared/skills/<name>.md
+        flat = SHARED_DIR / "skills" / f"{name}.md"
+        return flat if flat.exists() else None
+    if ref.startswith("local:"):
+        name = ref.split(":", 1)[1].strip()
+        candidate = agent_dir / "skills" / name / "SKILL.md"
+        if candidate.exists():
+            return candidate
+        flat = agent_dir / "skills" / f"{name}.md"
+        return flat if flat.exists() else None
+    # Legacy: relative path from agent_dir
+    p = (agent_dir / ref).resolve()
+    return p if p.exists() else None
+
+
 def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
     """Concatenate skill markdown files into one block appended to the
-    system prompt. Mirrors how CLAUDE.md skills are surfaced."""
+    system prompt. Supports `skill:<name>`, `local:<name>`, and legacy
+    relative-path refs. Mirrors how CLAUDE.md skills are surfaced."""
     parts: list[str] = []
-    for rel in skill_files:
-        p = (agent_dir / rel).resolve()
-        if p.exists():
-            parts.append(f"## Skill: {p.stem}\n\n{p.read_text()}")
+    for ref in skill_files:
+        p = _resolve_skill_ref(agent_dir, ref)
+        if p is None:
+            continue
+        # Stem-only title for single files; parent dir name for bundles.
+        title = p.parent.name if p.name == "SKILL.md" else p.stem
+        parts.append(f"## Skill: {title}\n\n{p.read_text()}")
     return "\n\n".join(parts)
 
 

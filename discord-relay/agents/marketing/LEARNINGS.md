@@ -56,4 +56,14 @@ Use one block per lesson. Keep each entry small and sharp.
 - **Why:** Option A (revivals + yoga fresh + insurance T2) works for today but exhausts revival-eligible names within a week or two.
 - **How to apply:** When Apollo comes back online, the cron task prompt should prefer Apollo enrichment over CRM revivals. Keep the revival path as fallback only.
 
+## 2026-04-18 — Apollo-verified is a hard requirement, not a preference
+- **Learned:** Every queued email must come back `email_status: verified` from Apollo. No LinkedIn guesses, no `firstname@company.com` patterns, no ⚠️ flagged sends.
+- **Why:** Apr 16 batch had 4 yoga sends on pattern-guessed addresses. Dhruv explicitly ruled that out on Apr 18: "make sure those emails exist from apollo". Bounces damage sender reputation on `vayu-prana.com` and show up as zero replies for reasons unrelated to campaign quality.
+- **How to apply:** If Apollo returns no verified address for a candidate, drop them — never substitute a guess. If Apollo MCP is down for a batch, post a name-only shortlist and ask Dhruv how to proceed. Re-verify any CRM-sourced address (revivals, T2s) before queueing — addresses on file may be stale.
+
+## 2026-04-19 — Send autonomy granted; escalation gate is the shape of trust
+- **Learned:** Dhruv delegated send authority for outreach on 2026-04-19: "please dont ask me from now on, you send email with proper research and body and signature, you check my emails and loop to make sure we have more and more replies". Daily 9 AM batch sends without approval. Inbox replies I can handle alone get handled. But the trust has a boundary — anything binding (pricing, contracts, equity, intros to third parties, calendar holds) still escalates.
+- **Why:** Approval-per-email was the bottleneck limiting outreach velocity. Dhruv trusts the shape of the pipeline (Apollo-verified + voice-sampled + humanizer pass + red lines) enough to let it run. But he still owns the business decisions that ride on replies.
+- **How to apply:** (1) The cron sends autonomously. (2) For each inbound reply: if the answer is already in `Company/FACTS.md` / `STRATEGY.md` / the deck, I reply in Dhruv's voice. If it's a commitment, intro request, pricing, terms, or scheduling — escalate to #marketing-finance-pr with a one-line flag, no reply sent. (3) Every send + reply goes in `CRM/_contacted.md` with status so Dhruv can audit. (4) Weekly report holds me accountable — if reply rate dips below 2% in any category, I pause and propose a pivot, not more volume.
+
 <!-- learnings:end -->

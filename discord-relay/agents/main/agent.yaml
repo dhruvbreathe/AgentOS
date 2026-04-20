@@ -14,7 +14,7 @@ system_prompt_file: ""
 
 # Optional: list of skill markdown files appended to the system prompt.
 skills:
-  - ../../shared/skills/dev-browser.md
+  - skill:dev-browser
 
 # Tools on top of the defaults in config.yaml.
 allowed_tools: []

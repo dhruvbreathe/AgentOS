@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from agent_loader import AgentConfig, load_all_agents, load_global
 from agent_tools import parse_routing_header
 from relay import DiscordMessageSink, run_agent
+from transcribe import is_audio, transcribe
 
 load_dotenv()
 
@@ -242,9 +243,39 @@ class RelayBot(discord.Client):
         # these as .attachments, not in .content, so they're invisible
         # unless we surface them explicitly.
         attach_paths = await self._download_attachments(message)
+
+        # Transcribe any audio attachments — voice messages are just .ogg
+        # files in Discord. We inject the transcript inline so the agent
+        # sees spoken input as if it were typed.
+        transcripts: list[tuple[Path, str]] = []
+        for p in attach_paths:
+            if is_audio(p):
+                text = await transcribe(p)
+                if text:
+                    transcripts.append((p, text))
+                    log.info("[%s] transcribed %s: %s",
+                             self.label, p.name, text[:120])
+
+        voice_block = ""
+        if transcripts:
+            parts = []
+            for p, text in transcripts:
+                parts.append(f"> _(voice message {p.name})_\n> {text}")
+            voice_block = "\n\n**Voice transcript:**\n" + "\n\n".join(parts)
+
+        # If the message has no text body but does have a transcript,
+        # promote the transcript as the effective body so agents that
+        # check "did the user say anything?" still see intent.
+        if not body.strip() and transcripts:
+            body = transcripts[0][1]
+            voice_block = ""  # already in body
+
+        # Only list non-audio attachments in the file list — audio files
+        # are already represented by their transcripts.
+        non_audio = [p for p in attach_paths if not is_audio(p)]
         attach_block = ""
-        if attach_paths:
-            lines = [f"- `{p}`" for p in attach_paths]
+        if non_audio:
+            lines = [f"- `{p}`" for p in non_audio]
             attach_block = (
                 "\n\n**Attached files** (saved locally, you can `Read` "
                 "them directly):\n" + "\n".join(lines)
@@ -252,6 +283,7 @@ class RelayBot(discord.Client):
 
         prompt = (
             f"[Discord #{message.channel.name} — from {author}]\n\n{body}"
+            + voice_block
             + attach_block
         )
 
