@@ -531,6 +531,7 @@ def api_connectors_list(agent: str | None = None):
     env_present = _env_vars_set()
     enabled_mcp: set[str] = set()
     enabled_env_passthrough: set[str] = set()
+    agent_env_literal: dict[str, str] = {}
     if agent:
         if agent not in _list_agents():
             raise HTTPException(404, "no such agent")
@@ -538,6 +539,9 @@ def api_connectors_list(agent: str | None = None):
         mcp = cfg.get("mcp_servers") or {}
         enabled_mcp = set(mcp.keys()) if isinstance(mcp, dict) else set()
         enabled_env_passthrough = set(cfg.get("env_passthrough") or [])
+        env_lit = cfg.get("env") or {}
+        if isinstance(env_lit, dict):
+            agent_env_literal = {str(k): str(v) for k, v in env_lit.items()}
 
     result = []
     for c in registry:
@@ -548,16 +552,42 @@ def api_connectors_list(agent: str | None = None):
             item["enabled"] = c["id"] in enabled_mcp
         elif c.get("kind") == "env_key":
             required = c.get("env_vars") or []
-            item["credentials_ready"] = all(v in env_present for v in required)
-            # Enabled = env_passthrough carries all required vars (agent sees them)
-            item["enabled"] = bool(required) and all(v in enabled_env_passthrough for v in required)
-            item["missing_env_vars"] = [v for v in required if v not in env_present]
+            per_agent = (c.get("per_agent_env") or {}) if isinstance(c.get("per_agent_env"), dict) else {}
+            # Global vars = required vars NOT marked per-agent. Those live in .env.
+            global_vars = [v for v in required if v not in per_agent]
+            per_agent_vars = [v for v in required if v in per_agent]
+            item["credentials_ready"] = all(v in env_present for v in global_vars)
+            # Enabled = env_passthrough covers global vars AND every per-agent var
+            # has a value set in this agent's env: literal block.
+            has_global = bool(global_vars) and all(v in enabled_env_passthrough for v in global_vars)
+            has_per_agent = all(v in agent_env_literal and agent_env_literal[v] for v in per_agent_vars)
+            # Backward compat: if the legacy flow had per-agent vars in
+            # env_passthrough (so they fell back to the global .env), treat as
+            # enabled-via-legacy. User can Edit to migrate to per-agent yaml.
+            legacy_per_agent = all(
+                v in enabled_env_passthrough and v in env_present
+                for v in per_agent_vars
+            )
+            item["legacy_per_agent"] = (
+                bool(per_agent_vars) and not has_per_agent and legacy_per_agent
+            )
+            if not global_vars and per_agent_vars:
+                item["enabled"] = has_per_agent or legacy_per_agent
+            else:
+                item["enabled"] = has_global and (has_per_agent or legacy_per_agent)
+            item["missing_env_vars"] = [v for v in global_vars if v not in env_present]
+            # Per-agent value currently set for this agent (empty if not yet).
+            item["per_agent_values"] = {v: agent_env_literal.get(v, "") for v in per_agent_vars}
         result.append(item)
     return {"connectors": result}
 
 
 class ConnectorToggle(BaseModel):
     enable: bool
+    # Per-agent env overrides (e.g. SENTRY_PROJECT). Written to agent.yaml
+    # `env:` block instead of the global .env so each agent can hold a
+    # different value.
+    per_agent_values: dict[str, str] | None = None
 
 
 @router.post("/api/agents/{name}/connectors/{connector_id}")
@@ -590,21 +620,53 @@ def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle)
 
     elif kind == "env_key":
         required = connector.get("env_vars") or []
+        per_agent = connector.get("per_agent_env") or {}
+        if not isinstance(per_agent, dict):
+            per_agent = {}
+        # Split: global vars live in .env; per_agent vars live in agent.yaml `env:`.
+        global_vars = [v for v in required if v not in per_agent]
+        per_agent_vars = [v for v in required if v in per_agent]
+
         env_pass = doc.get("env_passthrough")
         if not isinstance(env_pass, list):
             env_pass = []
         env_pass_set = set(env_pass)
+
+        # Load existing env: literal block
+        env_literal = doc.get("env")
+        if not isinstance(env_literal, (CommentedMap, dict)):
+            env_literal = CommentedMap()
+
         if payload.enable:
             env_present = _env_vars_set()
-            missing = [v for v in required if v not in env_present]
+            missing = [v for v in global_vars if v not in env_present]
             if missing:
                 raise HTTPException(400, {
                     "error": "missing_credentials",
                     "missing_env_vars": missing,
                     "message": f"Set these in .env first: {', '.join(missing)}. Secrets never flow through chat.",
                 })
-            for v in required:
+            # Per-agent values must be provided if the connector defines any.
+            provided = payload.per_agent_values or {}
+            missing_per_agent = [v for v in per_agent_vars if not provided.get(v, "").strip()
+                                 and not str(env_literal.get(v, "")).strip()]
+            if missing_per_agent:
+                raise HTTPException(400, {
+                    "error": "missing_per_agent_values",
+                    "missing_per_agent": missing_per_agent,
+                    "message": (
+                        f"Per-agent value required: {', '.join(missing_per_agent)}. "
+                        f"Each agent targets a different project — provide the slug for this agent."
+                    ),
+                })
+            # env_passthrough carries the global vars only
+            for v in global_vars:
                 env_pass_set.add(v)
+            # env: literal holds per-agent values (overrides env_passthrough at load time)
+            for v in per_agent_vars:
+                val = provided.get(v, "").strip()
+                if val:
+                    env_literal[v] = val
             # Mirror as an mcp_servers note too, so the agent's system prompt mentions it
             mcp = doc.get("mcp_servers")
             if not isinstance(mcp, (CommentedMap, dict)):
@@ -615,14 +677,23 @@ def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle)
             entry["note"] = connector.get("note") or connector.get("description") or connector["name"]
             mcp[connector_id] = entry
         else:
-            for v in required:
+            for v in global_vars:
                 env_pass_set.discard(v)
+            for v in per_agent_vars:
+                if v in env_literal:
+                    del env_literal[v]
             mcp = doc.get("mcp_servers")
             if isinstance(mcp, (CommentedMap, dict)) and connector_id in mcp:
                 del mcp[connector_id]
+
         doc["env_passthrough"] = sorted(env_pass_set) if env_pass_set else []
         if not doc["env_passthrough"]:
             del doc["env_passthrough"]
+        # Keep env: literal around only if it has values
+        if env_literal:
+            doc["env"] = env_literal
+        elif "env" in doc:
+            del doc["env"]
     else:
         raise HTTPException(400, f"unsupported connector kind: {kind}")
 
@@ -1646,7 +1717,9 @@ EDIT_JS = r"""
     if (c.enabled) card.classList.add('enabled');
     if (c.kind === 'env_key' && !c.credentials_ready) card.classList.add('needs-setup');
     const statusBadge = c.enabled
-      ? '<span class="conn-badge enabled">connected</span>'
+      ? (c.legacy_per_agent
+          ? '<span class="conn-badge enabled" title="Using global .env value — click Edit to set a per-agent slug">connected (legacy)</span>'
+          : '<span class="conn-badge enabled">connected</span>')
       : (c.kind === 'env_key' && !c.credentials_ready)
         ? '<span class="conn-badge needs-setup">needs .env</span>'
         : '<span class="conn-badge">available</span>';
@@ -1656,11 +1729,21 @@ EDIT_JS = r"""
     const missingBlock = (c.kind === 'env_key' && !c.credentials_ready && c.missing_env_vars?.length)
       ? `<div class="conn-missing">Set in <code>.env</code>: ${c.missing_env_vars.map(v=>`<code>${escHtml(v)}</code>`).join(' ')}</div>`
       : '';
-    const btn = c.enabled
-      ? `<button class="conn-btn danger" data-action="disconnect" data-id="${escAttr(c.id)}">Disconnect</button>`
-      : (c.kind === 'env_key' && !c.credentials_ready)
-        ? `<button class="conn-btn primary" data-action="setup" data-id="${escAttr(c.id)}">Add credentials</button>`
-        : `<button class="conn-btn primary" data-action="connect" data-id="${escAttr(c.id)}">Connect</button>`;
+    const hasPerAgent = c.kind === 'env_key' && c.per_agent_env && Object.keys(c.per_agent_env).length > 0;
+    let btn;
+    if (c.enabled) {
+      const editBtn = hasPerAgent
+        ? `<button class="conn-btn" data-action="edit" data-id="${escAttr(c.id)}">Edit</button>`
+        : '';
+      btn = `${editBtn}<button class="conn-btn danger" data-action="disconnect" data-id="${escAttr(c.id)}">Disconnect</button>`;
+    } else if (c.kind === 'env_key' && !c.credentials_ready) {
+      btn = `<button class="conn-btn primary" data-action="setup" data-id="${escAttr(c.id)}">Add credentials</button>`;
+    } else if (hasPerAgent) {
+      // Global creds ready but this agent still needs its per-agent value — modal, not direct toggle.
+      btn = `<button class="conn-btn primary" data-action="setup" data-id="${escAttr(c.id)}">Connect</button>`;
+    } else {
+      btn = `<button class="conn-btn primary" data-action="connect" data-id="${escAttr(c.id)}">Connect</button>`;
+    }
     card.innerHTML = `
       <div class="conn-head">
         <span class="conn-emoji">${c.emoji || '🔌'}</span>
@@ -1675,15 +1758,15 @@ EDIT_JS = r"""
         ${kindChip}
       </div>
     `;
-    const actionBtn = card.querySelector('[data-action]');
-    if (actionBtn) {
+    for (const actionBtn of card.querySelectorAll('[data-action]')) {
       actionBtn.onclick = async () => {
         const action = actionBtn.dataset.action;
         const id = actionBtn.dataset.id;
-        if (action === 'setup') {
+        if (action === 'setup' || action === 'edit') {
           openCredModal(c);
           return;
         }
+        const originalLabel = actionBtn.textContent;
         actionBtn.disabled = true;
         actionBtn.textContent = action === 'connect' ? 'Connecting…' : 'Disconnecting…';
         try {
@@ -1697,7 +1780,7 @@ EDIT_JS = r"""
             const msg = j.detail?.message || j.detail?.error || j.detail || 'toggle failed';
             toast(msg, 'fail', 6000);
             actionBtn.disabled = false;
-            actionBtn.textContent = action === 'connect' ? 'Connect' : 'Disconnect';
+            actionBtn.textContent = originalLabel;
             return;
           }
           toast(`${action === 'connect' ? 'connected' : 'disconnected'} + restart signaled`, 'ok');
@@ -1725,18 +1808,48 @@ EDIT_JS = r"""
     const fieldsDiv = $('conn-modal-fields');
     fieldsDiv.innerHTML = '';
     const vars = c.env_vars || [];
+    const perAgent = c.per_agent_env || {};
+    const perAgentVals = c.per_agent_values || {};
+    // Group 1: global .env fields
     for (const v of vars) {
+      if (v in perAgent) continue;  // handled below
       const already = !(c.missing_env_vars || []).includes(v);
       const label = document.createElement('label');
       label.innerHTML = `${escHtml(v)}${already ? ' <span class="dim" style="font-size:0.78em;">(already set — overwrite optional)</span>' : ''}`;
       const input = document.createElement('input');
       input.type = v.toLowerCase().includes('secret') || v.toLowerCase().includes('key') || v.toLowerCase().includes('token') || v.toLowerCase().includes('password') ? 'password' : 'text';
       input.dataset.var = v;
+      input.dataset.scope = 'global';
       input.placeholder = already ? '(leave blank to keep)' : `paste ${v}`;
       input.autocomplete = 'off';
       input.spellcheck = false;
       label.appendChild(input);
       fieldsDiv.appendChild(label);
+    }
+    // Group 2: per-agent fields, if any
+    if (Object.keys(perAgent).length) {
+      const hr = document.createElement('div');
+      hr.className = 'dim';
+      hr.style.cssText = 'margin:0.8em 0 0.3em 0;font-size:0.82em;border-top:1px dashed var(--border);padding-top:0.6em;';
+      hr.innerHTML = `Per-agent values (stored in <code>agents/${escHtml(AGENT_NAME)}/agent.yaml</code>)`;
+      fieldsDiv.appendChild(hr);
+      for (const v of Object.keys(perAgent)) {
+        const meta = perAgent[v] || {};
+        const existing = perAgentVals[v] || '';
+        const label = document.createElement('label');
+        const labelText = meta.label ? `${escHtml(meta.label)} <span class="dim" style="font-size:0.78em;">(${escHtml(v)})</span>` : escHtml(v);
+        label.innerHTML = `${labelText}${existing ? ` <span class="dim" style="font-size:0.78em;">(current: ${escHtml(existing)})</span>` : ''}`;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.dataset.var = v;
+        input.dataset.scope = 'per_agent';
+        input.value = existing;
+        input.placeholder = meta.placeholder || `value for ${v}`;
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        label.appendChild(input);
+        fieldsDiv.appendChild(label);
+      }
     }
     $('connModal').classList.remove('hidden');
     setTimeout(() => fieldsDiv.querySelector('input')?.focus(), 50);
@@ -1756,42 +1869,60 @@ EDIT_JS = r"""
     if (!_connModalCtx) return;
     const c = _connModalCtx;
     const submitBtn = $('connSubmit');
-    const values = {};
+    const globalValues = {};
+    const perAgentValues = {};
     const inputs = $('conn-modal-fields').querySelectorAll('input[data-var]');
     for (const inp of inputs) {
       const v = inp.value.trim();
-      if (v) values[inp.dataset.var] = v;
+      if (!v) continue;
+      if (inp.dataset.scope === 'per_agent') {
+        perAgentValues[inp.dataset.var] = v;
+      } else {
+        globalValues[inp.dataset.var] = v;
+      }
     }
-    // Allow submit only if user either filled in all missing vars, or re-entered at least one.
+    // Validate: all missing global vars covered + every per-agent var has a value
+    // (existing per-agent values count — the modal pre-fills them).
     const missing = c.missing_env_vars || [];
-    const stillMissing = missing.filter(v => !(v in values));
-    if (stillMissing.length) {
-      toast(`still missing: ${stillMissing.join(', ')}`, 'fail', 5000);
+    const stillMissingGlobal = missing.filter(v => !(v in globalValues));
+    if (stillMissingGlobal.length) {
+      toast(`still missing: ${stillMissingGlobal.join(', ')}`, 'fail', 5000);
+      return;
+    }
+    const perAgentKeys = Object.keys(c.per_agent_env || {});
+    const existingPerAgent = c.per_agent_values || {};
+    const stillMissingPerAgent = perAgentKeys.filter(
+      v => !(perAgentValues[v] || existingPerAgent[v]));
+    if (stillMissingPerAgent.length) {
+      toast(`per-agent value required: ${stillMissingPerAgent.join(', ')}`, 'fail', 5000);
       return;
     }
     submitBtn.disabled = true;
     submitBtn.textContent = 'Saving…';
     try {
-      const envRes = await fetch('/api/env/write', {
-        method: 'POST',
-        headers: {'content-type': 'application/json'},
-        body: JSON.stringify({ values, connector_id: c.id }),
-      });
-      const envJ = await envRes.json();
-      if (!envRes.ok) {
-        const msg = envJ.detail?.message || envJ.detail || envJ.error || 'env write failed';
-        toast(msg, 'fail', 6000);
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Save & connect';
-        return;
+      // 1. Write global credentials to .env (only if any were actually provided)
+      let envJ = { count: 0 };
+      if (Object.keys(globalValues).length) {
+        const envRes = await fetch('/api/env/write', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({ values: globalValues, connector_id: c.id }),
+        });
+        envJ = await envRes.json();
+        if (!envRes.ok) {
+          const msg = envJ.detail?.message || envJ.detail || envJ.error || 'env write failed';
+          toast(msg, 'fail', 6000);
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Save & connect';
+          return;
+        }
       }
-      // Now toggle the connector on — /api/env/write already updated os.environ
-      // so credentials_ready check on the server will pass.
+      // 2. Toggle connector on + pass per-agent values (stored in agent.yaml)
       submitBtn.textContent = 'Connecting…';
       const togRes = await fetch(`/api/agents/${AGENT_NAME}/connectors/${encodeURIComponent(c.id)}`, {
         method: 'POST',
         headers: {'content-type': 'application/json'},
-        body: JSON.stringify({ enable: true }),
+        body: JSON.stringify({ enable: true, per_agent_values: perAgentValues }),
       });
       const togJ = await togRes.json();
       if (!togRes.ok) {
@@ -1801,7 +1932,12 @@ EDIT_JS = r"""
         submitBtn.textContent = 'Save & connect';
         return;
       }
-      toast(`${c.name} connected (${envJ.count} var${envJ.count === 1 ? '' : 's'} written to .env)`, 'ok', 4500);
+      const globalCount = envJ.count || 0;
+      const perAgentCount = Object.keys(perAgentValues).length;
+      const bits = [];
+      if (globalCount) bits.push(`${globalCount} to .env`);
+      if (perAgentCount) bits.push(`${perAgentCount} per-agent in agent.yaml`);
+      toast(`${c.name} connected (${bits.join(', ') || 'updated'})`, 'ok', 4500);
       closeCredModal();
       await loadConnectors();
       await loadConfig();

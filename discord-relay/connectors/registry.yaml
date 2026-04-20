@@ -82,8 +82,14 @@ connectors:
     emoji: "🛡️"
     kind: env_key
     env_vars: [SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT]
+    # Per-agent overrides: values go into agent.yaml `env:` block instead of
+    # the global .env, so each agent can target a different Sentry project.
+    per_agent_env:
+      SENTRY_PROJECT:
+        label: "Project slug for this agent"
+        placeholder: "e.g. vayu-web, vayu-android, vayu-ios"
     docs_url: "https://sentry.io/settings/account/api/auth-tokens/"
-    docs_help: "Create an auth token. Scopes: project:read, event:read. Grab org slug + project slug from your project URL."
+    docs_help: "Auth token + org slug are shared across agents (written to .env). Project slug is per-agent — each agent targets a different Sentry project."
     description: "Error tracking, crash reports, release monitoring."
     note: "Sentry — crash reports, error tracking across iOS, Android, web. Release monitoring."
 
