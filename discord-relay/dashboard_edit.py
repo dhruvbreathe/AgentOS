@@ -667,7 +667,10 @@ def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle)
                 val = provided.get(v, "").strip()
                 if val:
                     env_literal[v] = val
-            # Mirror as an mcp_servers note too, so the agent's system prompt mentions it
+            # Mirror as an mcp_servers note too, so the agent's system prompt mentions it.
+            # For env_key connectors we also stamp the HTTP API recipe — env var
+            # names, endpoint base, and example curl calls — so the agent doesn't
+            # waste turns searching for a non-existent MCP tool.
             mcp = doc.get("mcp_servers")
             if not isinstance(mcp, (CommentedMap, dict)):
                 mcp = CommentedMap()
@@ -675,6 +678,15 @@ def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle)
             entry = CommentedMap()
             entry["type"] = "env"
             entry["note"] = connector.get("note") or connector.get("description") or connector["name"]
+            entry["env_vars"] = list(required)
+            if connector.get("api_base"):
+                entry["api_base"] = connector["api_base"]
+            if connector.get("api_auth"):
+                entry["api_auth"] = connector["api_auth"]
+            if connector.get("api_hints"):
+                entry["api_hints"] = list(connector["api_hints"])
+            if connector.get("docs_url"):
+                entry["docs_url"] = connector["docs_url"]
             mcp[connector_id] = entry
         else:
             for v in global_vars:

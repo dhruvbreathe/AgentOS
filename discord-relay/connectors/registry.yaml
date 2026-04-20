@@ -92,6 +92,14 @@ connectors:
     docs_help: "Auth token + org slug are shared across agents (written to .env). Project slug is per-agent — each agent targets a different Sentry project."
     description: "Error tracking, crash reports, release monitoring."
     note: "Sentry — crash reports, error tracking across iOS, Android, web. Release monitoring."
+    # HTTP API recipe — injected into the agent's system prompt so it knows
+    # exactly how to call this without wasting turns searching for MCP tools.
+    api_base: "https://sentry.io/api/0"
+    api_auth: "Authorization: Bearer $SENTRY_AUTH_TOKEN"
+    api_hints:
+      - "List issues: curl -H \"Authorization: Bearer $SENTRY_AUTH_TOKEN\" \"https://sentry.io/api/0/projects/$SENTRY_ORG/$SENTRY_PROJECT/issues/?statsPeriod=24h\""
+      - "Recent events on an issue: curl -H \"Authorization: Bearer $SENTRY_AUTH_TOKEN\" \"https://sentry.io/api/0/issues/{issue_id}/events/\""
+      - "Project stats: curl -H \"Authorization: Bearer $SENTRY_AUTH_TOKEN\" \"https://sentry.io/api/0/projects/$SENTRY_ORG/$SENTRY_PROJECT/stats/?stat=received&resolution=1d\""
 
   - id: github
     name: GitHub

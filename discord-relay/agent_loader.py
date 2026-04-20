@@ -368,30 +368,93 @@ def load_agent(name: str) -> AgentConfig:
     defaults = global_cfg.get("defaults", {}) or {}
 
     # Parse mcp_servers early so note-only entries can be folded into the
-    # system prompt as "integrations available" hints.
+    # system prompt as "integrations available" hints. Three buckets:
+    #   - real MCP server cfg (command/url/instance)  -> pass through to SDK
+    #   - type: mcp note                              -> "available via parent MCP" list
+    #   - type: env note                              -> "available via HTTP API" list
+    #                                                    with env vars + endpoint recipe
     raw_mcp = agent_cfg.get("mcp_servers") or {}
     mcp_servers: dict[str, Any] = {}
     mcp_notes: list[tuple[str, str]] = []
+    env_integrations: list[dict] = []
+
+    # Lazy-load connector registry so older agent.yaml entries (written before
+    # the api_* fields existed) still get enriched at prompt-build time.
+    _registry_by_id: dict[str, dict] = {}
+    try:
+        import yaml as _yaml  # type: ignore
+        _reg_path = Path(__file__).resolve().parent / "connectors" / "registry.yaml"
+        if _reg_path.exists():
+            _reg = _yaml.safe_load(_reg_path.read_text()) or {}
+            for c in _reg.get("connectors") or []:
+                if c.get("id"):
+                    _registry_by_id[c["id"]] = c
+    except Exception:
+        _registry_by_id = {}
+
     for mcp_name, mcp_cfg in raw_mcp.items():
         if isinstance(mcp_cfg, dict) and (
             "command" in mcp_cfg or "url" in mcp_cfg or "instance" in mcp_cfg
         ):
             mcp_servers[mcp_name] = mcp_cfg
+            continue
+        cfg = mcp_cfg if isinstance(mcp_cfg, dict) else {}
+        note = cfg.get("note") if isinstance(mcp_cfg, dict) else str(mcp_cfg)
+        note = note or "(no description)"
+        # Registry fallback: if the yaml entry is bare (old format), pull the
+        # recipe straight from the registry.
+        reg = _registry_by_id.get(mcp_name) or {}
+        if cfg.get("type") == "env" or reg.get("kind") == "env_key":
+            env_integrations.append({
+                "name": mcp_name,
+                "note": note,
+                "env_vars": cfg.get("env_vars") or reg.get("env_vars") or [],
+                "api_base": cfg.get("api_base") or reg.get("api_base"),
+                "api_auth": cfg.get("api_auth") or reg.get("api_auth"),
+                "api_hints": cfg.get("api_hints") or reg.get("api_hints") or [],
+                "docs_url": cfg.get("docs_url") or reg.get("docs_url"),
+            })
         else:
-            note = (
-                (mcp_cfg or {}).get("note") if isinstance(mcp_cfg, dict) else str(mcp_cfg)
-            )
-            mcp_notes.append((mcp_name, note or "(no description)"))
+            mcp_notes.append((mcp_name, note))
 
-    mcp_note_block = ""
+    blocks: list[str] = []
     if mcp_notes:
         lines = [f"- **{n}** — {d}" for n, d in mcp_notes]
-        mcp_note_block = (
+        blocks.append(
             "## Integrations available via parent MCP\n\n"
             "These services are reachable through the Claude Code CLI's "
             "shared MCP servers (not a per-agent stdio transport). Use them "
             "when the task requires them.\n\n" + "\n".join(lines)
         )
+    if env_integrations:
+        parts = [
+            "## Integrations available via HTTP API (env-key)",
+            "",
+            "These services are **NOT** MCP tools. They're plain HTTP APIs you "
+            "reach with `Bash` + `curl`, authed via environment variables the "
+            "relay has injected for you. **Do not search for MCP tools for "
+            "these** — `ToolSearch` will return nothing and you'll waste turns.",
+            "",
+        ]
+        for it in env_integrations:
+            parts.append(f"### {it['name']}")
+            parts.append(f"{it['note']}")
+            if it["env_vars"]:
+                parts.append(f"- **Env vars available:** {', '.join(f'`${v}`' for v in it['env_vars'])}")
+            if it["api_base"]:
+                parts.append(f"- **API base:** `{it['api_base']}`")
+            if it["api_auth"]:
+                parts.append(f"- **Auth:** `{it['api_auth']}`")
+            if it["api_hints"]:
+                parts.append("- **Example calls:**")
+                for hint in it["api_hints"]:
+                    parts.append(f"  - `{hint}`")
+            if it["docs_url"]:
+                parts.append(f"- **Docs:** {it['docs_url']}")
+            parts.append("")
+        blocks.append("\n".join(parts).rstrip())
+
+    mcp_note_block = "\n\n".join(blocks)
 
     # System prompt: shared universals + layered per-agent files + optional
     # legacy system_prompt.md + skills + inline integration notes.
