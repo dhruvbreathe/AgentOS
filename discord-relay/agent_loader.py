@@ -439,6 +439,33 @@ def load_agent(name: str) -> AgentConfig:
         enabled=bool(approval_cfg.get("enabled", True)),
     )
 
+    # Additional SDK pass-through fields: thinking budget, session forking,
+    # output format, file checkpointing, task budget. All optional — only set
+    # on the dataclass when the agent config provides a value.
+    _opts_extra: dict = {}
+    _mtt = agent_cfg.get("max_thinking_tokens") or defaults.get("max_thinking_tokens")
+    if _mtt is not None:
+        _opts_extra["max_thinking_tokens"] = int(_mtt)
+    _fs = agent_cfg.get("fork_session")
+    if _fs is None:
+        _fs = defaults.get("fork_session")
+    if _fs is not None:
+        _opts_extra["fork_session"] = bool(_fs)
+    _of = agent_cfg.get("output_format") or defaults.get("output_format")
+    if _of is not None:
+        _opts_extra["output_format"] = _of
+    _efc = agent_cfg.get("enable_file_checkpointing")
+    if _efc is None:
+        _efc = defaults.get("enable_file_checkpointing")
+    if _efc is not None:
+        _opts_extra["enable_file_checkpointing"] = bool(_efc)
+    _tb = agent_cfg.get("task_budget") or defaults.get("task_budget")
+    if _tb is not None:
+        if isinstance(_tb, int):
+            _opts_extra["task_budget"] = {"total": _tb}
+        elif isinstance(_tb, dict) and "total" in _tb:
+            _opts_extra["task_budget"] = {"total": int(_tb["total"])}
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -469,6 +496,7 @@ def load_agent(name: str) -> AgentConfig:
             "PreCompact": [HookMatcher(hooks=[on_precompact])],
         },
         include_partial_messages=True,  # enable token-level streaming
+        **_opts_extra,
     )
 
     primary = str(agent_cfg["channel_id"])

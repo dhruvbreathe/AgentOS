@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -66,7 +66,7 @@ KNOWN_TOOLS = [
 ]
 
 KNOWN_EFFORT = ["", "low", "medium", "high"]
-KNOWN_PERMISSION_MODES = ["", "default", "acceptEdits", "bypassPermissions", "plan"]
+KNOWN_PERMISSION_MODES = ["", "default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]
 KNOWN_THINKING = ["", "off", "adaptive", "enabled", "disabled"]
 KNOWN_SETTING_SOURCES = ["user", "project", "local"]
 KNOWN_TASK_KINDS = ["", "posted", "systemEvent"]
@@ -336,9 +336,32 @@ def _validate_config(cfg: dict) -> list[str]:
                     "env_passthrough", "setting_sources", "extra_channel_ids"):
         if listkey in cfg and cfg[listkey] is not None and not isinstance(cfg[listkey], list):
             errors.append(f"{listkey} must be a list")
-    for dictkey in ("subagents", "mcp_servers", "approval", "env", "sandbox"):
+    for dictkey in ("subagents", "mcp_servers", "approval", "env", "sandbox",
+                    "output_format", "task_budget"):
         if dictkey in cfg and cfg[dictkey] is not None and not isinstance(cfg[dictkey], dict):
             errors.append(f"{dictkey} must be an object")
+    if "max_thinking_tokens" in cfg and cfg["max_thinking_tokens"] not in (None, ""):
+        try:
+            n = int(cfg["max_thinking_tokens"])
+            if n < 0:
+                errors.append("max_thinking_tokens must be >= 0")
+        except (TypeError, ValueError):
+            errors.append("max_thinking_tokens must be an integer")
+    if "fork_session" in cfg and cfg["fork_session"] is not None and not isinstance(cfg["fork_session"], bool):
+        errors.append("fork_session must be a boolean")
+    if "enable_file_checkpointing" in cfg and cfg["enable_file_checkpointing"] is not None and not isinstance(cfg["enable_file_checkpointing"], bool):
+        errors.append("enable_file_checkpointing must be a boolean")
+    if "task_budget" in cfg and isinstance(cfg["task_budget"], dict):
+        if "total" in cfg["task_budget"]:
+            try:
+                n = int(cfg["task_budget"]["total"])
+                if n < 0:
+                    errors.append("task_budget.total must be >= 0")
+            except (TypeError, ValueError):
+                errors.append("task_budget.total must be an integer")
+    if "permission_mode" in cfg and cfg["permission_mode"]:
+        if cfg["permission_mode"] not in KNOWN_PERMISSION_MODES:
+            errors.append(f"permission_mode must be one of: {', '.join(x for x in KNOWN_PERMISSION_MODES if x)}")
     return errors
 
 
@@ -431,9 +454,20 @@ def api_tasks_list(name: str):
 
 @router.get("/api/agents/{name}/options")
 def api_options(name: str):
-    """Skills, tools, models, everything needed to populate selects."""
+    """Skills, tools, models, everything needed to populate selects + defaults
+    so the UI can show what's inherited vs. explicitly overridden."""
     if name not in _list_agents():
         raise HTTPException(404, "no such agent")
+    # Load defaults from config.yaml so the UI can render "(default: X)"
+    defaults: dict = {}
+    cfg_path = ROOT / "config.yaml"
+    if cfg_path.exists():
+        try:
+            import yaml as _yaml_mod
+            raw = _yaml_mod.safe_load(cfg_path.read_text()) or {}
+            defaults = raw.get("defaults") or {}
+        except Exception:
+            defaults = {}
     return {
         "models": [{"value": v, "label": l} for v, l in KNOWN_MODELS],
         "tools": KNOWN_TOOLS,
@@ -444,6 +478,7 @@ def api_options(name: str):
         "task_kinds": KNOWN_TASK_KINDS,
         "skills": _list_shared_skills() + _list_local_skills(name),
         "agents": _list_agents(),
+        "defaults": defaults,
     }
 
 
@@ -451,6 +486,266 @@ def api_options(name: str):
 def api_restart():
     path = _signal_restart()
     return {"ok": True, "signaled": path}
+
+
+# ---- Connectors -----------------------------------------------------------
+
+CONNECTOR_REGISTRY_PATH = ROOT / "connectors" / "registry.yaml"
+
+
+def _load_connector_registry() -> list[dict]:
+    if not CONNECTOR_REGISTRY_PATH.exists():
+        return []
+    try:
+        import yaml as _yaml_mod
+        raw = _yaml_mod.safe_load(CONNECTOR_REGISTRY_PATH.read_text()) or {}
+        return raw.get("connectors") or []
+    except Exception:
+        return []
+
+
+def _env_vars_set() -> set[str]:
+    """Which env vars are actually defined in .env or os.environ?"""
+    present: set[str] = set()
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            val = line.split("=", 1)[1].strip()
+            if key and val:
+                present.add(key)
+    for k, v in os.environ.items():
+        if v:
+            present.add(k)
+    return present
+
+
+@router.get("/api/connectors")
+def api_connectors_list(agent: str | None = None):
+    """List connector registry. If ?agent=<name> supplied, annotate each with
+    current enabled state for that agent."""
+    registry = _load_connector_registry()
+    env_present = _env_vars_set()
+    enabled_mcp: set[str] = set()
+    enabled_env_passthrough: set[str] = set()
+    if agent:
+        if agent not in _list_agents():
+            raise HTTPException(404, "no such agent")
+        cfg = _load_agent_yaml(AGENTS_DIR / agent / "agent.yaml")
+        mcp = cfg.get("mcp_servers") or {}
+        enabled_mcp = set(mcp.keys()) if isinstance(mcp, dict) else set()
+        enabled_env_passthrough = set(cfg.get("env_passthrough") or [])
+
+    result = []
+    for c in registry:
+        item = dict(c)
+        item["enabled"] = False
+        item["credentials_ready"] = True
+        if c.get("kind") == "mcp_note":
+            item["enabled"] = c["id"] in enabled_mcp
+        elif c.get("kind") == "env_key":
+            required = c.get("env_vars") or []
+            item["credentials_ready"] = all(v in env_present for v in required)
+            # Enabled = env_passthrough carries all required vars (agent sees them)
+            item["enabled"] = bool(required) and all(v in enabled_env_passthrough for v in required)
+            item["missing_env_vars"] = [v for v in required if v not in env_present]
+        result.append(item)
+    return {"connectors": result}
+
+
+class ConnectorToggle(BaseModel):
+    enable: bool
+
+
+@router.post("/api/agents/{name}/connectors/{connector_id}")
+def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle):
+    """Toggle a connector on/off for an agent. Writes agent.yaml + signals restart."""
+    if name not in _list_agents():
+        raise HTTPException(404, "no such agent")
+    registry = _load_connector_registry()
+    connector = next((c for c in registry if c["id"] == connector_id), None)
+    if not connector:
+        raise HTTPException(404, f"unknown connector: {connector_id}")
+
+    path = AGENTS_DIR / name / "agent.yaml"
+    doc = _load_agent_yaml(path)
+
+    kind = connector.get("kind")
+    if kind == "mcp_note":
+        mcp = doc.get("mcp_servers")
+        if not isinstance(mcp, (CommentedMap, dict)):
+            mcp = CommentedMap()
+            doc["mcp_servers"] = mcp
+        if payload.enable:
+            entry = CommentedMap()
+            entry["type"] = "mcp"
+            entry["note"] = connector.get("note") or connector.get("description") or connector["name"]
+            mcp[connector_id] = entry
+        else:
+            if connector_id in mcp:
+                del mcp[connector_id]
+
+    elif kind == "env_key":
+        required = connector.get("env_vars") or []
+        env_pass = doc.get("env_passthrough")
+        if not isinstance(env_pass, list):
+            env_pass = []
+        env_pass_set = set(env_pass)
+        if payload.enable:
+            env_present = _env_vars_set()
+            missing = [v for v in required if v not in env_present]
+            if missing:
+                raise HTTPException(400, {
+                    "error": "missing_credentials",
+                    "missing_env_vars": missing,
+                    "message": f"Set these in .env first: {', '.join(missing)}. Secrets never flow through chat.",
+                })
+            for v in required:
+                env_pass_set.add(v)
+            # Mirror as an mcp_servers note too, so the agent's system prompt mentions it
+            mcp = doc.get("mcp_servers")
+            if not isinstance(mcp, (CommentedMap, dict)):
+                mcp = CommentedMap()
+                doc["mcp_servers"] = mcp
+            entry = CommentedMap()
+            entry["type"] = "env"
+            entry["note"] = connector.get("note") or connector.get("description") or connector["name"]
+            mcp[connector_id] = entry
+        else:
+            for v in required:
+                env_pass_set.discard(v)
+            mcp = doc.get("mcp_servers")
+            if isinstance(mcp, (CommentedMap, dict)) and connector_id in mcp:
+                del mcp[connector_id]
+        doc["env_passthrough"] = sorted(env_pass_set) if env_pass_set else []
+        if not doc["env_passthrough"]:
+            del doc["env_passthrough"]
+    else:
+        raise HTTPException(400, f"unsupported connector kind: {kind}")
+
+    _dump_agent_yaml(doc, path)
+    _signal_restart()
+    return {"ok": True, "connector": connector_id, "enabled": payload.enable, "restart_signaled": True}
+
+
+# ---- Local credential write (.env) ---------------------------------------
+# Accepts credential writes ONLY from localhost to avoid exposing .env writes
+# over the Cloudflare tunnel / Vercel proxy. The dashboard is meant to be
+# operated from the same box the bot runs on; tunnel access stays read-ish.
+
+_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+# Tailscale CGNAT range — treat tailnet peers as trusted (same as localhost).
+# Cloudflare tunnel requests come from Cloudflare IPs, so those stay blocked.
+import ipaddress as _ipaddress
+_TAILSCALE_CIDR = _ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_localhost_request(request: Request) -> bool:
+    # Uvicorn sets request.client.host; prefer that over Host header (spoofable).
+    client = request.client.host if request.client else ""
+    if client in _LOCALHOST_HOSTS:
+        return True
+    # Tailscale peer — trusted tunnel back to Mac Studio.
+    try:
+        if _ipaddress.ip_address(client) in _TAILSCALE_CIDR:
+            return True
+    except (ValueError, TypeError):
+        pass
+    host_header = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    return host_header in _LOCALHOST_HOSTS
+
+
+# Conservative var-name regex: uppercase letters, digits, underscores.
+_ENV_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+
+class EnvWrite(BaseModel):
+    # {VAR_NAME: value}
+    values: dict[str, str]
+    connector_id: str | None = None  # optional, used to cross-check against registry
+
+
+@router.post("/api/env/write")
+def api_env_write(payload: EnvWrite, request: Request):
+    """Append/update credentials in the relay's .env file. Localhost only."""
+    if not _is_localhost_request(request):
+        raise HTTPException(403, "env write requires localhost access (not available over tunnel)")
+
+    if not payload.values:
+        raise HTTPException(400, "no values provided")
+
+    # Scope the allowed var names: must match registry if connector_id supplied,
+    # otherwise still require the strict env-var regex.
+    allowed: set[str] | None = None
+    if payload.connector_id:
+        registry = _load_connector_registry()
+        connector = next((c for c in registry if c["id"] == payload.connector_id), None)
+        if not connector:
+            raise HTTPException(404, f"unknown connector: {payload.connector_id}")
+        allowed = set(connector.get("env_vars") or [])
+        if not allowed:
+            raise HTTPException(400, "connector has no env_vars defined")
+
+    written: list[str] = []
+    for k, v in payload.values.items():
+        if not _ENV_VAR_RE.match(k):
+            raise HTTPException(400, f"invalid env var name: {k!r}")
+        if allowed is not None and k not in allowed:
+            raise HTTPException(400, f"{k} is not part of connector {payload.connector_id}")
+        if v is None or v == "":
+            raise HTTPException(400, f"empty value for {k}")
+        written.append(k)
+
+    env_path = ROOT / ".env"
+    existing_lines: list[str] = []
+    if env_path.exists():
+        existing_lines = env_path.read_text().splitlines()
+
+    # Build a map of existing keys → line index.
+    key_to_idx: dict[str, int] = {}
+    for i, line in enumerate(existing_lines):
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k = s.split("=", 1)[0].strip()
+        if k:
+            key_to_idx[k] = i
+
+    # Apply writes — replace in place if key exists, append otherwise.
+    for k in written:
+        raw_val = payload.values[k]
+        # Quote if the value contains whitespace or shell-ish characters.
+        if any(ch in raw_val for ch in [" ", "\t", "#", "$", "`", "\"", "'"]):
+            val = '"' + raw_val.replace('"', '\\"') + '"'
+        else:
+            val = raw_val
+        new_line = f"{k}={val}"
+        if k in key_to_idx:
+            existing_lines[key_to_idx[k]] = new_line
+        else:
+            # Ensure a trailing blank-line separation if file didn't end with newline group.
+            if existing_lines and existing_lines[-1].strip():
+                existing_lines.append("")
+            existing_lines.append(new_line)
+            key_to_idx[k] = len(existing_lines) - 1
+
+    content = "\n".join(existing_lines).rstrip() + "\n"
+    # Restrictive perms — .env holds secrets.
+    env_path.write_text(content)
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+    # Also populate the live process environ so subsequent /api/connectors
+    # reflects credentials_ready immediately (no dashboard restart required).
+    for k in written:
+        os.environ[k] = payload.values[k]
+
+    return {"ok": True, "written": written, "count": len(written)}
 
 
 # ---- HTML page ------------------------------------------------------------
@@ -484,6 +779,11 @@ def _edit_page_html(name: str) -> str:
   </div>
   <div id="toast" class="toast"></div>
 
+  <div id="effective" class="effective">
+    <h3>Effective config — what this agent will actually run</h3>
+    <div id="eff-grid" class="eff-grid">loading…</div>
+  </div>
+
   <details open><summary>Identity &amp; routing <span class="dim">(gated)</span></summary>
     <div class="grid">
       <label>name<input id="f-name"></label>
@@ -511,10 +811,13 @@ def _edit_page_html(name: str) -> str:
 
   <details open><summary>Tools</summary>
     <div class="panel">
-      <div class="dim">allowed_tools — extras on top of config.yaml defaults</div>
+      <div class="dim" style="margin-bottom:0.8em;">
+        Checked = tool is <b>active</b> for this agent. Uncheck a <span class="chip-default">default</span> tool to block it.
+        Check a tool that isn't a default to add it as an <span class="chip-override">override</span>.
+      </div>
       <div id="f-allowed_tools" class="tool-grid"></div>
-      <div class="dim" style="margin-top:1em;">disallowed_tools</div>
-      <div id="f-disallowed_tools" class="tool-grid"></div>
+      <div id="tools-summary" class="dim" style="margin-top:0.8em;font-size:0.82em;"></div>
+      <div id="f-disallowed_tools" style="display:none;"></div>
     </div>
   </details>
 
@@ -522,6 +825,16 @@ def _edit_page_html(name: str) -> str:
     <div class="panel">
       <div class="dim" style="margin-bottom:0.6em;">Toggle to enable a skill. Shared come from <code>shared/skills/</code>; local from <code>agents/{esc(name)}/skills/</code>.</div>
       <div id="f-skills" class="tool-grid"></div>
+    </div>
+  </details>
+
+  <details open><summary>Connectors <span class="dim" id="conn-count"></span></summary>
+    <div class="panel">
+      <div class="dim" style="margin-bottom:0.8em;">
+        One-click third-party integrations. <span class="chip-default">MCP</span> connectors toggle instantly.
+        <span class="chip-override">API key</span> connectors need credentials in <code>.env</code> first — never paste secrets in chat.
+      </div>
+      <div id="conn-grid" class="conn-grid">loading…</div>
     </div>
   </details>
 
@@ -567,6 +880,27 @@ def _edit_page_html(name: str) -> str:
     <button id="addTaskBtn" class="btn">+ New task</button>
   </details>
 
+  <details><summary>Advanced (Claude Agent SDK)</summary>
+    <div class="panel">
+      <div class="dim" style="margin-bottom:0.8em;">Low-level options passed straight to <code>ClaudeAgentOptions</code>. Blank = inherit from <code>config.yaml</code> defaults or SDK default.</div>
+      <div class="grid">
+        <label class="col-2">cwd (working directory)
+          <input id="f-cwd" placeholder="(blank → vault path from config.yaml)">
+        </label>
+        <label>max_thinking_tokens<input id="f-max_thinking_tokens" type="number" min="0" placeholder="inherit"></label>
+        <label>fork_session<select id="f-fork_session"><option value="inherit">inherit</option><option value="true">true</option><option value="false">false</option></select></label>
+        <label>task_budget (total tokens)<input id="f-task_budget" type="number" min="0" placeholder="inherit"></label>
+        <label>enable_file_checkpointing<select id="f-enable_file_checkpointing"><option value="inherit">inherit</option><option value="true">true</option><option value="false">false</option></select></label>
+        <label class="col-2">output_format (JSON — custom output schema)
+          <textarea id="f-output_format" rows="3" placeholder='inherit — or e.g. {{"type":"json"}}'></textarea>
+        </label>
+        <label class="col-2">sandbox (JSON — SandboxSettings)
+          <textarea id="f-sandbox" rows="4" placeholder='inherit — or e.g. {{"enabled":true,"network":{{"allowedHosts":["api.anthropic.com"]}}}}'></textarea>
+        </label>
+      </div>
+    </div>
+  </details>
+
   <details><summary>Raw YAML (read-only preview)</summary>
     <pre id="raw-preview" class="panel">loading…</pre>
   </details>
@@ -586,6 +920,21 @@ def _edit_page_html(name: str) -> str:
   </div>
 </div>
 
+<div id="connModal" class="modal hidden">
+  <div class="modal-body">
+    <h2 id="conn-modal-title">Connect</h2>
+    <div class="dim" id="conn-modal-help" style="margin-bottom:0.6em;"></div>
+    <div id="conn-modal-fields"></div>
+    <div class="dim" style="margin-top:0.8em;font-size:0.78em;">
+      Writes to <code>.env</code> on this machine (localhost-only). File perms set to 600. Restarts relay after save.
+    </div>
+    <div class="btn-row">
+      <button id="connCancel" class="btn">Cancel</button>
+      <button id="connSubmit" class="btn primary">Save &amp; connect</button>
+    </div>
+  </div>
+</div>
+
 <script>const AGENT_NAME = {json.dumps(name)};</script>
 <script>{js}</script>
 </body></html>
@@ -596,60 +945,129 @@ def _edit_page_html(name: str) -> str:
 
 EDIT_CSS = """
   :root {
-    --bg:#0e0e10; --panel:#18181b; --panel-2:#1f1f23;
-    --fg:#e4e4e7; --fg-dim:#a1a1aa; --fg-mute:#71717a;
-    --accent:#6fa8ff; --accent-2:#9d7cff; --ok:#4ade80;
-    --warn:#fbbf24; --fail:#f87171; --border:#27272a;
+    --bg:#f7f5ef; --panel:#ffffff; --panel-2:#efece3; --panel-3:#f2efe6;
+    --fg:#1a1f2e; --fg-dim:#4b5563; --fg-mute:#8a8a7b;
+    --accent:#1a1f2e; --accent-2:#7cc9a8; --accent-ink:#ffffff;
+    --ok:#3d8f58; --warn:#b5791f; --fail:#b94a33;
+    --border:#e5e1d6; --border-strong:#d6d1c2;
+    --shadow-sm:0 1px 2px rgba(26,31,46,0.04), 0 0 0 1px rgba(26,31,46,0.04);
+    --shadow-md:0 4px 16px rgba(26,31,46,0.06), 0 0 0 1px rgba(26,31,46,0.04);
+    --radius:12px;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace;
+    --serif:"Charter","Iowan Old Style","Georgia",serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#15161c; --panel:#1c1d25; --panel-2:#252731; --panel-3:#1f2029;
+      --fg:#f1eee4; --fg-dim:#c4bfae; --fg-mute:#827d6e;
+      --accent:#f7f5ef; --accent-ink:#1a1f2e;
+      --border:#2e2f3a; --border-strong:#3b3d4a;
+      --shadow-sm:0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.04);
+    }
   }
   *{box-sizing:border-box;}
-  body{font-family:-apple-system,"SF Pro Text","Inter",sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:0;}
-  nav{display:flex;gap:1.5em;padding:1em 1.5em;border-bottom:1px solid var(--border);background:var(--panel);align-items:center;}
-  nav a{color:var(--fg-dim);font-size:0.9em;text-decoration:none;}
-  nav a:hover{color:var(--accent);}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Inter","SF Pro Text",sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:0;font-size:15px;-webkit-font-smoothing:antialiased;padding-bottom:env(safe-area-inset-bottom);}
+  @supports (-webkit-touch-callout: none) { body { font-size:16px; } }
+  nav{display:flex;gap:1em;padding:0.9em 1.5em;border-bottom:1px solid var(--border);background:color-mix(in srgb, var(--bg) 86%, transparent);backdrop-filter:saturate(140%) blur(14px);-webkit-backdrop-filter:saturate(140%) blur(14px);position:sticky;top:0;z-index:30;align-items:center;}
+  nav a{color:var(--fg-dim);font-size:0.9em;text-decoration:none;padding:0.35em 0.85em;border-radius:999px;}
+  nav a:hover{color:var(--fg);background:var(--panel-2);}
   .wrap{max-width:1100px;margin:0 auto;padding:1.5em;}
-  h1{font-size:1.4em;margin:0;}
-  h2{font-size:1em;margin:0 0 0.8em;}
-  code,pre{font-family:"SF Mono","JetBrains Mono",monospace;font-size:0.85em;}
-  code{background:var(--panel-2);padding:0.1em 0.4em;border-radius:4px;}
-  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1em;}
+  @media (max-width:768px){.wrap{padding:1em;}}
+  h1{font-family:var(--serif);font-size:1.7em;margin:0;font-weight:500;letter-spacing:-0.02em;}
+  h2{font-size:1em;margin:0 0 0.8em;font-weight:600;}
+  code,pre{font-family:var(--mono);font-size:0.85em;}
+  code{background:var(--panel-2);padding:0.1em 0.45em;border-radius:5px;word-break:break-word;}
+  pre{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow-x:auto;max-width:100%;}
+  textarea{width:100%;box-sizing:border-box;word-break:break-word;}
+  input{max-width:100%;box-sizing:border-box;}
+  .wrap,details,.panel{max-width:100%;box-sizing:border-box;overflow-wrap:anywhere;}
+  html,body{overflow-x:hidden;}
+  .chip-default{display:inline-block;font-size:0.72em;padding:0.05em 0.45em;border-radius:999px;background:color-mix(in srgb, var(--accent-2) 22%, transparent);color:var(--ok);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;}
+  .chip-override{display:inline-block;font-size:0.72em;padding:0.05em 0.45em;border-radius:999px;background:var(--panel-2);color:var(--fg);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;}
+  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1em;flex-wrap:wrap;gap:0.8em;}
   .dim{color:var(--fg-mute);font-size:0.85em;}
   .btn-row{display:flex;gap:0.5em;flex-wrap:wrap;}
-  .btn{background:var(--panel-2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:0.55em 1em;cursor:pointer;font-size:0.88em;}
-  .btn:hover{border-color:var(--accent);}
-  .btn.primary{background:var(--accent);color:#0e0e10;border-color:var(--accent);font-weight:600;}
-  .btn.danger{background:var(--fail);color:#0e0e10;border-color:var(--fail);}
-  details{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:0.8em 1.2em;margin-bottom:0.8em;}
-  details summary{cursor:pointer;font-size:0.95em;font-weight:600;color:var(--fg-dim);padding:0.2em 0;}
-  details[open] summary{color:var(--fg);}
-  details>summary+*{margin-top:0.8em;}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:0.8em;}
+  .btn{background:var(--panel);color:var(--fg);border:1px solid var(--border);border-radius:999px;padding:0.55em 1.1em;cursor:pointer;font-size:0.9em;min-height:40px;font-weight:500;box-shadow:var(--shadow-sm);transition:all 0.14s;font-family:inherit;}
+  .btn:hover{border-color:var(--border-strong);transform:translateY(-1px);box-shadow:var(--shadow-md);}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600;}
+  .btn.primary:hover{opacity:0.92;}
+  .btn.danger{background:var(--fail);color:#fff;border-color:var(--fail);}
+  details{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:1em 1.3em;margin-bottom:0.8em;box-shadow:var(--shadow-sm);}
+  details summary{cursor:pointer;font-size:0.95em;font-weight:600;color:var(--fg);padding:0.2em 0;list-style:none;display:flex;align-items:center;gap:0.5em;}
+  details summary::-webkit-details-marker{display:none;}
+  details summary::before{content:"";display:inline-block;width:0;height:0;border-left:5px solid var(--fg-mute);border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform 0.14s;}
+  details[open] summary::before{transform:rotate(90deg);}
+  details>summary+*{margin-top:0.9em;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:0.9em;}
   .grid .col-2{grid-column:span 2;}
   @media (max-width:700px){.grid{grid-template-columns:1fr;}.grid .col-2{grid-column:span 1;}}
-  label{display:flex;flex-direction:column;gap:0.3em;font-size:0.82em;color:var(--fg-dim);}
-  input,select,textarea{background:var(--panel-2);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:0.5em 0.7em;font-size:0.9em;font-family:inherit;}
-  input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none;}
-  textarea{font-family:"SF Mono","JetBrains Mono",monospace;font-size:0.85em;}
-  .panel{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:0.8em 1em;}
-  .tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.3em;}
-  .tool-grid label{flex-direction:row;align-items:center;gap:0.5em;color:var(--fg);font-size:0.85em;background:var(--panel);padding:0.4em 0.7em;border-radius:5px;border:1px solid var(--border);cursor:pointer;}
-  .tool-grid label:hover{border-color:var(--accent);}
-  .tool-grid input[type=checkbox]{margin:0;}
-  .sub-row{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:0.8em;margin-bottom:0.6em;display:grid;grid-template-columns:1fr 1fr auto;gap:0.5em;}
+  label{display:flex;flex-direction:column;gap:0.35em;font-size:0.82em;color:var(--fg-dim);font-weight:500;}
+  input,select,textarea{background:var(--panel);color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:0.6em 0.75em;font-size:0.95em;font-family:inherit;min-height:40px;}
+  input:focus,select:focus,textarea:focus{border-color:var(--fg);outline:2px solid rgba(26,31,46,0.08);outline-offset:0;}
+  textarea{font-family:var(--mono);font-size:0.85em;min-height:unset;}
+  .panel{background:var(--panel-3);border:1px solid var(--border);border-radius:10px;padding:0.9em 1.1em;}
+  .tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0.4em;}
+  .tool-grid label{display:flex;flex-direction:row;align-items:center;gap:0.55em;color:var(--fg);font-size:0.87em;background:var(--panel);padding:0.55em 0.85em;border-radius:8px;border:1px solid var(--border);cursor:pointer;min-height:40px;transition:all 0.14s;min-width:0;overflow:hidden;}
+  .tool-grid .tool-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;}
+  .tool-grid label:hover{border-color:var(--border-strong);background:var(--panel-3);}
+  .tool-grid label:has(input:checked){border-color:var(--fg);background:var(--panel-2);}
+  .tool-grid input[type=checkbox]{margin:0;width:16px;height:16px;accent-color:var(--fg);}
+  /* default-state + override indicators */
+  .tool-grid label.is-default{background:color-mix(in srgb, var(--accent-2) 14%, var(--panel));border-color:color-mix(in srgb, var(--accent-2) 40%, var(--border));}
+  .tool-grid label.is-default::after{content:"default";margin-left:auto;font-size:0.66em;color:var(--ok);background:color-mix(in srgb, var(--accent-2) 22%, transparent);padding:0.15em 0.55em;border-radius:999px;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;}
+  .tool-grid label.is-override::after{content:"override";margin-left:auto;font-size:0.66em;color:var(--fg);background:var(--panel-2);padding:0.15em 0.55em;border-radius:999px;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;}
+  .tool-grid label.is-blocked{background:color-mix(in srgb, var(--fail) 10%, var(--panel));border-color:color-mix(in srgb, var(--fail) 30%, var(--border));}
+  .tool-grid label.is-blocked::after{content:"blocked";margin-left:auto;font-size:0.66em;color:var(--fail);background:color-mix(in srgb, var(--fail) 14%, transparent);padding:0.15em 0.55em;border-radius:999px;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;}
+  /* Connectors grid */
+  .conn-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0.7em;}
+  .conn-card{display:flex;flex-direction:column;gap:0.4em;padding:0.85em 0.95em;background:var(--panel);border:1px solid var(--border);border-radius:10px;min-height:120px;transition:all 0.14s;}
+  .conn-card:hover{border-color:var(--border-strong);background:var(--panel-2);}
+  .conn-card.enabled{border-color:var(--ok);background:color-mix(in srgb, var(--ok) 8%, var(--panel));}
+  .conn-card.needs-setup{border-color:color-mix(in srgb, var(--warn, #e8b755) 40%, var(--border));background:color-mix(in srgb, var(--warn, #e8b755) 6%, var(--panel));}
+  .conn-head{display:flex;align-items:center;gap:0.5em;font-weight:600;font-size:0.92em;color:var(--fg);}
+  .conn-emoji{font-size:1.2em;}
+  .conn-cat{font-size:0.7em;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.06em;margin-left:auto;}
+  .conn-desc{font-size:0.82em;color:var(--fg-mute);flex:1;line-height:1.35;}
+  .conn-btn-row{display:flex;align-items:center;gap:0.5em;margin-top:0.25em;}
+  .conn-btn{padding:0.4em 0.9em;border-radius:6px;border:1px solid var(--border);background:var(--panel-2);color:var(--fg);cursor:pointer;font-size:0.82em;font-weight:600;transition:all 0.12s;}
+  .conn-btn:hover{background:var(--panel-3);border-color:var(--border-strong);}
+  .conn-btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);}
+  .conn-btn.primary:hover{filter:brightness(1.1);}
+  .conn-btn.danger{border-color:color-mix(in srgb, var(--fail) 40%, var(--border));color:var(--fail);}
+  .conn-btn:disabled{opacity:0.5;cursor:not-allowed;}
+  .conn-badge{font-size:0.7em;padding:0.12em 0.5em;border-radius:999px;background:var(--panel-2);color:var(--fg-mute);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;}
+  .conn-badge.enabled{background:color-mix(in srgb, var(--ok) 22%, transparent);color:var(--ok);}
+  .conn-badge.needs-setup{background:color-mix(in srgb, var(--warn, #e8b755) 22%, transparent);color:var(--warn, #e8b755);}
+  .conn-missing{font-size:0.72em;color:var(--warn, #e8b755);margin-top:0.15em;}
+  .conn-missing code{background:var(--panel-2);padding:0.05em 0.35em;border-radius:4px;font-size:0.9em;}
+  .inherit-hint{font-size:0.75em;color:var(--fg-mute);margin-top:0.2em;font-style:italic;}
+  .effective{background:color-mix(in srgb, var(--accent-2) 10%, var(--panel));border:1px solid color-mix(in srgb, var(--accent-2) 30%, var(--border));border-radius:var(--radius);padding:1em 1.2em;margin-bottom:1.2em;}
+  .effective h3{margin:0 0 0.5em;font-size:0.72em;color:var(--ok);text-transform:uppercase;letter-spacing:0.12em;font-weight:700;}
+  .effective .eff-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.5em 1.2em;font-size:0.86em;}
+  .effective .eff-key{color:var(--fg-mute);font-size:0.78em;text-transform:uppercase;letter-spacing:0.06em;}
+  .effective .eff-val{color:var(--fg);font-weight:500;font-family:var(--mono);font-size:0.86em;word-break:break-word;}
+  .effective .eff-val.dim{color:var(--fg-mute);font-style:italic;font-family:inherit;}
+  .source-tag{display:inline-block;font-size:0.66em;padding:0.1em 0.5em;border-radius:999px;margin-left:0.4em;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;vertical-align:middle;}
+  .source-tag.override{background:var(--panel-2);color:var(--fg);}
+  .source-tag.default{background:color-mix(in srgb, var(--accent-2) 22%, transparent);color:var(--ok);}
+  .sub-row{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:0.9em;margin-bottom:0.6em;display:grid;grid-template-columns:1fr 1fr auto;gap:0.6em;}
   .sub-row input,.sub-row select,.sub-row textarea{width:100%;}
   .sub-row .sub-name{font-weight:600;}
   .sub-row textarea{grid-column:span 3;}
   .sub-row .sub-full{grid-column:span 3;display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:0.5em;}
-  .task-row{background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:0.8em;margin-bottom:0.6em;display:grid;grid-template-columns:2fr 1.5fr 1fr auto;gap:0.5em;align-items:center;}
+  @media (max-width:700px){.sub-row,.sub-row .sub-full{grid-template-columns:1fr;}.sub-row textarea{grid-column:span 1;}}
+  .task-row{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:0.9em;margin-bottom:0.6em;display:grid;grid-template-columns:2fr 1.5fr 1fr auto;gap:0.5em;align-items:center;}
   .task-row .task-body{grid-column:span 4;display:none;margin-top:0.5em;}
   .task-row.open .task-body{display:block;}
   .task-row textarea{width:100%;}
-  .toast{position:fixed;top:1em;right:1em;background:var(--panel);border:1px solid var(--border);padding:0.8em 1.2em;border-radius:6px;z-index:1000;display:none;max-width:420px;}
+  @media (max-width:700px){.task-row{grid-template-columns:1fr;}.task-row .task-body{grid-column:span 1;}}
+  .toast{position:fixed;top:1em;right:1em;background:var(--panel);border:1px solid var(--border);padding:0.9em 1.3em;border-radius:10px;z-index:1000;display:none;max-width:420px;box-shadow:var(--shadow-md);}
   .toast.ok{border-color:var(--ok);color:var(--ok);}
   .toast.warn{border-color:var(--warn);color:var(--warn);}
   .toast.fail{border-color:var(--fail);color:var(--fail);}
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:2000;}
+  .modal{position:fixed;inset:0;background:rgba(26,31,46,0.5);display:flex;align-items:center;justify-content:center;z-index:2000;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);}
   .modal.hidden{display:none;}
-  .modal-body{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1.5em;width:min(500px,90vw);}
+  .modal-body{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:1.5em;width:min(500px,92vw);box-shadow:var(--shadow-md);}
   .modal label{margin-top:0.8em;}
   .modal .btn-row{margin-top:1.2em;justify-content:flex-end;}
 """
@@ -671,38 +1089,82 @@ EDIT_JS = r"""
   async function loadOptions() {
     const r = await fetch(`/api/agents/${AGENT_NAME}/options`);
     state.options = await r.json();
-    // model dropdowns
+    const defaults = state.options.defaults || {};
+    const fmt = (v) => {
+      if (v === undefined || v === null || v === '') return '∅';
+      if (Array.isArray(v)) return v.length ? v.join(', ') : '∅';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    };
+    const inheritLabel = (key) => {
+      const d = defaults[key];
+      if (d === undefined || d === null || d === '') return '(inherit — no default)';
+      return `(inherit → ${fmt(d)})`;
+    };
+    // model dropdowns — first option rewritten to show default
     for (const id of ['f-model', 'f-fallback_model']) {
       const sel = $(id);
       sel.innerHTML = '';
       for (const m of state.options.models) {
         const o = document.createElement('option');
-        o.value = m.value; o.textContent = m.label;
+        o.value = m.value;
+        const key = id === 'f-model' ? 'model' : 'fallback_model';
+        o.textContent = m.value === '' ? inheritLabel(key) : m.label;
         sel.appendChild(o);
       }
     }
     // effort / thinking / permission_mode
-    for (const [id, list] of [
-      ['f-effort', state.options.effort],
-      ['f-thinking', state.options.thinking],
-      ['f-permission_mode', state.options.permission_modes],
-    ]) {
+    const selMap = {
+      'f-effort': ['effort', state.options.effort],
+      'f-thinking': ['thinking', state.options.thinking],
+      'f-permission_mode': ['permission_mode', state.options.permission_modes],
+    };
+    for (const [id, [key, list]] of Object.entries(selMap)) {
       const sel = $(id);
       sel.innerHTML = '';
       for (const v of list) {
         const o = document.createElement('option');
-        o.value = v; o.textContent = v || '(inherit)';
+        o.value = v;
+        o.textContent = v || inheritLabel(key);
         sel.appendChild(o);
       }
     }
-    // tool grids
-    for (const [id] of [['f-allowed_tools'], ['f-disallowed_tools']]) {
-      const g = $(id); g.innerHTML = '';
-      for (const t of state.options.tools) {
-        const l = document.createElement('label');
-        l.innerHTML = `<input type="checkbox" data-tool="${t}"><span>${t}</span>`;
-        g.appendChild(l);
+    // placeholder-as-default for number/text inputs
+    const placeholders = {
+      'f-max_turns': 'max_turns',
+      'f-max_hops': 'max_hops',
+      'f-setting_sources': 'setting_sources',
+      'f-add_dirs': 'add_dirs',
+    };
+    for (const [id, key] of Object.entries(placeholders)) {
+      const el = $(id);
+      if (!el) continue;
+      const d = defaults[key];
+      if (d !== undefined && d !== null && d !== '') {
+        el.placeholder = `inherit → ${fmt(d)}`;
       }
+    }
+    // approval placeholders
+    const apD = defaults.approval || {};
+    if ($('f-approval_timeout') && apD.timeout_seconds != null)
+      $('f-approval_timeout').placeholder = `inherit → ${apD.timeout_seconds}`;
+    if ($('f-approval_poll') && apD.poll_interval_seconds != null)
+      $('f-approval_poll').placeholder = `inherit → ${apD.poll_interval_seconds}`;
+    // tool grid — single merged grid. Annotation + checked state set in fillForm().
+    const defAllowed = defaults.allowed_tools || [];
+    const g = $('f-allowed_tools'); g.innerHTML = '';
+    // Sort: defaults first so the common "on" tools bubble to the top
+    const allTools = [...state.options.tools].sort((a, b) => {
+      const da = defAllowed.includes(a), db = defAllowed.includes(b);
+      if (da !== db) return da ? -1 : 1;
+      return a.localeCompare(b);
+    });
+    for (const t of allTools) {
+      const l = document.createElement('label');
+      l.dataset.tool = t;
+      if (defAllowed.includes(t)) l.classList.add('is-default');
+      l.innerHTML = `<input type="checkbox" data-tool="${t}"><span class="tool-name">${t}</span>`;
+      g.appendChild(l);
     }
     // skills grid
     const sg = $('f-skills'); sg.innerHTML = '';
@@ -738,12 +1200,33 @@ EDIT_JS = r"""
     $('f-max_turns').value = c.max_turns ?? '';
     $('f-max_hops').value = c.max_hops ?? '';
     $('f-setting_sources').value = (c.setting_sources || []).join(', ');
-    // tool checkboxes
-    for (const cb of document.querySelectorAll('#f-allowed_tools input')) {
-      cb.checked = (c.allowed_tools || []).includes(cb.dataset.tool);
+    // tool checkboxes — checked = tool is ACTIVE (merged effective state).
+    // Uncheck default = blocks it. Check non-default = override adds it.
+    const defs = (state.options && state.options.defaults) || {};
+    const defAllowed = defs.allowed_tools || [];
+    const ovAllowed = c.allowed_tools || [];
+    const ovDisallowed = c.disallowed_tools || [];
+    let activeCount = 0, defaultCount = 0, overrideCount = 0, blockedCount = 0;
+    for (const lab of document.querySelectorAll('#f-allowed_tools label')) {
+      const t = lab.dataset.tool;
+      const cb = lab.querySelector('input');
+      const inDefault = defAllowed.includes(t);
+      const inAllowed = ovAllowed.includes(t);
+      const inBlocked = ovDisallowed.includes(t);
+      // Effective = (default OR override-added) AND NOT blocked
+      const active = (inDefault || inAllowed) && !inBlocked;
+      cb.checked = active;
+      lab.classList.toggle('is-default', inDefault && !inBlocked);
+      lab.classList.toggle('is-override', inAllowed && !inDefault && !inBlocked);
+      lab.classList.toggle('is-blocked', inBlocked);
+      if (active) activeCount++;
+      if (inDefault && !inBlocked) defaultCount++;
+      if (inAllowed && !inDefault && !inBlocked) overrideCount++;
+      if (inBlocked) blockedCount++;
     }
-    for (const cb of document.querySelectorAll('#f-disallowed_tools input')) {
-      cb.checked = (c.disallowed_tools || []).includes(cb.dataset.tool);
+    const summary = $('tools-summary');
+    if (summary) {
+      summary.innerHTML = `<b>${activeCount}</b> active — ${defaultCount} from defaults, ${overrideCount} overrides. <b>${blockedCount}</b> blocked.`;
     }
     // skills
     for (const cb of document.querySelectorAll('#f-skills input')) {
@@ -764,6 +1247,87 @@ EDIT_JS = r"""
       ? JSON.stringify(c.mcp_servers, null, 2) : '';
     // subagents
     renderSubs(c.subagents || {});
+    // advanced (SDK) fields
+    $('f-cwd').value = c.cwd || '';
+    $('f-max_thinking_tokens').value = c.max_thinking_tokens ?? '';
+    $('f-fork_session').value = c.fork_session === undefined || c.fork_session === null ? 'inherit' : String(c.fork_session);
+    const tb = c.task_budget;
+    $('f-task_budget').value = (tb && typeof tb === 'object') ? (tb.total ?? '') : (typeof tb === 'number' ? tb : '');
+    $('f-enable_file_checkpointing').value = c.enable_file_checkpointing === undefined || c.enable_file_checkpointing === null ? 'inherit' : String(c.enable_file_checkpointing);
+    $('f-output_format').value = c.output_format ? (typeof c.output_format === 'string' ? c.output_format : JSON.stringify(c.output_format, null, 2)) : '';
+    $('f-sandbox').value = c.sandbox ? JSON.stringify(c.sandbox, null, 2) : '';
+    // effective-config summary panel
+    renderEffective(c);
+  }
+
+  function renderEffective(c) {
+    const defs = (state.options && state.options.defaults) || {};
+    const grid = $('eff-grid');
+    if (!grid) return;
+    // Merge: override → default → "∅"
+    const pick = (k, fallback) => {
+      if (c[k] !== undefined && c[k] !== null && c[k] !== '') return { value: c[k], source: 'override' };
+      if (defs[k] !== undefined && defs[k] !== null && defs[k] !== '') return { value: defs[k], source: 'default' };
+      return { value: fallback ?? null, source: 'default' };
+    };
+    const fmt = (v) => {
+      if (v === undefined || v === null || v === '') return '(unset)';
+      if (Array.isArray(v)) return v.length ? v.join(', ') : '(empty)';
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    };
+    // derived: merged tool set
+    const baseAllowed = (defs.allowed_tools || []).filter(t => !(c.disallowed_tools || []).includes(t));
+    const extras = (c.allowed_tools || []).filter(t => !(defs.allowed_tools || []).includes(t));
+    const activeTools = [...new Set([...baseAllowed, ...extras])];
+    const blocked = [...(c.disallowed_tools || []), ...(defs.disallowed_tools || [])];
+    // rows
+    const rows = [];
+    const row = (key, label) => {
+      const { value, source } = pick(key);
+      const v = fmt(value);
+      const tag = source === 'override'
+        ? '<span class="source-tag override">override</span>'
+        : '<span class="source-tag default">default</span>';
+      const vCls = (value === null || value === undefined || value === '') ? 'eff-val dim' : 'eff-val';
+      rows.push(`<div><div class="eff-key">${label}${tag}</div><div class="${vCls}">${escHtml(v)}</div></div>`);
+    };
+    row('model', 'Model');
+    row('fallback_model', 'Fallback');
+    row('thinking', 'Thinking');
+    row('effort', 'Effort');
+    row('permission_mode', 'Permission');
+    row('max_turns', 'Max turns');
+    row('max_hops', 'Max hops');
+    row('allow_bots', 'Allow bots');
+    row('cwd', 'cwd');
+    row('max_thinking_tokens', 'Max thinking tokens');
+    row('fork_session', 'Fork session');
+    row('enable_file_checkpointing', 'File checkpointing');
+    // task_budget — show total
+    const tbVal = c.task_budget ?? defs.task_budget;
+    const tbSrc = c.task_budget !== undefined && c.task_budget !== null ? 'override' : 'default';
+    const tbTotal = (tbVal && typeof tbVal === 'object') ? tbVal.total : tbVal;
+    const tbTag = tbSrc === 'override' ? '<span class="source-tag override">override</span>' : '<span class="source-tag default">default</span>';
+    const tbCls = (tbTotal === null || tbTotal === undefined || tbTotal === '') ? 'eff-val dim' : 'eff-val';
+    rows.push(`<div><div class="eff-key">Task budget${tbTag}</div><div class="${tbCls}">${escHtml(tbTotal ?? '(unset)')}</div></div>`);
+    // tools derived
+    rows.push(`<div style="grid-column:1 / -1"><div class="eff-key">Active tools <span class="source-tag default">merged</span></div><div class="eff-val">${escHtml(activeTools.join(', ') || '(none)')}</div></div>`);
+    if (blocked.length) {
+      rows.push(`<div style="grid-column:1 / -1"><div class="eff-key">Blocked tools <span class="source-tag override">override</span></div><div class="eff-val">${escHtml(blocked.join(', '))}</div></div>`);
+    }
+    // skills
+    const skills = c.skills || [];
+    rows.push(`<div style="grid-column:1 / -1"><div class="eff-key">Skills <span class="source-tag ${skills.length?'override':'default'}">${skills.length?'override':'none'}</span></div><div class="${skills.length?'eff-val':'eff-val dim'}">${escHtml(skills.length ? skills.join(', ') : '(no skills enabled)')}</div></div>`);
+    // channel
+    rows.push(`<div><div class="eff-key">Channel</div><div class="eff-val">${escHtml(c.channel_id || '(unset)')}</div></div>`);
+    // approval summary
+    const ap = c.approval || {};
+    const apDefs = defs.approval || {};
+    const apEnabled = ap.enabled !== undefined ? ap.enabled : (apDefs.enabled !== undefined ? apDefs.enabled : true);
+    const apSource = ap.enabled !== undefined ? 'override' : 'default';
+    rows.push(`<div><div class="eff-key">Approval gate <span class="source-tag ${apSource}">${apSource}</span></div><div class="eff-val">${apEnabled ? 'enabled' : 'disabled'}</div></div>`);
+    grid.innerHTML = rows.join('');
   }
 
   function setSelect(id, val) {
@@ -849,8 +1413,15 @@ EDIT_JS = r"""
     const ss = s('f-setting_sources').split(',').map(x=>x.trim()).filter(Boolean);
     if (ss.length) c.setting_sources = ss;
 
-    c.allowed_tools = Array.from(document.querySelectorAll('#f-allowed_tools input:checked')).map(cb=>cb.dataset.tool);
-    c.disallowed_tools = Array.from(document.querySelectorAll('#f-disallowed_tools input:checked')).map(cb=>cb.dataset.tool);
+    // Save tool diff vs defaults: only persist deviations.
+    //   allowed_tools = checked tools NOT in defaults (extras user turned on)
+    //   disallowed_tools = UNchecked tools IN defaults (defaults user turned off)
+    const _defs = (state.options && state.options.defaults) || {};
+    const _defAllowed = new Set(_defs.allowed_tools || []);
+    const _checkedSet = new Set(Array.from(document.querySelectorAll('#f-allowed_tools input:checked')).map(cb=>cb.dataset.tool));
+    const _allTools = Array.from(document.querySelectorAll('#f-allowed_tools input')).map(cb=>cb.dataset.tool);
+    c.allowed_tools = _allTools.filter(t => _checkedSet.has(t) && !_defAllowed.has(t));
+    c.disallowed_tools = _allTools.filter(t => !_checkedSet.has(t) && _defAllowed.has(t));
     c.skills = Array.from(document.querySelectorAll('#f-skills input:checked')).map(cb=>cb.dataset.skill);
 
     const dirs = s('f-add_dirs').split('\n').map(x=>x.trim()).filter(Boolean);
@@ -882,6 +1453,25 @@ EDIT_JS = r"""
 
     const subs = collectSubs();
     if (Object.keys(subs).length) c.subagents = subs;
+
+    // Advanced (Claude Agent SDK) fields — only set when non-blank / non-inherit
+    if (s('f-cwd')) c.cwd = s('f-cwd');
+    if (s('f-max_thinking_tokens')) c.max_thinking_tokens = parseInt(s('f-max_thinking_tokens'), 10);
+    const fsVal = $('f-fork_session').value;
+    if (fsVal !== 'inherit') c.fork_session = fsVal === 'true';
+    if (s('f-task_budget')) c.task_budget = { total: parseInt(s('f-task_budget'), 10) };
+    const efcVal = $('f-enable_file_checkpointing').value;
+    if (efcVal !== 'inherit') c.enable_file_checkpointing = efcVal === 'true';
+    const ofRaw = s('f-output_format');
+    if (ofRaw) {
+      try { c.output_format = JSON.parse(ofRaw); }
+      catch(e) { throw new Error('output_format must be valid JSON: '+e.message); }
+    }
+    const sbRaw = s('f-sandbox');
+    if (sbRaw) {
+      try { c.sandbox = JSON.parse(sbRaw); }
+      catch(e) { throw new Error('sandbox must be valid JSON: '+e.message); }
+    }
 
     return c;
   }
@@ -1032,6 +1622,195 @@ EDIT_JS = r"""
   };
 
   // initial load
-  loadOptions().then(loadConfig);
+  loadOptions().then(loadConfig).then(loadConnectors);
+
+  // ---- connectors ----
+  async function loadConnectors() {
+    const r = await fetch(`/api/connectors?agent=${encodeURIComponent(AGENT_NAME)}`);
+    if (!r.ok) { $('conn-grid').innerHTML = '<div class="dim">failed to load connectors</div>'; return; }
+    const j = await r.json();
+    const conns = j.connectors || [];
+    const enabled = conns.filter(c => c.enabled).length;
+    const needsSetup = conns.filter(c => c.kind === 'env_key' && !c.credentials_ready).length;
+    $('conn-count').textContent = `— ${enabled}/${conns.length} connected${needsSetup?`, ${needsSetup} need .env setup`:''}`;
+    const grid = $('conn-grid');
+    grid.innerHTML = '';
+    for (const c of conns) {
+      grid.appendChild(buildConnCard(c));
+    }
+  }
+
+  function buildConnCard(c) {
+    const card = document.createElement('div');
+    card.className = 'conn-card';
+    if (c.enabled) card.classList.add('enabled');
+    if (c.kind === 'env_key' && !c.credentials_ready) card.classList.add('needs-setup');
+    const statusBadge = c.enabled
+      ? '<span class="conn-badge enabled">connected</span>'
+      : (c.kind === 'env_key' && !c.credentials_ready)
+        ? '<span class="conn-badge needs-setup">needs .env</span>'
+        : '<span class="conn-badge">available</span>';
+    const kindChip = c.kind === 'mcp_note'
+      ? '<span class="chip-default">MCP</span>'
+      : '<span class="chip-override">API key</span>';
+    const missingBlock = (c.kind === 'env_key' && !c.credentials_ready && c.missing_env_vars?.length)
+      ? `<div class="conn-missing">Set in <code>.env</code>: ${c.missing_env_vars.map(v=>`<code>${escHtml(v)}</code>`).join(' ')}</div>`
+      : '';
+    const btn = c.enabled
+      ? `<button class="conn-btn danger" data-action="disconnect" data-id="${escAttr(c.id)}">Disconnect</button>`
+      : (c.kind === 'env_key' && !c.credentials_ready)
+        ? `<button class="conn-btn primary" data-action="setup" data-id="${escAttr(c.id)}">Add credentials</button>`
+        : `<button class="conn-btn primary" data-action="connect" data-id="${escAttr(c.id)}">Connect</button>`;
+    card.innerHTML = `
+      <div class="conn-head">
+        <span class="conn-emoji">${c.emoji || '🔌'}</span>
+        <span>${escHtml(c.name)}</span>
+        <span class="conn-cat">${escHtml(c.category || '')}</span>
+      </div>
+      <div class="conn-desc">${escHtml(c.description || '')}</div>
+      ${missingBlock}
+      <div class="conn-btn-row">
+        ${btn}
+        ${statusBadge}
+        ${kindChip}
+      </div>
+    `;
+    const actionBtn = card.querySelector('[data-action]');
+    if (actionBtn) {
+      actionBtn.onclick = async () => {
+        const action = actionBtn.dataset.action;
+        const id = actionBtn.dataset.id;
+        if (action === 'setup') {
+          openCredModal(c);
+          return;
+        }
+        actionBtn.disabled = true;
+        actionBtn.textContent = action === 'connect' ? 'Connecting…' : 'Disconnecting…';
+        try {
+          const res = await fetch(`/api/agents/${AGENT_NAME}/connectors/${encodeURIComponent(id)}`, {
+            method: 'POST',
+            headers: {'content-type': 'application/json'},
+            body: JSON.stringify({enable: action === 'connect'}),
+          });
+          const j = await res.json();
+          if (!res.ok) {
+            const msg = j.detail?.message || j.detail?.error || j.detail || 'toggle failed';
+            toast(msg, 'fail', 6000);
+            actionBtn.disabled = false;
+            actionBtn.textContent = action === 'connect' ? 'Connect' : 'Disconnect';
+            return;
+          }
+          toast(`${action === 'connect' ? 'connected' : 'disconnected'} + restart signaled`, 'ok');
+          await loadConnectors();
+          await loadConfig();
+        } catch(e) {
+          toast('error: '+e.message, 'fail', 6000);
+          actionBtn.disabled = false;
+        }
+      };
+    }
+    return card;
+  }
+
+  // ---- credential modal (paste-in-dashboard for env_key connectors) ----
+  let _connModalCtx = null;
+
+  function openCredModal(c) {
+    _connModalCtx = c;
+    $('conn-modal-title').innerHTML = `${c.emoji || '🔌'} Connect ${escHtml(c.name)}`;
+    const helpLines = [];
+    if (c.docs_help) helpLines.push(escHtml(c.docs_help));
+    if (c.docs_url) helpLines.push(`<a href="${escAttr(c.docs_url)}" target="_blank" rel="noopener">Open provider dashboard →</a>`);
+    $('conn-modal-help').innerHTML = helpLines.join('<br>');
+    const fieldsDiv = $('conn-modal-fields');
+    fieldsDiv.innerHTML = '';
+    const vars = c.env_vars || [];
+    for (const v of vars) {
+      const already = !(c.missing_env_vars || []).includes(v);
+      const label = document.createElement('label');
+      label.innerHTML = `${escHtml(v)}${already ? ' <span class="dim" style="font-size:0.78em;">(already set — overwrite optional)</span>' : ''}`;
+      const input = document.createElement('input');
+      input.type = v.toLowerCase().includes('secret') || v.toLowerCase().includes('key') || v.toLowerCase().includes('token') || v.toLowerCase().includes('password') ? 'password' : 'text';
+      input.dataset.var = v;
+      input.placeholder = already ? '(leave blank to keep)' : `paste ${v}`;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      label.appendChild(input);
+      fieldsDiv.appendChild(label);
+    }
+    $('connModal').classList.remove('hidden');
+    setTimeout(() => fieldsDiv.querySelector('input')?.focus(), 50);
+  }
+
+  function closeCredModal() {
+    $('connModal').classList.add('hidden');
+    _connModalCtx = null;
+  }
+
+  $('connCancel').onclick = closeCredModal;
+  $('connModal').addEventListener('click', (e) => {
+    if (e.target === $('connModal')) closeCredModal();
+  });
+
+  $('connSubmit').onclick = async () => {
+    if (!_connModalCtx) return;
+    const c = _connModalCtx;
+    const submitBtn = $('connSubmit');
+    const values = {};
+    const inputs = $('conn-modal-fields').querySelectorAll('input[data-var]');
+    for (const inp of inputs) {
+      const v = inp.value.trim();
+      if (v) values[inp.dataset.var] = v;
+    }
+    // Allow submit only if user either filled in all missing vars, or re-entered at least one.
+    const missing = c.missing_env_vars || [];
+    const stillMissing = missing.filter(v => !(v in values));
+    if (stillMissing.length) {
+      toast(`still missing: ${stillMissing.join(', ')}`, 'fail', 5000);
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Saving…';
+    try {
+      const envRes = await fetch('/api/env/write', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({ values, connector_id: c.id }),
+      });
+      const envJ = await envRes.json();
+      if (!envRes.ok) {
+        const msg = envJ.detail?.message || envJ.detail || envJ.error || 'env write failed';
+        toast(msg, 'fail', 6000);
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Save & connect';
+        return;
+      }
+      // Now toggle the connector on — /api/env/write already updated os.environ
+      // so credentials_ready check on the server will pass.
+      submitBtn.textContent = 'Connecting…';
+      const togRes = await fetch(`/api/agents/${AGENT_NAME}/connectors/${encodeURIComponent(c.id)}`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({ enable: true }),
+      });
+      const togJ = await togRes.json();
+      if (!togRes.ok) {
+        const msg = togJ.detail?.message || togJ.detail?.error || togJ.detail || 'toggle failed';
+        toast('saved .env but toggle failed: ' + msg, 'fail', 6000);
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Save & connect';
+        return;
+      }
+      toast(`${c.name} connected (${envJ.count} var${envJ.count === 1 ? '' : 's'} written to .env)`, 'ok', 4500);
+      closeCredModal();
+      await loadConnectors();
+      await loadConfig();
+    } catch(e) {
+      toast('error: ' + e.message, 'fail', 6000);
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Save & connect';
+    }
+  };
+
 })();
 """

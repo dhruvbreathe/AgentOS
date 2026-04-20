@@ -1,3 +1,4 @@
+# edited via dashboard at 2026-04-20T16:01:23+00:00
 name: main
 channel_id: "1469505325102006490"   # #virtual-ceo-cto-dhruv / Vayu main (primary)
 # NOTE: #research-labs (1477129158114152570) used to be here as an extra
@@ -15,8 +16,6 @@ system_prompt_file: ""
 # Optional: list of skill markdown files appended to the system prompt.
 skills:
   - skill:dev-browser
-
-# Tools on top of the defaults in config.yaml.
 allowed_tools: []
 disallowed_tools: []
 
@@ -35,25 +34,45 @@ effort: high
 #     type: stdio
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-obsidian"]
-mcp_servers: {}
+mcp_servers:
+  mixpanel:
+    type: mcp
+    note: Mixpanel product analytics — query events, funnels, retention, user replays, dashboards
 
 # Scoped specialists Vayu can spawn via the Task tool. See shared/SUBAGENTS.md.
+  gmail:
+    type: mcp
+    note: Gmail access — read threads, create drafts, manage labels. Use for outreach, support triage, investor follow-ups
+  biorxiv:
+    type: mcp
+    note: bioRxiv preprint search — breathwork, HRV, stress, interoception, respiratory science
+  supabase:
+    type: env
+    note: Supabase access — project ref yakibuftxtsvqnwnermi (prod) / qzbcaamocrtxtfavistu (staging). Postgres 14.1.
 subagents:
   research:
-    description: "Focused research subagent — one question, sourced answer."
-    prompt: |
-      You are a research specialist invoked by Vayu. Answer ONE question
-      in under 200 words with 3 bullets max and source links where
-      possible. No filler. No "based on my search". Lead with the answer.
-    tools: [WebSearch, WebFetch, Read, Grep, Glob]
+    description: Focused research subagent — one question, sourced answer.
     model: claude-haiku-4-5-20251001
+    tools:
+      - WebSearch
+      - WebFetch
+      - Read
+      - Grep
+      - Glob
     max_turns: 5
+    prompt: "You are a research specialist invoked by Vayu. Answer ONE question\nin under 200 words with 3 bullets max and source links where\npossible. No filler. No \"based on my search\". Lead with the
+      answer.\n"
   synthesizer:
-    description: "Distill a pile of notes or trajectories into a crisp summary."
-    prompt: |
-      You synthesise. Given input (session logs, trajectories, notes),
-      produce a 3-section summary: what happened, what matters, what to
-      do next. Terse, sourced, no hedging. Under 250 words.
-    tools: [Read, Glob, Grep]
+    description: Distill a pile of notes or trajectories into a crisp summary.
     model: claude-sonnet-4-6
+    tools:
+      - Read
+      - Glob
+      - Grep
     max_turns: 3
+    prompt: "You synthesise. Given input (session logs, trajectories, notes),\nproduce a 3-section summary: what happened, what matters, what to\ndo next. Terse, sourced, no hedging. Under 250 words.\n"
+permission_mode: auto
+env_passthrough:
+  - SUPABASE_PROJECT_REF
+  - SUPABASE_SERVICE_ROLE_KEY
+  - SUPABASE_URL

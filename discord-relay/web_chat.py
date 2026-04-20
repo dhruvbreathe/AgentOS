@@ -475,21 +475,28 @@ async def chat_upload(agent: str, request: Request) -> JSONResponse:
     so the browser can include them in the next prompt."""
     if agent not in _agent_map():
         raise HTTPException(404, "no such agent")
-    from fastapi import UploadFile
     form = await request.form()
     out_dir = UPLOADS_DIR / agent
     out_dir.mkdir(parents=True, exist_ok=True)
     saved: list[dict] = []
     for _, item in form.multi_items():
-        if not isinstance(item, UploadFile):
+        # Duck-type rather than isinstance — starlette's UploadFile class can
+        # fail isinstance() checks when fastapi/starlette versions drift.
+        if not (hasattr(item, "filename") and hasattr(item, "read") and callable(getattr(item, "read", None))):
+            continue
+        filename = getattr(item, "filename", None) or "upload"
+        if not filename or filename == "upload" and not hasattr(item, "content_type"):
             continue
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        safe = "".join(c for c in (item.filename or "upload") if c.isalnum() or c in "._-")
+        safe = "".join(c for c in filename if c.isalnum() or c in "._-") or "upload"
         local = out_dir / f"{ts}-{safe}"
         data = await item.read()
+        if not isinstance(data, (bytes, bytearray)):
+            # String fields slip through — skip them.
+            continue
         local.write_bytes(data)
-        entry = {"path": str(local), "name": item.filename, "bytes": len(data),
-                 "type": item.content_type}
+        entry = {"path": str(local), "name": filename, "bytes": len(data),
+                 "type": getattr(item, "content_type", None)}
         # If audio, transcribe immediately so the prompt carries the transcript.
         try:
             from transcribe import is_audio, transcribe
@@ -530,12 +537,13 @@ CHAT_CSS = """
   .msg.assistant .bubble{background:var(--panel-2);border:1px solid var(--border);}
   .msg .ts{font-size:0.7em;color:var(--fg-mute);margin-top:0.3em;}
   .msg.user .ts{text-align:right;}
-  .chat-input{border-top:1px solid var(--border);padding:1em 1.2em;display:flex;gap:0.8em;align-items:flex-end;}
-  .chat-input textarea{flex:1;background:var(--panel-2);border:1px solid var(--border);color:var(--fg);padding:0.7em 1em;border-radius:8px;font-family:inherit;font-size:0.95em;resize:none;min-height:2.4em;max-height:10em;}
-  .chat-input textarea:focus{outline:none;border-color:var(--accent);}
-  .chat-input button{background:var(--accent);color:#0a0a0b;border:none;padding:0.7em 1.3em;border-radius:8px;cursor:pointer;font-weight:600;font-size:0.9em;}
-  .chat-input button:disabled{opacity:0.4;cursor:not-allowed;}
-  .chat-input button:hover:not(:disabled){background:#7db4ff;}
+  .chat-input{border-top:1px solid var(--border);padding:0.9em 1.1em calc(0.9em + env(safe-area-inset-bottom)) 1.1em;display:flex;gap:0.6em;align-items:flex-end;background:var(--panel);}
+  .chat-input textarea{flex:1;min-width:0;background:var(--panel-2);border:1px solid var(--border);color:var(--fg);padding:0.7em 1em;border-radius:10px;font-family:inherit;font-size:0.95em;resize:none;min-height:44px;max-height:10em;box-sizing:border-box;}
+  .chat-input textarea:focus{outline:none;border-color:var(--fg);}
+  /* Send button — primary action, theme-aware */
+  .chat-input button#chat-send{background:var(--accent);color:var(--accent-ink);border:none;padding:0 1.2em;min-height:44px;min-width:64px;border-radius:10px;cursor:pointer;font-weight:600;font-size:0.92em;font-family:inherit;flex-shrink:0;transition:opacity 0.14s;}
+  .chat-input button#chat-send:disabled{opacity:0.35;cursor:not-allowed;}
+  .chat-input button#chat-send:hover:not(:disabled){opacity:0.9;}
   .chat-empty{display:flex;align-items:center;justify-content:center;flex:1;color:var(--fg-mute);font-size:0.9em;}
   .typing{display:inline-block;padding:0.3em 0.8em;background:var(--panel-2);border-radius:8px;color:var(--fg-mute);font-size:0.85em;}
   .typing .dot{display:inline-block;animation:blink 1.4s infinite;}
@@ -544,15 +552,18 @@ CHAT_CSS = """
   @keyframes blink{0%,80%,100%{opacity:0.3;}40%{opacity:1;}}
   .tool-log{margin:0.3em 0;font-size:0.8em;}
   .tool-event{padding:0.25em 0.7em;margin-bottom:0.2em;border-left:2px solid var(--border);color:var(--fg-dim);background:var(--panel-2);border-radius:0 6px 6px 0;}
-  .tool-event.thinking{border-left-color:var(--accent-2);opacity:0.85;}
   .tool-event code{background:transparent;padding:0;color:var(--accent);}
   .chat-attach-chips{display:none;gap:0.4em;flex-wrap:wrap;padding:0.4em 1.2em 0;}
   .chip{background:var(--panel-2);border:1px solid var(--border);padding:0.2em 0.5em;border-radius:6px;font-size:0.8em;display:inline-flex;align-items:center;gap:0.3em;}
   .chip-x{background:none;border:none;color:var(--fg-mute);cursor:pointer;font-size:1.1em;padding:0 0.2em;}
   .chip-x:hover{color:var(--fail);}
   .chat-messages.dragging{background:rgba(111,168,255,0.05);outline:2px dashed var(--accent);outline-offset:-8px;}
-  .chat-attach-btn{background:var(--panel-2);border:1px solid var(--border);color:var(--fg-dim);padding:0.7em 0.8em;border-radius:8px;cursor:pointer;font-size:0.9em;}
-  .chat-attach-btn:hover{color:var(--fg);border-color:var(--accent);}
+  .chat-main.dragging{outline:2px dashed var(--accent);outline-offset:-4px;position:relative;}
+  .chat-main.dragging::after{content:"drop files to attach";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--panel-2);border:1px solid var(--accent);padding:0.6em 1.2em;border-radius:8px;color:var(--accent);font-size:0.95em;pointer-events:none;z-index:10;}
+  .tool-event.thinking{border-left:2px solid var(--accent-2);background:rgba(111,168,255,0.04);}
+  /* Attach button — secondary, readable icon, 44px tap target */
+  .chat-input button.chat-attach-btn{background:var(--panel-2);border:1px solid var(--border);color:var(--fg);padding:0;width:44px;height:44px;min-height:44px;border-radius:10px;cursor:pointer;font-size:1.2em;line-height:1;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;font-family:inherit;}
+  .chat-input button.chat-attach-btn:hover{color:var(--fg);border-color:var(--fg);background:var(--panel-3);}
   @media (max-width:780px){
     .chat-layout{grid-template-columns:1fr;grid-template-rows:auto 1fr;}
     .chat-sidebar{max-height:120px;}
@@ -695,7 +706,8 @@ CHAT_PAGE_JS = r"""
     if (empty) empty.remove();
 
     addMessage('user', prompt || '(attachment only)', new Date().toISOString().slice(0, 19));
-    const assistantBubble = addMessage('assistant', '<span class="typing"><span class="dot">•</span><span class="dot">•</span><span class="dot">•</span></span>');
+    const assistantBubble = addMessage('assistant', '');
+    assistantBubble.innerHTML = '<span class="typing"><span class="dot">•</span><span class="dot">•</span><span class="dot">•</span></span>';
     const toolLog = document.createElement('div');
     toolLog.className = 'tool-log';
     assistantBubble.parentElement.insertBefore(toolLog, assistantBubble);
@@ -703,6 +715,52 @@ CHAT_PAGE_JS = r"""
     let currentText = '';
     let sawFinal = false;
     const startTime = Date.now();
+    // Dispatch a single SSE event onto the UI. Shared between streaming and
+    // blocking-text paths so both render identically.
+    function handleEvent(ev){
+      if (ev.type === 'update' || ev.type === 'final'){
+        currentText = ev.text || '';
+        updateAssistantBubble(assistantBubble, currentText);
+        if (ev.type === 'final') sawFinal = true;
+      } else if (ev.type === 'tool_use'){
+        const div = document.createElement('div');
+        div.className = 'tool-event';
+        const inp = JSON.stringify(ev.input || {}).slice(0, 100);
+        div.innerHTML = '🔧 <code>' + escapeHtml(ev.name) + '</code> <span class="meta">' + escapeHtml(inp) + '</span>';
+        toolLog.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+      } else if (ev.type === 'tool_result'){
+        const div = document.createElement('div');
+        div.className = 'tool-event';
+        const icon = ev.is_error ? '❌' : '✅';
+        div.innerHTML = icon + ' <span class="meta">' + escapeHtml(ev.preview || '') + '</span>';
+        toolLog.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+      } else if (ev.type === 'thinking'){
+        const div = document.createElement('div');
+        div.className = 'tool-event thinking';
+        div.innerHTML = '🧠 <em>' + escapeHtml(ev.text || '') + '</em>';
+        toolLog.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+      } else if (ev.type === 'error'){
+        assistantBubble.innerHTML = '<span style="color:var(--fail)">⚠️ ' + escapeHtml(ev.message) + '</span>';
+      }
+    }
+
+    function parseChunk(chunk){
+      if (!chunk || !chunk.startsWith('data:')) return;
+      const json = chunk.slice(5).trim();
+      if (!json) return;
+      let ev; try { ev = JSON.parse(json); } catch(_){ return; }
+      handleEvent(ev);
+    }
+    // iOS Safari + Vercel-edge + CF-tunnel mangle ReadableStream bodies.
+    // Detect iOS/Safari and skip the streaming path. Desktop Chrome/Firefox/Safari
+    // still get live token streaming.
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const hasStreams = !isIOS && typeof ReadableStream !== 'undefined' && typeof TextDecoder !== 'undefined';
+
     try {
       const resp = await fetch(`/api/chat/${agentName}/stream`, {
         method: 'POST',
@@ -712,49 +770,23 @@ CHAT_PAGE_JS = r"""
       if (!resp.ok){
         throw new Error('HTTP ' + resp.status);
       }
-      const reader = resp.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      while (true){
-        const {value, done} = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, {stream:true});
-        const events = buf.split('\n\n');
-        buf = events.pop() || '';
-        for (const chunk of events){
-          if (!chunk.startsWith('data:')) continue;
-          const json = chunk.slice(5).trim();
-          if (!json) continue;
-          let ev;
-          try { ev = JSON.parse(json); } catch(_){ continue; }
-          if (ev.type === 'update' || ev.type === 'final'){
-            currentText = ev.text || '';
-            updateAssistantBubble(assistantBubble, currentText);
-            if (ev.type === 'final') sawFinal = true;
-          } else if (ev.type === 'tool_use'){
-            const div = document.createElement('div');
-            div.className = 'tool-event';
-            const inp = JSON.stringify(ev.input || {}).slice(0, 100);
-            div.innerHTML = '🔧 <code>' + escapeHtml(ev.name) + '</code> <span class="meta">' + escapeHtml(inp) + '</span>';
-            toolLog.appendChild(div);
-            messages.scrollTop = messages.scrollHeight;
-          } else if (ev.type === 'tool_result'){
-            const div = document.createElement('div');
-            div.className = 'tool-event';
-            const icon = ev.is_error ? '❌' : '✅';
-            div.innerHTML = icon + ' <span class="meta">' + escapeHtml(ev.preview || '') + '</span>';
-            toolLog.appendChild(div);
-            messages.scrollTop = messages.scrollHeight;
-          } else if (ev.type === 'thinking'){
-            const div = document.createElement('div');
-            div.className = 'tool-event thinking';
-            div.innerHTML = '🧠 <em>' + escapeHtml(ev.text || '') + '</em>';
-            toolLog.appendChild(div);
-            messages.scrollTop = messages.scrollHeight;
-          } else if (ev.type === 'error'){
-            assistantBubble.innerHTML = '<span style="color:var(--fail)">⚠️ ' + escapeHtml(ev.message) + '</span>';
-          }
+      if (hasStreams && resp.body && resp.body.getReader){
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        while (true){
+          const {value, done} = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, {stream:true});
+          const events = buf.split('\n\n');
+          buf = events.pop() || '';
+          for (const chunk of events) parseChunk(chunk);
         }
+        if (buf.trim()) parseChunk(buf);
+      } else {
+        // Blocking path: wait for the full body, then replay all SSE events.
+        const text = await resp.text();
+        for (const chunk of text.split('\n\n')) parseChunk(chunk);
       }
       // Fire a local desktop notification if the turn took long and the tab isn't focused.
       const elapsed = (Date.now() - startTime) / 1000;
@@ -815,14 +847,37 @@ CHAT_PAGE_JS = r"""
     if (files.length) uploadFiles(files);
   });
 
-  // Drag-and-drop.
-  ['dragenter','dragover'].forEach(ev => messages.addEventListener(ev, (e) => {
-    e.preventDefault(); messages.classList.add('dragging');
-  }));
-  ['dragleave','drop'].forEach(ev => messages.addEventListener(ev, (e) => {
-    e.preventDefault(); messages.classList.remove('dragging');
-  }));
-  messages.addEventListener('drop', (e) => {
+  // Drag-and-drop: capture at document/window level so drops on textarea,
+  // buttons, or any nested child still route to uploadFiles(). This is the
+  // pattern Discord/Slack use — without it, <textarea> swallows the drop.
+  const dropZone = document.getElementById('chat-pane') || messages;
+  function isFileDrag(e){
+    return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  }
+  // Block browser default (navigating to the file) everywhere on the page.
+  window.addEventListener('dragover', (e) => {
+    if (isFileDrag(e)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }
+  });
+  window.addEventListener('drop', (e) => {
+    if (isFileDrag(e)) e.preventDefault();
+  });
+  // Overlay lifecycle driven by enter/leave on the document.
+  let dragDepth = 0;
+  document.addEventListener('dragenter', (e) => {
+    if (!isFileDrag(e)) return;
+    dragDepth++;
+    dropZone.classList.add('dragging');
+  });
+  document.addEventListener('dragleave', (e) => {
+    if (!isFileDrag(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropZone.classList.remove('dragging');
+  });
+  document.addEventListener('drop', (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    dropZone.classList.remove('dragging');
     if (e.dataTransfer.files && e.dataTransfer.files.length){
       uploadFiles(e.dataTransfer.files);
     }
@@ -855,7 +910,7 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
       <h3>Agents</h3>
       {''.join(sidebar_items)}
     </div>
-    <div class="chat-main">
+    <div class="chat-main" id="chat-pane">
       <div class="chat-header">
         <h2>@{esc(agent)}</h2>
         <span class="meta">direct chat</span>

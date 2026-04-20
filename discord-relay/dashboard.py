@@ -389,76 +389,291 @@ def _vault_stats() -> dict:
 
 CSS = """
   :root {
-    --bg:#0e0e10; --panel:#18181b; --panel-2:#1f1f23;
-    --fg:#e4e4e7; --fg-dim:#a1a1aa; --fg-mute:#71717a;
-    --accent:#6fa8ff; --accent-2:#9d7cff;
-    --ok:#4ade80; --warn:#fbbf24; --fail:#f87171;
-    --border:#27272a;
+    /* Prana — warm, premium, breath-aligned */
+    --bg:#f7f5ef;               /* cream */
+    --panel:#ffffff;            /* primary surface */
+    --panel-2:#efece3;          /* subtle alt surface */
+    --panel-3:#f2efe6;          /* lighter alt */
+    --fg:#1a1f2e;               /* deep navy */
+    --fg-dim:#4b5563;           /* secondary */
+    --fg-mute:#8a8a7b;          /* tertiary */
+    --accent:#1a1f2e;           /* navy — primary action */
+    --accent-2:#7cc9a8;         /* mint — breath */
+    --accent-3:#a89ecd;         /* lavender */
+    --accent-ink:#ffffff;       /* ink on accent */
+    --ok:#3d8f58;
+    --warn:#b5791f;
+    --fail:#b94a33;
+    --ok-bg:rgba(125,199,168,0.18);
+    --warn-bg:rgba(212,148,62,0.15);
+    --fail-bg:rgba(199,84,62,0.12);
+    --border:#e5e1d6;
+    --border-strong:#d6d1c2;
+    --shadow-sm:0 1px 2px rgba(26,31,46,0.04), 0 0 0 1px rgba(26,31,46,0.04);
+    --shadow-md:0 4px 16px rgba(26,31,46,0.06), 0 0 0 1px rgba(26,31,46,0.04);
+    --radius:14px;
+    --radius-sm:10px;
+    --radius-pill:999px;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace;
+    --serif:"Charter","Iowan Old Style","Georgia",serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#15161c; --panel:#1c1d25; --panel-2:#252731; --panel-3:#1f2029;
+      --fg:#f1eee4; --fg-dim:#c4bfae; --fg-mute:#827d6e;
+      --accent:#f7f5ef; --accent-ink:#1a1f2e;
+      --border:#2e2f3a; --border-strong:#3b3d4a;
+      --shadow-sm:0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.04);
+      --shadow-md:0 6px 20px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.04);
+      --ok-bg:rgba(125,199,168,0.12);
+      --warn-bg:rgba(212,148,62,0.12);
+      --fail-bg:rgba(199,84,62,0.12);
+    }
   }
   *{box-sizing:border-box;}
-  body{font-family:-apple-system,"SF Pro Text","Inter",sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:0;}
-  .wrap{max-width:1280px;margin:0 auto;padding:1.5em;}
-  h1,h2,h3{margin:0;font-weight:600;}
-  h1{font-size:1.4em;}
-  h2{font-size:1.1em;margin:2em 0 0.8em;color:var(--fg-dim);text-transform:uppercase;letter-spacing:0.08em;font-weight:500;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Inter","SF Pro Text","Helvetica Neue",sans-serif;
+    font-size:15px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  @supports (-webkit-touch-callout: none) { body { font-size:16px; } }
+
+  /* ---------- layout shell ---------- */
+  .topbar{
+    position:sticky;top:0;z-index:40;
+    display:flex;align-items:center;gap:1em;
+    padding:0.9em 1.5em;
+    background:color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter:saturate(140%) blur(14px);
+    -webkit-backdrop-filter:saturate(140%) blur(14px);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{display:flex;align-items:center;gap:0.55em;font-weight:600;letter-spacing:-0.01em;color:var(--fg);text-decoration:none;font-size:1.02em;}
+  .brand-mark{width:28px;height:28px;border-radius:9px;background:linear-gradient(135deg,var(--accent) 0%,#2d3448 100%);display:grid;place-items:center;color:var(--accent-ink);font-weight:700;font-size:0.9em;box-shadow:var(--shadow-sm);}
+  .brand small{font-weight:400;color:var(--fg-mute);font-size:0.82em;margin-left:0.2em;}
+  .nav-desktop{display:flex;gap:0.15em;margin-left:1.2em;}
+  .nav-desktop a{
+    color:var(--fg-dim);font-size:0.92em;text-decoration:none;
+    padding:0.5em 0.9em;border-radius:var(--radius-pill);transition:all 0.14s;
+  }
+  .nav-desktop a:hover{color:var(--fg);background:var(--panel-2);}
+  .nav-desktop a.active{color:var(--fg);background:var(--panel);box-shadow:var(--shadow-sm);}
+  .topbar-spacer{flex:1;}
+  .topbar-meta{color:var(--fg-mute);font-size:0.82em;display:flex;align-items:center;gap:0.5em;}
+  .pulse-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(61,143,88,0.6);animation:pulse 2.2s ease-out infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(61,143,88,0.5);}70%{box-shadow:0 0 0 8px rgba(61,143,88,0);}100%{box-shadow:0 0 0 0 rgba(61,143,88,0);}}
+
+  @media (max-width:768px){
+    .nav-desktop{display:none;}
+    .topbar{padding:0.7em 1em;}
+  }
+
+  .wrap{max-width:1200px;margin:0 auto;padding:1.5em;}
+  @media (max-width:768px){.wrap{padding:1em;padding-bottom:5.5em;}}
+
+  /* ---------- bottom nav (mobile) ---------- */
+  .nav-bottom{
+    display:none;
+    position:fixed;bottom:0;left:0;right:0;z-index:50;
+    background:color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter:saturate(140%) blur(16px);
+    -webkit-backdrop-filter:saturate(140%) blur(16px);
+    border-top:1px solid var(--border);
+    padding:0.45em 0.25em calc(0.45em + env(safe-area-inset-bottom));
+  }
+  .nav-bottom ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(5,1fr);}
+  .nav-bottom a{
+    display:flex;flex-direction:column;align-items:center;gap:0.15em;
+    padding:0.45em 0.25em;color:var(--fg-mute);text-decoration:none;
+    font-size:0.7em;font-weight:500;border-radius:10px;min-height:44px;
+  }
+  .nav-bottom a svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;}
+  .nav-bottom a.active{color:var(--fg);}
+  .nav-bottom a.active svg{stroke:var(--fg);}
+  @media (max-width:768px){.nav-bottom{display:block;}}
+
+  /* ---------- typography ---------- */
+  h1,h2,h3,h4{margin:0;font-weight:600;letter-spacing:-0.015em;color:var(--fg);}
+  h1{font-family:var(--serif);font-size:2em;line-height:1.15;font-weight:500;letter-spacing:-0.02em;}
+  h2{font-size:0.78em;margin:2.2em 0 0.9em;color:var(--fg-mute);text-transform:uppercase;letter-spacing:0.11em;font-weight:600;}
   h3{font-size:1em;margin:1em 0 0.5em;}
-  a{color:var(--accent);text-decoration:none;}
-  a:hover{text-decoration:underline;}
+  @media (max-width:768px){h1{font-size:1.65em;}}
+  a{color:var(--fg);text-decoration:none;border-bottom:1px solid transparent;transition:border-color 0.15s;}
+  a:hover{border-bottom-color:var(--fg-mute);}
   .meta{color:var(--fg-mute);font-size:0.85em;}
-  nav{display:flex;gap:1.5em;padding:1em 1.5em;border-bottom:1px solid var(--border);background:var(--panel);align-items:center;}
-  nav a{color:var(--fg-dim);font-size:0.9em;}
-  nav a.active{color:var(--accent);}
+  .eyebrow{color:var(--fg-mute);text-transform:uppercase;font-size:0.68em;letter-spacing:0.14em;font-weight:600;}
+
+  /* ---------- hero ---------- */
+  .hero{display:flex;align-items:flex-end;justify-content:space-between;gap:1em;margin:0.4em 0 1.5em;flex-wrap:wrap;}
+  .hero-headline{flex:1;min-width:240px;}
+  .hero-subtitle{color:var(--fg-dim);margin-top:0.4em;font-size:1.02em;max-width:54ch;}
+  .hero-actions{display:flex;gap:0.5em;flex-wrap:wrap;}
+
+  /* ---------- buttons ---------- */
+  .btn{
+    display:inline-flex;align-items:center;gap:0.4em;
+    padding:0.65em 1.1em;border-radius:var(--radius-pill);
+    font-size:0.92em;font-weight:500;cursor:pointer;
+    background:var(--panel);color:var(--fg);border:1px solid var(--border);
+    text-decoration:none;transition:all 0.14s;min-height:40px;
+    box-shadow:var(--shadow-sm);
+  }
+  .btn:hover{border-color:var(--border-strong);transform:translateY(-1px);box-shadow:var(--shadow-md);}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);}
+  .btn.primary:hover{opacity:0.92;}
+  .btn.ghost{box-shadow:none;background:transparent;}
+  .btn.sm{padding:0.4em 0.85em;font-size:0.85em;min-height:32px;}
+
+  /* ---------- grid + stat cards ---------- */
   .grid{display:grid;gap:1em;}
   .cols-4{grid-template-columns:repeat(4,1fr);}
   .cols-3{grid-template-columns:repeat(3,1fr);}
   .cols-2{grid-template-columns:repeat(2,1fr);}
-  @media (max-width:900px){.cols-4,.cols-3{grid-template-columns:1fr 1fr;}}
-  @media (max-width:600px){.cols-4,.cols-3,.cols-2{grid-template-columns:1fr;}}
-  .stat{background:var(--panel);border:1px solid var(--border);padding:1em;border-radius:8px;}
-  .stat .label{color:var(--fg-mute);text-transform:uppercase;font-size:0.7em;letter-spacing:0.08em;}
-  .stat .value{font-size:1.8em;font-weight:600;margin-top:0.3em;}
-  .stat .sub{color:var(--fg-dim);font-size:0.8em;margin-top:0.3em;}
+  @media (max-width:1024px){.cols-4{grid-template-columns:repeat(2,1fr);}}
+  @media (max-width:640px){.cols-4,.cols-3,.cols-2{grid-template-columns:1fr;}}
+
+  .stat{
+    background:var(--panel);border:1px solid var(--border);
+    padding:1.1em 1.2em;border-radius:var(--radius);
+    box-shadow:var(--shadow-sm);
+  }
+  .stat .label{color:var(--fg-mute);text-transform:uppercase;font-size:0.68em;letter-spacing:0.12em;font-weight:600;}
+  .stat .value{font-family:var(--serif);font-size:2.1em;font-weight:500;margin-top:0.25em;line-height:1.1;letter-spacing:-0.02em;}
+  .stat .value .pill{font-family:-apple-system,sans-serif;font-size:0.48em;font-weight:500;vertical-align:middle;}
+  .stat .sub{color:var(--fg-dim);font-size:0.85em;margin-top:0.45em;}
+  .stat.accent{background:linear-gradient(135deg, var(--panel) 0%, var(--panel-2) 100%);}
+
+  /* ---------- agent cards (mobile-first) ---------- */
+  .agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:0.9em;}
+  .agent-card{
+    display:block;background:var(--panel);border:1px solid var(--border);
+    border-radius:var(--radius);padding:1em 1.1em;
+    text-decoration:none;color:inherit;transition:all 0.14s;
+    box-shadow:var(--shadow-sm);
+  }
+  .agent-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md);border-color:var(--border-strong);}
+  .agent-card .head{display:flex;align-items:center;justify-content:space-between;gap:0.5em;margin-bottom:0.7em;}
+  .agent-card .name{font-weight:600;font-size:1.02em;}
+  .agent-card .age{color:var(--fg-mute);font-size:0.8em;}
+  .agent-card .row{display:flex;gap:0.55em;align-items:center;flex-wrap:wrap;font-size:0.82em;color:var(--fg-dim);margin-top:0.55em;}
+  .agent-card .row .chip{background:var(--panel-2);border-radius:var(--radius-pill);padding:0.15em 0.65em;color:var(--fg-dim);font-size:0.8em;}
+  .agent-card .model{color:var(--fg-mute);font-family:var(--mono);font-size:0.75em;margin-top:0.3em;}
+  .health-dot{display:inline-block;width:8px;height:8px;border-radius:50%;}
+  .health-dot.ok{background:var(--ok);}
+  .health-dot.warn{background:var(--warn);}
+  .health-dot.fail{background:var(--fail);}
+  .health-dot.dim{background:var(--fg-mute);}
+
+  /* ---------- table ---------- */
   table{border-collapse:collapse;width:100%;font-size:0.9em;}
-  table th{text-align:left;padding:0.6em 0.8em;border-bottom:1px solid var(--border);color:var(--fg-mute);font-weight:500;font-size:0.75em;text-transform:uppercase;letter-spacing:0.06em;}
-  table td{padding:0.6em 0.8em;border-bottom:1px solid var(--border);}
-  table tr:hover{background:var(--panel-2);}
-  .pill{display:inline-block;padding:0.15em 0.6em;border-radius:12px;font-size:0.75em;font-weight:500;}
-  .pill.ok{background:rgba(74,222,128,0.15);color:var(--ok);}
-  .pill.warn{background:rgba(251,191,36,0.15);color:var(--warn);}
-  .pill.fail{background:rgba(248,113,113,0.15);color:var(--fail);}
+  table th{text-align:left;padding:0.75em 1em;border-bottom:1px solid var(--border);color:var(--fg-mute);font-weight:600;font-size:0.7em;text-transform:uppercase;letter-spacing:0.1em;}
+  table td{padding:0.75em 1em;border-bottom:1px solid var(--border);}
+  table tr:last-child td{border-bottom:none;}
+  table tr:hover td{background:var(--panel-3);}
+  @media (max-width:640px){table.responsive thead{display:none;}table.responsive tr{display:block;border-bottom:1px solid var(--border);padding:0.6em 0;}table.responsive td{display:flex;justify-content:space-between;padding:0.3em 1em;border:none;}table.responsive td:before{content:attr(data-label);color:var(--fg-mute);font-size:0.75em;text-transform:uppercase;letter-spacing:0.08em;}}
+
+  /* ---------- pills ---------- */
+  .pill{display:inline-flex;align-items:center;gap:0.3em;padding:0.18em 0.65em;border-radius:var(--radius-pill);font-size:0.76em;font-weight:500;letter-spacing:0.01em;}
+  .pill.ok{background:var(--ok-bg);color:var(--ok);}
+  .pill.warn{background:var(--warn-bg);color:var(--warn);}
+  .pill.fail{background:var(--fail-bg);color:var(--fail);}
   .pill.dim{background:var(--panel-2);color:var(--fg-dim);}
-  code,pre{font-family:"SF Mono","JetBrains Mono",monospace;font-size:0.85em;}
-  code{background:var(--panel-2);padding:0.1em 0.4em;border-radius:4px;}
-  pre{background:var(--panel);border:1px solid var(--border);padding:1em;border-radius:6px;overflow-x:auto;white-space:pre-wrap;}
-  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1.2em;}
+  .pill.accent{background:var(--accent);color:var(--accent-ink);}
+
+  /* ---------- code + panels ---------- */
+  code,pre{font-family:var(--mono);font-size:0.85em;}
+  code{background:var(--panel-2);padding:0.1em 0.45em;border-radius:5px;color:var(--fg);word-break:break-word;}
+  pre{background:var(--panel);border:1px solid var(--border);padding:1em 1.1em;border-radius:var(--radius-sm);overflow-x:auto;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;box-shadow:var(--shadow-sm);max-width:100%;box-sizing:border-box;}
+  html,body{overflow-x:hidden;max-width:100vw;}
+  .wrap,main,section,.panel,details{max-width:100%;box-sizing:border-box;}
+  textarea,input{max-width:100%;box-sizing:border-box;word-break:break-word;}
+  table{max-width:100%;}
+  table td,table th{word-break:break-word;overflow-wrap:anywhere;}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:1.2em 1.3em;box-shadow:var(--shadow-sm);}
   .panel+.panel{margin-top:1em;}
-  .event{padding:0.5em 0;border-bottom:1px solid var(--border);font-size:0.88em;}
+  .panel.flush{padding:0;}
+  .panel.flush table th,.panel.flush table td{padding:0.8em 1.3em;}
+
+  /* ---------- events feed ---------- */
+  .event{padding:0.65em 0;border-bottom:1px solid var(--border);font-size:0.88em;display:flex;align-items:baseline;gap:0.6em;flex-wrap:wrap;}
   .event:last-child{border-bottom:none;}
-  .event .ts{color:var(--fg-mute);margin-right:0.8em;font-family:monospace;}
-  .event .agent{color:var(--accent-2);margin-right:0.6em;font-weight:500;}
-  .event .type{color:var(--fg-dim);margin-right:0.6em;}
-  .truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:680px;display:inline-block;vertical-align:bottom;}
+  .event .ts{color:var(--fg-mute);font-family:var(--mono);font-size:0.78em;}
+  .event .agent{color:var(--fg);font-weight:600;}
+  .event .agent a{border:none;}
+  .event .type{color:var(--fg-dim);}
+  .truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;flex:1;min-width:0;}
+
+  /* ---------- misc ---------- */
+  hr{border:none;border-top:1px solid var(--border);margin:1.5em 0;}
+  .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:1em;margin:2em 0 0.8em;}
+  .section-head h2{margin:0;}
+  .section-head .link{color:var(--fg-dim);font-size:0.86em;}
+  .empty{color:var(--fg-mute);font-size:0.92em;padding:0.6em 0;font-style:italic;}
+
+  /* noindex hint */
+  .dev-hint{position:fixed;bottom:1em;right:1em;font-size:0.72em;color:var(--fg-mute);background:var(--panel);padding:0.35em 0.8em;border-radius:var(--radius-pill);border:1px solid var(--border);box-shadow:var(--shadow-sm);z-index:30;}
+  @media (max-width:768px){.dev-hint{display:none;}}
 """
 
-NAV_ITEMS = [("/", "overview"), ("/chat", "chat"), ("/activity", "activity"),
-             ("/schedule", "schedule"), ("/health", "health"), ("/vault", "vault"),
-             ("/search", "search")]
+NAV_ITEMS = [("/", "Overview"), ("/chat", "Chat"), ("/activity", "Activity"),
+             ("/schedule", "Schedule"), ("/health", "Health"), ("/vault", "Vault"),
+             ("/search", "Search")]
+
+# Bottom-nav (mobile) — 5 primary destinations with inline SVG icons.
+_BOTTOM_NAV = [
+    ("/", "Home",
+     '<svg viewBox="0 0 24 24"><path d="M3 12 12 3l9 9"/><path d="M5 10v10h14V10"/></svg>'),
+    ("/chat", "Chat",
+     '<svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4V5z"/></svg>'),
+    ("/activity", "Activity",
+     '<svg viewBox="0 0 24 24"><path d="M3 12h4l2-7 4 14 2-7h6"/></svg>'),
+    ("/schedule", "Schedule",
+     '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 10h18M8 2v4M16 2v4"/></svg>'),
+    ("/vault", "Vault",
+     '<svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M4 8h16M10 8v12"/></svg>'),
+]
 
 
-def _nav(active_path: str) -> str:
-    links = "".join(
+def _topbar(active_path: str) -> str:
+    desktop_links = "".join(
         f'<a href="{href}" class="{"active" if href == active_path else ""}">{name}</a>'
         for href, name in NAV_ITEMS
     )
-    return f'<nav>{links}<span style="flex:1"></span><span class="meta">💨 Prana AgentOS</span></nav>'
+    return f"""<header class="topbar">
+  <a href="/" class="brand"><span class="brand-mark">P</span>Prana <small>AgentOS</small></a>
+  <nav class="nav-desktop">{desktop_links}</nav>
+  <span class="topbar-spacer"></span>
+  <span class="topbar-meta"><span class="pulse-dot"></span> live</span>
+</header>"""
 
 
-def _page(title: str, nav_active: str, body: str, refresh: int = 30) -> str:
+def _bottom_nav(active_path: str) -> str:
+    items = "".join(
+        f'<li><a href="{href}" class="{"active" if href == active_path else ""}">{svg}<span>{label}</span></a></li>'
+        for href, label, svg in _BOTTOM_NAV
+    )
+    return f'<nav class="nav-bottom"><ul>{items}</ul></nav>'
+
+
+def _page(title: str, nav_active: str, body: str, refresh: int = 0) -> str:
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{esc(title)} — AgentOS</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f7f5ef" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#15161c" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light dark">
+<title>{esc(title)} — Prana AgentOS</title>
+<link rel="manifest" href="/manifest.json">
 {refresh_tag}<style>{CSS}</style></head>
-<body>{_nav(nav_active)}<div class="wrap">{body}</div></body></html>"""
+<body>
+{_topbar(nav_active)}
+<main class="wrap">{body}</main>
+{_bottom_nav(nav_active)}
+</body></html>"""
 
 
 def _age(mtime_iso: str | None) -> tuple[str, str]:
@@ -527,65 +742,95 @@ def index():
     )
 
     overall_class = "ok" if fail == 0 and warn == 0 else ("warn" if fail == 0 else "fail")
-    overall_label = "all green" if overall_class == "ok" else (f"{warn} warn" if fail == 0 else f"{fail} fail")
+    overall_label = "all systems normal" if overall_class == "ok" else (
+        f"{warn} warning" + ("s" if warn != 1 else "") if fail == 0
+        else f"{fail} failure" + ("s" if fail != 1 else "")
+    )
+
+    # Friendly date + "today" headline
+    today_str = datetime.now().strftime("%A, %B %-d")
+
+    hero_html = f"""
+    <section class="hero">
+      <div class="hero-headline">
+        <div class="eyebrow">Today · {esc(today_str)}</div>
+        <h1>Your team is <span style="color:var(--{'ok' if overall_class=='ok' else overall_class})">{overall_label}</span>.</h1>
+        <p class="hero-subtitle">{total_agents} agents, {active_1h} active in the last hour. {total_open} open task{"" if total_open==1 else "s"}, {total_sched} scheduled job{"" if total_sched==1 else "s"}.</p>
+      </div>
+      <div class="hero-actions">
+        <a href="/chat" class="btn primary">Open chat</a>
+        <a href="/activity" class="btn ghost">Activity</a>
+      </div>
+    </section>
+    """
 
     stats_html = f"""
     <div class="grid cols-4">
-      <div class="stat"><div class="label">System</div>
+      <div class="stat"><div class="label">Health</div>
         <div class="value"><span class="pill {overall_class}">{overall_label}</span></div>
-        <div class="sub">{ok}✅ {warn}⚠️ {fail}❌</div></div>
+        <div class="sub">{ok} healthy · {warn} warn · {fail} fail</div></div>
       <div class="stat"><div class="label">Agents</div>
         <div class="value">{total_agents}</div>
         <div class="sub">{active_1h} active last hour</div></div>
       <div class="stat"><div class="label">Open tasks</div>
         <div class="value">{total_open}</div>
-        <div class="sub">across ActiveTasks/</div></div>
-      <div class="stat"><div class="label">Cron jobs</div>
+        <div class="sub">across all agents</div></div>
+      <div class="stat"><div class="label">Scheduled</div>
         <div class="value">{total_sched}</div>
-        <div class="sub"><a href="/schedule">view schedule</a></div></div>
+        <div class="sub"><a href="/schedule">view schedule →</a></div></div>
     </div>
     """
 
-    rows: list[str] = []
-    for r in reports:
-        if "agent" not in r:
-            continue
+    # Agent cards — sort active-first, alphabetical tiebreaker
+    def _sort_key(r):
+        last = r.get("last_trajectory") or {}
+        age = last.get("age_minutes", 1e9)
+        return (age, r.get("agent", ""))
+
+    agent_reports = sorted(
+        [r for r in reports if "agent" in r],
+        key=_sort_key,
+    )
+
+    cards: list[str] = []
+    for r in agent_reports:
         name = r["agent"]
-        last = r.get("last_trajectory")
-        age_str, age_sev = _age(last["mtime_utc"] if last else None)
+        last = r.get("last_trajectory") or {}
+        age_str, age_sev = _age(last.get("mtime_utc"))
         d = doctor_by_agent.get(name, {})
         health = d.get("worst", "—")
-        if health in ("ok", "warn", "fail"):
-            health_pill = f'<span class="pill {health}">{health}</span>'
-        else:
-            health_pill = '<span class="pill dim">—</span>'
-        rows.append(f"""
-        <tr>
-          <td><a href="/agents/{esc(name)}"><strong>{esc(name)}</strong></a></td>
-          <td>{health_pill}</td>
-          <td><span class="pill {age_sev}">{age_str}</span></td>
-          <td>{r.get('open_tasks', 0)}</td>
-          <td>{len(r.get('scheduled_tasks', []))}</td>
-          <td>{r.get('today_memory_bytes', 0)} B</td>
-          <td><code>{esc(r.get('model') or '—')}</code></td>
-        </tr>""")
+        dot_cls = health if health in ("ok", "warn", "fail") else "dim"
+        open_count = r.get("open_tasks", 0)
+        sched_count = len(r.get("scheduled_tasks", []))
+        model = r.get("model") or "default"
+        chips: list[str] = []
+        if open_count:
+            chips.append(f'<span class="chip">{open_count} open</span>')
+        if sched_count:
+            chips.append(f'<span class="chip">{sched_count} cron</span>')
+        if not chips:
+            chips.append('<span class="chip">idle</span>')
+        cards.append(f"""
+        <a href="/agents/{esc(name)}" class="agent-card">
+          <div class="head">
+            <div class="name"><span class="health-dot {dot_cls}"></span> {esc(name)}</div>
+            <div class="age">{age_str}</div>
+          </div>
+          <div class="row">{"".join(chips)}</div>
+          <div class="model">{esc(model)}</div>
+        </a>""")
 
     agents_html = f"""
-    <h2>Agents</h2>
-    <div class="panel" style="padding:0;">
-    <table>
-      <thead><tr>
-        <th>agent</th><th>health</th><th>last turn</th>
-        <th>open</th><th>cron</th><th>today mem</th><th>model</th>
-      </tr></thead>
-      <tbody>{''.join(rows)}</tbody>
-    </table>
+    <div class="section-head">
+      <h2>Agents</h2>
+      <span class="link">{len(agent_reports)} total · sorted by activity</span>
     </div>
+    <div class="agent-grid">{"".join(cards)}</div>
     """
 
-    feed = _activity_feed(limit=15)
+    feed = _activity_feed(limit=12)
     feed_rows = "".join(
-        f'<div class="event"><span class="ts">{esc(ev.get("ts","")[:19])}</span>'
+        f'<div class="event"><span class="ts">{esc(ev.get("ts","")[11:19])}</span>'
         f'<span class="agent"><a href="/agents/{esc(ev.get("_agent",""))}">{esc(ev.get("_agent","?"))}</a></span>'
         f'<span class="truncate">{_summarize_event(ev)}</span></div>'
         for ev in feed
@@ -594,10 +839,10 @@ def index():
     sched = _all_scheduled()
     next_up = [s for s in sched if s.get("next_fire")][:6]
     sched_rows = "".join(
-        f'<div class="event"><span class="ts">{esc(s["next_fire"])}</span>'
+        f'<div class="event"><span class="ts">{esc(s["next_fire"][-8:] if len(s["next_fire"])>=8 else s["next_fire"])}</span>'
         f'<span class="agent"><a href="/agents/{esc(s["agent"])}">{esc(s["agent"])}</a></span>'
-        f'<span>{esc(s["name"])} <code>{esc(s["cron"])}</code>'
-        f'{" <span class=pill dim>system</span>" if s["kind"]=="systemEvent" else ""}'
+        f'<span class="truncate">{esc(s["name"])} <code>{esc(s["cron"])}</code>'
+        f'{" <span class=\"pill dim\">system</span>" if s["kind"]=="systemEvent" else ""}'
         f'</span></div>'
         for s in next_up
     )
@@ -605,29 +850,24 @@ def index():
     bottom_html = f"""
     <div class="grid cols-2" style="margin-top:1.5em;">
       <div>
-        <h2>Recent activity</h2>
-        <div class="panel">{feed_rows or "<div class='meta'>no events</div>"}</div>
-        <div class="meta" style="margin-top:0.5em;"><a href="/activity">view all →</a></div>
+        <div class="section-head"><h2>Recent activity</h2><a href="/activity" class="link">view all →</a></div>
+        <div class="panel">{feed_rows or "<div class='empty'>no events yet</div>"}</div>
       </div>
       <div>
-        <h2>Upcoming crons</h2>
-        <div class="panel">{sched_rows or "<div class='meta'>nothing scheduled</div>"}</div>
-        <div class="meta" style="margin-top:0.5em;"><a href="/schedule">view all →</a></div>
+        <div class="section-head"><h2>Upcoming</h2><a href="/schedule" class="link">view all →</a></div>
+        <div class="panel">{sched_rows or "<div class='empty'>nothing scheduled soon</div>"}</div>
       </div>
     </div>
     """
 
     body = f"""
-    <div style="display:flex;align-items:baseline;gap:1em;">
-      <h1>Overview</h1>
-      <span class="meta">{esc(now)}</span>
-    </div>
-    <br>
+    {hero_html}
     {stats_html}
     {agents_html}
     {bottom_html}
+    <div class="dev-hint">💨 refreshed {esc(now[11:19])}</div>
     """
-    return HTMLResponse(_page("Overview", "/", body))
+    return HTMLResponse(_page("Overview", "/", body, refresh=60))
 
 
 @app.get("/agents/{name}", response_class=HTMLResponse)
@@ -1002,7 +1242,7 @@ def _chat_sidebar_list() -> list[dict]:
 def chat_index_route():
     if not _CHAT_READY:
         return HTMLResponse(_page("Chat", "/chat", '<div class="panel"><span class="pill fail">chat disabled</span> — web_chat module failed to load.</div>'))
-    nav_html = _nav("/chat")
+    nav_html = _topbar("/chat")
     return HTMLResponse(chat_index_html(_chat_sidebar_list(), nav_html, CSS))
 
 
@@ -1012,7 +1252,7 @@ def chat_agent_route(agent: str):
         raise HTTPException(503, "chat disabled")
     if agent not in _agent_map():
         raise HTTPException(404, "no such agent")
-    nav_html = _nav("/chat")
+    nav_html = _topbar("/chat")
     return HTMLResponse(chat_page_html(agent, _chat_sidebar_list(), nav_html, CSS))
 
 
@@ -1286,11 +1526,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--ssl-certfile", default=None, help="path to TLS cert (e.g. Tailscale-issued .crt)")
+    ap.add_argument("--ssl-keyfile", default=None, help="path to TLS key (e.g. Tailscale-issued .key)")
     args = ap.parse_args()
-    print(f"AgentOS dashboard -> http://{args.host}:{args.port}/")
+    scheme = "https" if (args.ssl_certfile and args.ssl_keyfile) else "http"
+    print(f"AgentOS dashboard -> {scheme}://{args.host}:{args.port}/")
     if not HAVE_CRONITER:
         print("note: install croniter for next-fire times: ./.venv/bin/pip install croniter")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    kwargs = {"host": args.host, "port": args.port, "log_level": "warning"}
+    if args.ssl_certfile and args.ssl_keyfile:
+        kwargs["ssl_certfile"] = args.ssl_certfile
+        kwargs["ssl_keyfile"] = args.ssl_keyfile
+    uvicorn.run(app, **kwargs)
 
 
 if __name__ == "__main__":

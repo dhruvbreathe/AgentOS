@@ -1,0 +1,176 @@
+# Connector Registry
+# ---------------------------------------------------------------------------
+# Catalog of third-party integrations agents can enable.
+#
+# Two `kind` values:
+#   - mcp_note: tool surface is globally available via Claude.ai subscription
+#               MCP servers. Toggling just adds a note to agent.yaml
+#               `mcp_servers` so the system prompt says "you have X".
+#   - env_key:  integration needs API keys / env vars. Toggling adds the
+#               env var names to the agent's `env_passthrough` list. Actual
+#               secret values must be written to .env manually (secrets never
+#               flow through Discord chat).
+#
+# Adding a connector: append a new entry here, restart dashboard, done.
+# ---------------------------------------------------------------------------
+
+connectors:
+  # --- MCP note-only (one-click) ----------------------------------------
+  - id: apollo
+    name: Apollo.io
+    category: Sales & CRM
+    emoji: "🎯"
+    kind: mcp_note
+    description: "Prospect search, contact enrichment, email sequences. Outbound sales + intel."
+    note: "Apollo.io CRM — prospect search, contact enrichment, outreach sequences, org/people enrichment"
+
+  - id: gmail
+    name: Gmail
+    category: Communication
+    emoji: "✉️"
+    kind: mcp_note
+    description: "Read threads, create drafts, manage labels. Outbound + inbound email."
+    note: "Gmail access — read threads, create drafts, manage labels. Use for outreach, support triage, investor follow-ups"
+
+  - id: mixpanel
+    name: Mixpanel
+    category: Analytics
+    emoji: "📊"
+    kind: mcp_note
+    description: "Query product analytics — events, funnels, retention, dashboards."
+    note: "Mixpanel product analytics — query events, funnels, retention, user replays, dashboards"
+
+  - id: google_drive
+    name: Google Drive
+    category: Files
+    emoji: "📁"
+    kind: mcp_note
+    description: "Read / search Google Drive files. Research and docs."
+    note: "Google Drive — read and search Dhruv's Drive files (strategy docs, research, shared folders)"
+
+  - id: google_calendar
+    name: Google Calendar
+    category: Scheduling
+    emoji: "📅"
+    kind: mcp_note
+    description: "Read + manage calendar events. Meeting scheduling + availability."
+    note: "Google Calendar — read events, check availability, schedule meetings"
+
+  - id: biorxiv
+    name: bioRxiv
+    category: Research
+    emoji: "🧬"
+    kind: mcp_note
+    description: "Search biology/neuroscience preprints. Breathwork + HRV research."
+    note: "bioRxiv preprint search — breathwork, HRV, stress, interoception, respiratory science"
+
+  # --- Env-key based (needs .env setup) ---------------------------------
+  - id: supabase
+    name: Supabase
+    category: Database
+    emoji: "🐘"
+    kind: env_key
+    env_vars: [SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_PROJECT_REF]
+    docs_url: "https://supabase.com/dashboard/project/_/settings/api"
+    docs_help: "Open your project → Settings → API. Copy: URL, service_role key, and Reference ID."
+    description: "Postgres queries, auth, storage. Vayu prod + staging."
+    note: "Supabase access — project ref yakibuftxtsvqnwnermi (prod) / qzbcaamocrtxtfavistu (staging). Postgres 14.1."
+
+  - id: sentry
+    name: Sentry
+    category: Monitoring
+    emoji: "🛡️"
+    kind: env_key
+    env_vars: [SENTRY_AUTH_TOKEN, SENTRY_ORG, SENTRY_PROJECT]
+    docs_url: "https://sentry.io/settings/account/api/auth-tokens/"
+    docs_help: "Create an auth token. Scopes: project:read, event:read. Grab org slug + project slug from your project URL."
+    description: "Error tracking, crash reports, release monitoring."
+    note: "Sentry — crash reports, error tracking across iOS, Android, web. Release monitoring."
+
+  - id: github
+    name: GitHub
+    category: Code
+    emoji: "🐙"
+    kind: env_key
+    env_vars: [GITHUB_TOKEN]
+    docs_url: "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Prana+Agent+OS"
+    docs_help: "Generate a classic PAT with repo + read:org scopes. Copy the token (starts with ghp_)."
+    description: "Read/write issues, PRs, repos via `gh` CLI."
+    note: "GitHub access via gh CLI — read PRs and issues freely; never push or merge without operator approval."
+
+  - id: slack
+    name: Slack
+    category: Communication
+    emoji: "💬"
+    kind: env_key
+    env_vars: [SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET]
+    docs_url: "https://api.slack.com/apps"
+    docs_help: "Create a Slack App → OAuth & Permissions → install to workspace. Copy Bot User OAuth Token (xoxb-…) and Signing Secret from Basic Information."
+    description: "Post to Slack channels, read messages, DM users."
+    note: "Slack — post to channels, read messages. Use sparingly; Discord is primary."
+
+  - id: notion
+    name: Notion
+    category: Knowledge
+    emoji: "📝"
+    kind: env_key
+    env_vars: [NOTION_API_KEY]
+    docs_url: "https://www.notion.so/profile/integrations"
+    docs_help: "New integration → Internal integration. Copy the Internal Integration Token (starts with secret_)."
+    description: "Read/write Notion pages and databases."
+    note: "Notion — read/write pages and databases for strategy docs, handbooks, meeting notes."
+
+  - id: linear
+    name: Linear
+    category: Project Management
+    emoji: "📐"
+    kind: env_key
+    env_vars: [LINEAR_API_KEY]
+    docs_url: "https://linear.app/settings/api"
+    docs_help: "Settings → API → Create new API key. Copy immediately (shown once)."
+    description: "Issues, projects, cycles. Engineering task tracking."
+    note: "Linear — engineering issue tracking. Create/update issues, cycles, projects."
+
+  - id: stripe
+    name: Stripe
+    category: Payments
+    emoji: "💳"
+    kind: env_key
+    env_vars: [STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY]
+    docs_url: "https://dashboard.stripe.com/apikeys"
+    docs_help: "Developers → API keys. Copy Secret key (sk_live_… or sk_test_…) and Publishable key (pk_…)."
+    description: "Payments, subscriptions, customer lookups."
+    note: "Stripe — payments, subscriptions, customer/invoice lookups. Read-first; never mutate without approval."
+
+  - id: posthog
+    name: PostHog
+    category: Analytics
+    emoji: "📈"
+    kind: env_key
+    env_vars: [POSTHOG_API_KEY, POSTHOG_HOST]
+    docs_url: "https://app.posthog.com/settings/user-api-keys"
+    docs_help: "Personal API keys → Create. Scope to read events, insights. Host is usually https://app.posthog.com or https://us.i.posthog.com."
+    description: "Product analytics + session replay for web."
+    note: "PostHog — web analytics, session replay, feature flags. Primary for vayu-prana.com."
+
+  - id: openai
+    name: OpenAI
+    category: AI
+    emoji: "🧠"
+    kind: env_key
+    env_vars: [OPENAI_API_KEY]
+    docs_url: "https://platform.openai.com/api-keys"
+    docs_help: "Create new secret key. Starts with sk-. Copy immediately (shown once)."
+    description: "OpenAI API for embeddings, TTS, Whisper."
+    note: "OpenAI API — use for embeddings, TTS, Whisper transcription. Not for chat (Claude handles that)."
+
+  - id: cloudflare
+    name: Cloudflare
+    category: Infra
+    emoji: "☁️"
+    kind: env_key
+    env_vars: [CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID]
+    docs_url: "https://dash.cloudflare.com/profile/api-tokens"
+    docs_help: "Create Token → template matching your needs (DNS edit, Workers, etc.). Account ID is on the right sidebar of the main dashboard."
+    description: "DNS, Workers, Pages, Tunnels."
+    note: "Cloudflare — DNS for vayu-prana.com, quick tunnels for dashboard, Workers deployments."

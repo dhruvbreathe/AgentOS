@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "https://name-faqs-warrant-memories.trycloudflare.com/$1" }
+  ]
+}
