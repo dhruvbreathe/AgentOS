@@ -245,6 +245,56 @@ def _build_approval_hook(
     return _gate
 
 
+def _build_budget_hook(agent_name: str, monthly_budget: int | None,
+                       warn_pct: float = 80.0, block_pct: float | None = None):
+    """UserPromptSubmit hook — on each turn, check this agent's month-to-date
+    token spend against `monthly_budget`. If over `warn_pct`, inject a warning
+    into additionalContext. If over `block_pct` (opt-in), deny the turn.
+    """
+    async def _noop(input_data, tool_use_id, context):
+        return {}
+    if not monthly_budget or monthly_budget <= 0:
+        return _noop
+
+    async def _check(input_data, tool_use_id, context):
+        try:
+            import tasks as _t
+            totals = _t.spend_totals()
+            used = 0
+            if agent_name in totals:
+                t = totals[agent_name]
+                used = (t.get("input_tokens") or 0) + (t.get("output_tokens") or 0)
+            pct = (used * 100.0 / monthly_budget) if monthly_budget else 0
+        except Exception:
+            return {}
+        if block_pct is not None and pct >= block_pct:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Budget: {agent_name} is at {pct:.0f}% of monthly cap "
+                        f"({used:,} / {monthly_budget:,} tokens). Hard block at "
+                        f"{block_pct}%. Operator must raise the cap in "
+                        f"agent.yaml or wait for next month."
+                    ),
+                }
+            }
+        if pct >= warn_pct:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": (
+                        f"[budget notice] {agent_name} is at {pct:.0f}% of "
+                        f"monthly token cap ({used:,} / {monthly_budget:,}). "
+                        f"Be terse. Skip non-essential tool calls."
+                    ),
+                }
+            }
+        return {}
+    return _check
+
+
 async def _block_raw_crontab(input_data, tool_use_id, context):
     """PreToolUse hook: deny raw `crontab` write invocations. Agents should
     use `scheduler/install.py` (launchd) for new work. The legacy
@@ -439,6 +489,31 @@ def load_agent(name: str) -> AgentConfig:
         enabled=bool(approval_cfg.get("enabled", True)),
     )
 
+    # Budget hook — warn / deny on monthly token cap. Per-agent override on
+    # top of config.yaml defaults. Accepts either a flat int or a dict with
+    # {monthly, warn_pct, block_pct}.
+    _budget_default = defaults.get("budget_monthly_tokens")
+    _budget_raw = agent_cfg.get("budget_monthly_tokens", _budget_default)
+    _budget_total: int | None = None
+    _warn_pct = 80.0
+    _block_pct: float | None = None
+    if isinstance(_budget_raw, (int, float)) and _budget_raw > 0:
+        _budget_total = int(_budget_raw)
+    elif isinstance(_budget_raw, dict):
+        _m = _budget_raw.get("monthly") or _budget_raw.get("total")
+        if _m:
+            _budget_total = int(_m)
+        if "warn_pct" in _budget_raw:
+            _warn_pct = float(_budget_raw["warn_pct"])
+        if "block_pct" in _budget_raw and _budget_raw["block_pct"] is not None:
+            _block_pct = float(_budget_raw["block_pct"])
+    budget_hook = _build_budget_hook(
+        agent_name=name,
+        monthly_budget=_budget_total,
+        warn_pct=_warn_pct,
+        block_pct=_block_pct,
+    )
+
     # Additional SDK pass-through fields: thinking budget, session forking,
     # output format, file checkpointing, task budget. All optional — only set
     # on the dataclass when the agent config provides a value.
@@ -492,6 +567,7 @@ def load_agent(name: str) -> AgentConfig:
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
             ],
+            "UserPromptSubmit": [HookMatcher(hooks=[budget_hook])],
             "Stop": [HookMatcher(hooks=[on_stop])],
             "PreCompact": [HookMatcher(hooks=[on_precompact])],
         },

@@ -125,6 +125,15 @@ except Exception as _e:
     print(f"warn: edit router not mounted: {_e}", file=sys.stderr)
     _EDIT_READY = False
 
+# Mount tasks/goals/budgets router (Paperclip-style project management).
+try:
+    from tasks_routes import router as tasks_router
+    app.include_router(tasks_router)
+    _TASKS_READY = True
+except Exception as _e:
+    print(f"warn: tasks router not mounted: {_e}", file=sys.stderr)
+    _TASKS_READY = False
+
 
 def esc(s) -> str:
     return html_lib.escape(str(s or ""))
@@ -617,9 +626,10 @@ CSS = """
   @media (max-width:768px){.dev-hint{display:none;}}
 """
 
-NAV_ITEMS = [("/", "Overview"), ("/chat", "Chat"), ("/activity", "Activity"),
-             ("/schedule", "Schedule"), ("/health", "Health"), ("/vault", "Vault"),
-             ("/search", "Search")]
+NAV_ITEMS = [("/", "Overview"), ("/chat", "Chat"), ("/tasks", "Tasks"),
+             ("/goals", "Goals"), ("/budgets", "Budgets"),
+             ("/activity", "Activity"), ("/schedule", "Schedule"),
+             ("/health", "Health"), ("/vault", "Vault"), ("/search", "Search")]
 
 # Bottom-nav (mobile) — 5 primary destinations with inline SVG icons.
 _BOTTOM_NAV = [
