@@ -334,6 +334,145 @@ async def _run_turn(agent_cfg, prompt: str, sink: WebSink,
                             thread_id=thread_id)
 
 
+# ---- agent info (tools + prompt files for the chat side panel) -------------
+#
+# Surfaces what the agent is connected to AND what lives in its layered
+# system prompt. Lets the chat UI show "here's what this agent knows and
+# can do" without the operator having to grep the filesystem.
+
+AGENTS_DIR = ROOT / "agents"
+SHARED_DIR = ROOT / "shared"
+
+# Safe roots that `/api/chat/<agent>/file` is allowed to serve. Any resolved
+# path must live under one of these to escape 403.
+def _allowed_file_roots(agent: str) -> list[Path]:
+    return [
+        AGENTS_DIR / agent,
+        SHARED_DIR,
+    ]
+
+
+def _agent_info(agent: str) -> dict:
+    from agent_loader import (
+        LAYERED_FILES, SHARED_FILES, load_agent, _resolve_skill_ref,
+    )
+    cfg = load_agent(agent)
+    agent_dir = AGENTS_DIR / agent
+
+    # Merge global defaults + agent overrides the same way agent_loader does.
+    import yaml as _yaml
+    raw = {}
+    cfg_path = agent_dir / "agent.yaml"
+    if cfg_path.exists():
+        raw = _yaml.safe_load(cfg_path.read_text()) or {}
+    global_cfg = _yaml.safe_load((ROOT / "config.yaml").read_text()) or {}
+    defaults = global_cfg.get("defaults", {}) or {}
+
+    def _merged(key, fallback=None):
+        return raw.get(key, defaults.get(key, fallback))
+
+    allowed = _merged("allowed_tools", []) or []
+    disallowed = _merged("disallowed_tools", []) or []
+    model = _merged("model") or "inherited"
+    permission_mode = _merged("permission_mode") or "default"
+
+    # mcp_servers — split into SDK-wired / mcp notes / env-key HTTP integrations.
+    raw_mcp = raw.get("mcp_servers") or {}
+    mcp_wired: list[str] = []
+    mcp_notes: list[dict] = []
+    env_integrations: list[dict] = []
+
+    # Registry fallback for older entries without api_* metadata.
+    reg_by_id: dict[str, dict] = {}
+    reg_path = ROOT / "connectors" / "registry.yaml"
+    if reg_path.exists():
+        reg = _yaml.safe_load(reg_path.read_text()) or {}
+        for c in reg.get("connectors") or []:
+            if c.get("id"):
+                reg_by_id[c["id"]] = c
+
+    for key, val in raw_mcp.items():
+        if not isinstance(val, dict):
+            mcp_wired.append(key)
+            continue
+        t = val.get("type")
+        if t == "mcp":
+            mcp_notes.append({"name": key, "note": val.get("note", "")})
+        elif t == "env":
+            enriched = reg_by_id.get(key, {})
+            env_integrations.append({
+                "name": key,
+                "note": val.get("note") or enriched.get("note", ""),
+                "env_vars": val.get("env_vars") or enriched.get("env_vars") or [],
+                "api_base": val.get("api_base") or enriched.get("api_base"),
+                "docs_url": val.get("docs_url") or enriched.get("docs_url"),
+            })
+        else:
+            # Real MCP server (command/url/instance-based).
+            mcp_wired.append(key)
+
+    # Skills — resolve each ref into a path + existence flag.
+    skills_out: list[dict] = []
+    for ref in raw.get("skills") or []:
+        p = _resolve_skill_ref(agent_dir, ref)
+        skills_out.append({
+            "ref": ref,
+            "path": str(p.relative_to(ROOT)) if p else None,
+            "exists": bool(p and p.exists()),
+            "size": p.stat().st_size if p and p.exists() else 0,
+        })
+
+    # Layered + shared prompt files.
+    def _manifest(root: Path, names: list[str]) -> list[dict]:
+        out = []
+        for n in names:
+            p = root / n
+            out.append({
+                "name": n,
+                "path": str(p.relative_to(ROOT)) if p.exists() else None,
+                "exists": p.exists(),
+                "size": p.stat().st_size if p.exists() else 0,
+            })
+        return out
+
+    return {
+        "agent": agent,
+        "model": model,
+        "permission_mode": permission_mode,
+        "allowed_tools": allowed,
+        "disallowed_tools": disallowed,
+        "mcp_wired": sorted(set(mcp_wired)),
+        "mcp_notes": mcp_notes,
+        "env_integrations": env_integrations,
+        "skills": skills_out,
+        "layered_files": _manifest(agent_dir, LAYERED_FILES),
+        "shared_files": _manifest(SHARED_DIR, SHARED_FILES),
+        "prompt_total_chars": len(cfg.system_prompt or ""),
+        "channel_id": cfg.channel_ids[0] if cfg.channel_ids else None,
+    }
+
+
+def _safe_read_file(agent: str, rel: str) -> dict:
+    """Read a file under an allowed root. Reject traversal or anything
+    that resolves outside agents/<agent>/ or shared/."""
+    target = (ROOT / rel).resolve()
+    roots = [r.resolve() for r in _allowed_file_roots(agent)]
+    if not any(str(target).startswith(str(r) + "/") or str(target) == str(r)
+               for r in roots):
+        raise HTTPException(403, f"not in allowed roots: {rel}")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, f"file not found: {rel}")
+    # Cap at 1MB so a huge file can't nuke the UI.
+    size = target.stat().st_size
+    if size > 1_000_000:
+        raise HTTPException(413, f"file too large ({size} bytes)")
+    return {
+        "path": str(target.relative_to(ROOT)),
+        "size": size,
+        "content": target.read_text(errors="replace"),
+    }
+
+
 # ---- FastAPI router --------------------------------------------------------
 
 router = APIRouter()
@@ -358,6 +497,20 @@ def list_chat_agents() -> JSONResponse:
             "history_lines": total_lines,
         })
     return JSONResponse(out)
+
+
+@router.get("/api/chat/{agent}/info")
+def chat_agent_info(agent: str) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    return JSONResponse(_agent_info(agent))
+
+
+@router.get("/api/chat/{agent}/file")
+def chat_agent_file(agent: str, path: str) -> JSONResponse:
+    if agent not in _agent_map():
+        raise HTTPException(404, "no such agent")
+    return JSONResponse(_safe_read_file(agent, path))
 
 
 @router.get("/api/chat/{agent}/threads")
@@ -761,7 +914,8 @@ async def chat_upload(agent: str, request: Request) -> JSONResponse:
 # ---- HTML pages ------------------------------------------------------------
 
 CHAT_CSS = """
-  .chat-layout{display:grid;grid-template-columns:240px 1fr;gap:1em;height:calc(100vh - 120px);min-height:500px;}
+  .chat-layout{display:grid;grid-template-columns:220px 1fr 320px;gap:1em;height:calc(100vh - 120px);min-height:500px;}
+  .chat-layout.info-collapsed{grid-template-columns:220px 1fr;}
   .chat-sidebar{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:0.5em;overflow-y:auto;}
   .chat-sidebar h3{font-size:0.7em;text-transform:uppercase;letter-spacing:0.08em;color:var(--fg-mute);padding:0.5em 0.6em;margin:0;}
   .chat-sidebar a{display:block;padding:0.5em 0.6em;border-radius:6px;color:var(--fg-dim);text-decoration:none;font-size:0.9em;}
@@ -824,10 +978,44 @@ CHAT_CSS = """
   /* Attach button — secondary, readable icon, 44px tap target */
   .chat-input button.chat-attach-btn{background:var(--panel-2);border:1px solid var(--border);color:var(--fg);padding:0;width:44px;height:44px;min-height:44px;border-radius:10px;cursor:pointer;font-size:1.2em;line-height:1;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;font-family:inherit;}
   .chat-input button.chat-attach-btn:hover{color:var(--fg);border-color:var(--fg);background:var(--panel-3);}
+  /* Right info panel — tools + system prompt files */
+  .chat-info{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:0.6em 0.8em;overflow-y:auto;font-size:0.85em;}
+  .chat-info h3{font-size:0.7em;text-transform:uppercase;letter-spacing:0.08em;color:var(--fg-mute);margin:0.8em 0 0.4em 0;padding:0;}
+  .chat-info h3:first-child{margin-top:0;}
+  .chat-info .pill{display:inline-block;background:var(--panel-2);border:1px solid var(--border);color:var(--fg-dim);padding:0.1em 0.5em;border-radius:10px;font-size:0.78em;margin:0 0.2em 0.3em 0;}
+  .chat-info .pill.enabled{color:var(--accent);border-color:var(--accent);}
+  .chat-info .pill.disabled{color:var(--fg-mute);opacity:0.5;text-decoration:line-through;}
+  .chat-info .row{display:flex;align-items:center;gap:0.4em;font-size:0.82em;padding:0.25em 0;border-radius:4px;}
+  .chat-info .row.clickable{cursor:pointer;}
+  .chat-info .row.clickable:hover{background:var(--panel-2);}
+  .chat-info .row.missing{opacity:0.45;}
+  .chat-info .row code{background:transparent;color:var(--accent);padding:0;font-size:0.9em;}
+  .chat-info .size{color:var(--fg-mute);font-size:0.7em;margin-left:auto;}
+  .chat-info .integration{padding:0.3em 0.5em;margin:0.2em 0;background:var(--panel-2);border-radius:6px;}
+  .chat-info .integration .name{font-weight:500;color:var(--fg);}
+  .chat-info .integration .vars{color:var(--fg-mute);font-size:0.75em;font-family:monospace;margin-top:0.15em;}
+  .chat-info .meta-line{color:var(--fg-mute);font-size:0.78em;margin-bottom:0.3em;}
+  /* File viewer modal */
+  .file-viewer{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:1000;padding:1em;}
+  .file-viewer.open{display:flex;}
+  .file-viewer .fv-body{background:var(--panel);border:1px solid var(--border);border-radius:10px;max-width:900px;width:100%;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;}
+  .file-viewer .fv-head{padding:0.7em 1em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:1em;}
+  .file-viewer .fv-head h3{margin:0;font-size:0.95em;color:var(--fg);text-transform:none;letter-spacing:0;flex:1;}
+  .file-viewer .fv-head code{color:var(--accent);font-size:0.8em;}
+  .file-viewer .fv-head button{background:var(--panel-2);border:1px solid var(--border);color:var(--fg-dim);padding:0.3em 0.8em;border-radius:6px;cursor:pointer;font-size:0.8em;}
+  .file-viewer pre{flex:1;overflow:auto;margin:0;padding:1em 1.2em;background:var(--panel-2);font-size:0.82em;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
+  .chat-header .info-toggle{font-size:1.1em;}
+  @media (max-width:1100px){
+    .chat-layout{grid-template-columns:220px 1fr;}
+    .chat-info{display:none;}
+    .chat-layout.info-open .chat-info{display:block;position:fixed;top:70px;right:1em;bottom:1em;width:320px;z-index:100;box-shadow:0 10px 40px rgba(0,0,0,0.3);}
+  }
   @media (max-width:780px){
     .chat-layout{grid-template-columns:1fr;grid-template-rows:auto 1fr;}
     .chat-sidebar{max-height:120px;}
     .chat-sidebar a{display:inline-block;margin-right:0.3em;}
+    .chat-info{display:none;}
+    .chat-layout.info-open .chat-info{display:block;position:fixed;top:60px;left:0.5em;right:0.5em;bottom:0.5em;width:auto;z-index:100;}
   }
 """
 
@@ -1293,10 +1481,163 @@ CHAT_PAGE_JS = r"""
     }
   });
 
+  // ---- info panel (tools + system prompt files) ----
+  const infoBody = document.getElementById('chat-info-body');
+  const infoToggle = document.getElementById('chat-info-toggle');
+  const layout = document.getElementById('chat-layout');
+
+  function fmtBytes(n){
+    if (!n) return '';
+    if (n < 1024) return n + 'B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + 'KB';
+    return (n/1024/1024).toFixed(1) + 'MB';
+  }
+
+  async function loadInfo(){
+    try {
+      const r = await fetch(`/api/chat/${agentName}/info`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      renderInfo(d);
+    } catch(e){
+      infoBody.innerHTML = '<div class="meta-line">failed to load info: ' + escapeHtml(e.message) + '</div>';
+    }
+  }
+
+  function renderInfo(d){
+    const parts = [];
+    parts.push(`<div class="meta-line">model <code>${escapeHtml(d.model)}</code> · ${escapeHtml(d.permission_mode)} · ${d.prompt_total_chars.toLocaleString()} prompt chars</div>`);
+
+    // ---- allowed / disallowed tools ----
+    parts.push('<h3>Tools allowed</h3>');
+    if (d.allowed_tools.length === 0){
+      parts.push('<div class="meta-line">— all tools allowed (no allowlist) —</div>');
+    } else {
+      parts.push('<div>' + d.allowed_tools.map(t => `<span class="pill enabled">${escapeHtml(t)}</span>`).join('') + '</div>');
+    }
+    if (d.disallowed_tools.length){
+      parts.push('<h3>Tools blocked</h3>');
+      parts.push('<div>' + d.disallowed_tools.map(t => `<span class="pill disabled">${escapeHtml(t)}</span>`).join('') + '</div>');
+    }
+
+    // ---- MCP (real SDK servers) ----
+    if (d.mcp_wired.length){
+      parts.push('<h3>MCP servers (wired)</h3>');
+      parts.push('<div>' + d.mcp_wired.map(s => `<span class="pill enabled">${escapeHtml(s)}</span>`).join('') + '</div>');
+    }
+
+    // ---- parent MCP notes ----
+    if (d.mcp_notes.length){
+      parts.push('<h3>Parent MCP (available)</h3>');
+      parts.push(d.mcp_notes.map(m => `
+        <div class="integration">
+          <div class="name">${escapeHtml(m.name)}</div>
+          <div class="vars">${escapeHtml((m.note || '').slice(0, 140))}</div>
+        </div>`).join(''));
+    }
+
+    // ---- env-key HTTP integrations ----
+    if (d.env_integrations.length){
+      parts.push('<h3>HTTP API (env-key)</h3>');
+      parts.push(d.env_integrations.map(m => `
+        <div class="integration">
+          <div class="name">${escapeHtml(m.name)}${m.api_base ? ' <span class="size">' + escapeHtml(m.api_base) + '</span>' : ''}</div>
+          <div class="vars">${(m.env_vars || []).map(v => '$' + escapeHtml(v)).join(' · ')}</div>
+        </div>`).join(''));
+    }
+
+    // ---- skills ----
+    if (d.skills.length){
+      parts.push('<h3>Skills</h3>');
+      parts.push(d.skills.map(s => `
+        <div class="row ${s.exists ? 'clickable' : 'missing'}" data-path="${s.exists ? escapeHtml(s.path) : ''}" data-title="${escapeHtml(s.ref)}">
+          📎 <code>${escapeHtml(s.ref)}</code>
+          <span class="size">${fmtBytes(s.size)}</span>
+        </div>`).join(''));
+    }
+
+    // ---- layered per-agent files ----
+    parts.push('<h3>System prompt — per-agent</h3>');
+    parts.push(d.layered_files.map(f => `
+      <div class="row ${f.exists ? 'clickable' : 'missing'}" data-path="${f.exists ? escapeHtml(f.path) : ''}" data-title="${escapeHtml(f.name)}">
+        ${f.exists ? '📄' : '·'} <code>${escapeHtml(f.name)}</code>
+        <span class="size">${fmtBytes(f.size)}</span>
+      </div>`).join(''));
+
+    // ---- shared files ----
+    parts.push('<h3>System prompt — shared</h3>');
+    parts.push(d.shared_files.map(f => `
+      <div class="row ${f.exists ? 'clickable' : 'missing'}" data-path="${f.exists ? escapeHtml(f.path) : ''}" data-title="${escapeHtml(f.name)}">
+        ${f.exists ? '📄' : '·'} <code>${escapeHtml(f.name)}</code>
+        <span class="size">${fmtBytes(f.size)}</span>
+      </div>`).join(''));
+
+    infoBody.innerHTML = parts.join('');
+
+    // Wire click handlers on every row that has a path.
+    infoBody.querySelectorAll('.row.clickable').forEach(row => {
+      row.addEventListener('click', () => {
+        const p = row.dataset.path;
+        const t = row.dataset.title;
+        if (p) openFile(p, t);
+      });
+    });
+  }
+
+  // ---- file viewer ----
+  const fv = document.getElementById('file-viewer');
+  const fvTitle = document.getElementById('fv-title');
+  const fvPath = document.getElementById('fv-path');
+  const fvContent = document.getElementById('fv-content');
+  const fvClose = document.getElementById('fv-close');
+
+  async function openFile(path, title){
+    fvTitle.textContent = title || path;
+    fvPath.textContent = path;
+    fvContent.textContent = 'loading…';
+    fv.classList.add('open');
+    try {
+      const r = await fetch(`/api/chat/${agentName}/file?path=${encodeURIComponent(path)}`);
+      if (!r.ok){
+        const err = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(err.detail || ('HTTP ' + r.status));
+      }
+      const d = await r.json();
+      fvContent.textContent = d.content || '(empty)';
+    } catch(e){
+      fvContent.textContent = '⚠️  ' + e.message;
+    }
+  }
+
+  fvClose.addEventListener('click', () => fv.classList.remove('open'));
+  fv.addEventListener('click', (e) => { if (e.target === fv) fv.classList.remove('open'); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && fv.classList.contains('open')){
+      fv.classList.remove('open');
+    }
+  });
+
+  // Info panel collapse (persist via localStorage).
+  const INFO_KEY = 'agentos-info-collapsed:' + agentName;
+  if (localStorage.getItem(INFO_KEY) === '1'){
+    layout.classList.add('info-collapsed');
+  }
+  infoToggle.addEventListener('click', () => {
+    const wide = window.innerWidth > 1100;
+    if (wide){
+      layout.classList.toggle('info-collapsed');
+      localStorage.setItem(INFO_KEY, layout.classList.contains('info-collapsed') ? '1' : '0');
+    } else {
+      // Narrow screens: toggle the overlay mode instead.
+      layout.classList.toggle('info-open');
+    }
+  });
+
   // Bootstrap: honour #t=<id> in the URL if present.
   const initial = readHash();
   if (initial) activeThread = initial;
   loadThreads(activeThread);
+  loadInfo();
   input.focus();
 })();
 """
@@ -1318,7 +1659,7 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
 <style>{css}{CHAT_CSS}</style></head>
 <body>{nav_html}
 <div class="wrap">
-  <div class="chat-layout">
+  <div class="chat-layout" id="chat-layout">
     <div class="chat-sidebar">
       <h3>Agents</h3>
       {''.join(sidebar_items)}
@@ -1327,6 +1668,7 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
       <div class="chat-header">
         <h2>@{esc(agent)}</h2>
         <span class="meta" id="chat-thread-meta">loading threads…</span>
+        <button id="chat-info-toggle" class="info-toggle" title="Toggle tools &amp; prompt files panel">ⓘ</button>
         <button id="chat-clear" title="Reset the current thread">reset</button>
       </div>
       <div id="chat-tabs" class="chat-tabs"></div>
@@ -1339,6 +1681,19 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
         <button id="chat-send">Send</button>
       </div>
     </div>
+    <aside class="chat-info" id="chat-info">
+      <div id="chat-info-body">loading…</div>
+    </aside>
+  </div>
+</div>
+<div class="file-viewer" id="file-viewer">
+  <div class="fv-body">
+    <div class="fv-head">
+      <h3 id="fv-title"></h3>
+      <code id="fv-path"></code>
+      <button id="fv-close">close</button>
+    </div>
+    <pre id="fv-content"></pre>
   </div>
 </div>
 <script>window.__AGENT_NAME__ = {json.dumps(agent)};</script>
