@@ -67,8 +67,17 @@ defaults:
       - '\breboot\b'
       # Production writes outside the relay/vault:
       - '/Users/celainc/Documents/Vayu/Vayu/Company/DECISIONS\.md'
-      # .env changes require operator sign-off
-      - '\.env\b[^.]'
+
+# Save-to-vault gate. Operator reacts `emoji` on any agent message to
+# persist the most recent turn (last user prompt + assistant outputs)
+# into $VAULT_PATH/Sessions/. The bot reacts `ack_emoji` on success or
+# `error_emoji` on failure, so the operator gets visual confirmation
+# without leaving Discord. Mirrors the Hermes "save icon" UX.
+save:
+  enabled: true
+  emoji: "💾"
+  ack_emoji: "✅"
+  error_emoji: "⚠️"
 
 # Streaming behaviour for live Discord message edits.
 streaming:

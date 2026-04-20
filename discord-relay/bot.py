@@ -55,12 +55,16 @@ class RelayBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
+        # reactions intent is required for on_raw_reaction_add → save-marker.
+        # Webhook-poll path (approval_gate) doesn't use it.
+        intents.reactions = True
         super().__init__(intents=intents)
 
         self.label = label
         self.agents: dict[str, AgentConfig] = agents  # channel_id → cfg
         self.global_cfg = load_global()
         self.streaming_cfg = self.global_cfg.get("streaming", {}) or {}
+        self.save_cfg = self.global_cfg.get("save", {}) or {}
         self.sessions = _load_sessions()
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -118,6 +122,73 @@ class RelayBot(discord.Client):
                 log.warning("[%s] failed to save attachment %s: %s",
                             self.label, att.filename, e)
         return paths
+
+    async def on_raw_reaction_add(
+        self, payload: discord.RawReactionActionEvent
+    ) -> None:
+        """Save-to-vault gate. Operator reacts with the configured save
+        emoji on any agent message → write the most recent turn to
+        $VAULT_PATH/Sessions/ and react ack on the message. Mirrors the
+        Hermes 'save icon' UX."""
+        if not self.save_cfg.get("enabled", True):
+            return
+        save_emoji = self.save_cfg.get("emoji", "💾")
+        ack_emoji = self.save_cfg.get("ack_emoji", "✅")
+        error_emoji = self.save_cfg.get("error_emoji", "⚠️")
+
+        if str(payload.emoji) != save_emoji:
+            return
+        if self.user is not None and payload.user_id == self.user.id:
+            return  # ignore my own ack reactions
+
+        channel_id = str(payload.channel_id)
+        agent = self.agents.get(channel_id)
+        if not agent:
+            return  # not a channel I own
+
+        vault_env = self.global_cfg.get("vault_path_env", "VAULT_PATH")
+        vault_path = os.environ.get(vault_env)
+        if not vault_path:
+            log.warning("[%s] save: %s not set, skipping", self.label, vault_env)
+            return
+
+        channel = self.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except Exception as e:
+                log.warning("[%s] save: cannot fetch channel: %s", self.label, e)
+                return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except Exception as e:
+            log.warning("[%s] save: cannot fetch message: %s", self.label, e)
+            return
+
+        from save_marker import save_turn
+        session_id = self.sessions.get(channel_id)
+        try:
+            out_path = save_turn(
+                agent_name=agent.name,
+                channel_name=getattr(channel, "name", channel_id),
+                session_id=session_id,
+                vault_path=Path(vault_path),
+            )
+        except Exception:
+            log.exception("[%s] save: save_turn raised", self.label)
+            try:
+                await message.add_reaction(error_emoji)
+            except Exception:
+                pass
+            return
+
+        ack = ack_emoji if out_path else error_emoji
+        try:
+            await message.add_reaction(ack)
+        except Exception as e:
+            log.warning("[%s] save: cannot add reaction: %s", self.label, e)
+        if out_path:
+            log.info("[%s] save: %s -> %s", self.label, agent.name, out_path)
 
     async def on_message(self, message: discord.Message) -> None:
         channel_id = str(message.channel.id)

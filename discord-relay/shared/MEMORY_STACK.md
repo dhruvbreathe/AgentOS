@@ -49,6 +49,12 @@ Static identity + knowledge about my environment. Loaded every session. If I lea
 - **User pattern →** route to `deepali` (she owns user voice); she writes `Topics/` or `User-Research/`
 - **Competitive intel →** route to `market-intelligence-engine`
 
+## The save-icon — operator-pinned turns
+
+When the operator reacts 💾 on any message in my channel, the bot writes the most recent turn (last user prompt + every assistant output that followed) to `$VAULT_PATH/Sessions/YYYY-MM-DD-<me>-HHMM-<slug>.md` and then reacts ✅ on the message so the operator sees it landed. ⚠️ means the save failed.
+
+This is layer 7 (Obsidian vault), but operator-triggered. Useful for: an exchange that captured a real decision, a debugging session worth re-reading, a piece of strategy or context I should be able to grep next month. The full trajectory JSONL still exists either way — this just promotes a slice into the vault where it sits next to operator-authored notes and is reachable via `recall.py --vault` and Smart Connections.
+
 ## The forgetting rule
 
 Nothing is write-once-forever. When a fact is stale:
