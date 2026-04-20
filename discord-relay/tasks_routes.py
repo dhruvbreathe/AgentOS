@@ -244,7 +244,7 @@ TASKS_CSS = """
 .goal-chip{background:var(--panel);border:1px solid var(--border);padding:0.1em 0.4em;border-radius:4px;font-size:0.75em;color:var(--accent-2);}
 .filters{display:flex;gap:0.6em;margin-bottom:0.5em;flex-wrap:wrap;align-items:center;}
 .filters input, .filters select{background:var(--panel);border:1px solid var(--border);color:var(--fg);padding:0.4em 0.6em;border-radius:6px;}
-.btn-primary{background:var(--accent);color:#000;border:none;padding:0.5em 1em;border-radius:6px;cursor:pointer;font-weight:500;}
+.btn-primary{background:var(--accent);color:var(--accent-ink);border:none;padding:0.5em 1em;border-radius:6px;cursor:pointer;font-weight:500;}
 .btn-primary:hover{opacity:0.9;}
 .btn-secondary{background:var(--panel-2);color:var(--fg);border:1px solid var(--border);padding:0.5em 1em;border-radius:6px;cursor:pointer;}
 #taskModal, #goalModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center;}
