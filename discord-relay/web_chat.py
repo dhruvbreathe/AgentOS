@@ -220,6 +220,29 @@ def _append_history(agent: str, role: str, content: str,
     with p.open("a") as f:
         f.write(json.dumps(rec) + "\n")
     _touch_thread(agent, thread_id)
+    # Fire a live event for browser subscribers. `role` drives `from`:
+    # operator prompts and assistant replies both surface as activity in
+    # this agent's thread, but only non-operator messages count as unread.
+    try:
+        from events import publish as publish_event
+        # Who sent it? user = operator; assistant = this agent's own reply;
+        # routed = another agent (meta["from"] is authoritative).
+        if role == "user":
+            sender = "operator"
+        elif role == "routed":
+            sender = (meta or {}).get("from") or "unknown"
+        else:
+            sender = agent  # assistant replying to itself's channel
+        publish_event({
+            "type": role,
+            "agent": agent,
+            "thread": thread_id,
+            "from": sender,
+            "preview": content[:140],
+        })
+    except Exception:
+        # Event bus is best-effort; never break history writes over it.
+        pass
 
 
 def _read_history(agent: str, limit: int = 200,
@@ -497,6 +520,56 @@ def list_chat_agents() -> JSONResponse:
             "history_lines": total_lines,
         })
     return JSONResponse(out)
+
+
+# ---- live events (SSE) + unread tracking -----------------------------------
+#
+# The Bus in events.py fans out every activity into a single feed. The
+# browser subscribes once and updates badges live without polling. Unread
+# counts per (browser, agent) are computed against a "last seen" timestamp
+# the browser sends back up on mark-as-read.
+
+@router.get("/api/chat/events")
+async def chat_events() -> StreamingResponse:
+    """SSE feed of every chat event across all agents. Used by the UI to
+    paint red-dot badges when another agent replies or the operator gets
+    a routed message. Survives restarts via events.jsonl."""
+    from events import bus
+
+    async def stream() -> AsyncIterator[bytes]:
+        queue = bus.subscribe()
+        # Initial comment so the browser's EventSource reports "open" quickly.
+        yield b": hello\n\n"
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    # Keep-alive comment — Cloudflare tunnels drop idle streams.
+                    yield b": ka\n\n"
+                    continue
+                yield f"data: {json.dumps(ev)}\n\n".encode()
+        finally:
+            bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.get("/api/chat/unread")
+def chat_unread(since: str | None = None) -> JSONResponse:
+    """Per-agent unread count since `since` (ISO-8601). If `since` is
+    None, returns 0 for everything (browser needs to send its last-seen)."""
+    from events import unread_by_agent
+    counts = unread_by_agent(since) if since else {}
+    return JSONResponse({"since": since, "counts": counts})
 
 
 @router.get("/api/chat/{agent}/info")
@@ -921,7 +994,12 @@ CHAT_CSS = """
   .chat-sidebar a{display:block;padding:0.5em 0.6em;border-radius:6px;color:var(--fg-dim);text-decoration:none;font-size:0.9em;}
   .chat-sidebar a:hover{background:var(--panel-2);color:var(--fg);}
   .chat-sidebar a.active{background:var(--panel-2);color:var(--accent);font-weight:500;}
+  .chat-sidebar a{position:relative;}
   .chat-sidebar .agent-meta{font-size:0.7em;color:var(--fg-mute);margin-left:0.8em;}
+  /* Unread badge — red dot with optional count. */
+  .badge{display:inline-block;min-width:0.5em;height:0.5em;border-radius:50%;background:var(--fail,#e66);vertical-align:middle;margin-left:0.4em;box-shadow:0 0 0 2px var(--panel);}
+  .badge.count{min-width:1.4em;height:1.1em;line-height:1.1em;border-radius:0.7em;padding:0 0.4em;font-size:0.7em;color:#fff;font-weight:600;text-align:center;}
+  .chat-tab .badge{margin-left:0;margin-right:0.2em;}
   .chat-main{display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
   .chat-header{padding:0.8em 1.2em;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:1em;}
   .chat-header h2{margin:0;text-transform:none;letter-spacing:0;font-size:1.1em;color:var(--fg);}
@@ -949,6 +1027,10 @@ CHAT_CSS = """
   .msg .bubble{padding:0.8em 1em;border-radius:12px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;font-size:0.94em;}
   .msg.user .bubble{background:rgba(111,168,255,0.12);border:1px solid rgba(111,168,255,0.3);}
   .msg.assistant .bubble{background:var(--panel-2);border:1px solid var(--border);}
+  /* Routed-in message from another agent (mirrored from send_to_agent). */
+  .msg.routed .role{color:var(--accent-2);}
+  .msg.routed .bubble{background:rgba(231,184,76,0.08);border:1px solid rgba(231,184,76,0.3);}
+  .msg.routed .bubble::before{content:"📡 from @" attr(data-from);display:block;font-size:0.78em;color:var(--fg-mute);margin-bottom:0.3em;letter-spacing:0.02em;}
   .msg .ts{font-size:0.7em;color:var(--fg-mute);margin-top:0.3em;}
   .msg.user .ts{text-align:right;}
   .chat-input{border-top:1px solid var(--border);padding:0.9em 1.1em calc(0.9em + env(safe-area-inset-bottom)) 1.1em;display:flex;gap:0.6em;align-items:flex-end;background:var(--panel);}
@@ -1075,10 +1157,14 @@ CHAT_PAGE_JS = r"""
     return s;
   }
 
-  function addMessage(role, content, ts){
+  function addMessage(role, content, ts, meta){
     const wrap = el('div', 'msg ' + role);
-    wrap.appendChild(el('div', 'role', role));
+    const label = role === 'routed' ? ('routed @' + (meta && meta.from ? meta.from : '?')) : role;
+    wrap.appendChild(el('div', 'role', label));
     const bubble = el('div', 'bubble');
+    if (role === 'routed' && meta && meta.from){
+      bubble.setAttribute('data-from', meta.from);
+    }
     bubble.innerHTML = renderMd(content);
     wrap.appendChild(bubble);
     if (ts) wrap.appendChild(el('div', 'ts', escapeHtml(ts)));
@@ -1098,7 +1184,7 @@ CHAT_PAGE_JS = r"""
       const data = await r.json();
       messages.innerHTML = '';
       for (const m of data.history){
-        addMessage(m.role, m.content, m.ts);
+        addMessage(m.role, m.content, m.ts, m.meta);
       }
       if (data.history.length === 0){
         messages.innerHTML = '<div class="chat-empty">Start a conversation with @' + escapeHtml(agentName) + '.</div>';
@@ -1633,6 +1719,123 @@ CHAT_PAGE_JS = r"""
     }
   });
 
+  // ---- live events (SSE) + unread badges ----
+  // Per-agent "last seen" lives in localStorage so badges persist across
+  // reloads. Opening an agent's chat auto-marks it read.
+  const LAST_SEEN_KEY = 'agentos-last-seen';
+  function getLastSeen(){
+    try { return JSON.parse(localStorage.getItem(LAST_SEEN_KEY) || '{}'); }
+    catch(_){ return {}; }
+  }
+  function saveLastSeen(map){
+    localStorage.setItem(LAST_SEEN_KEY, JSON.stringify(map));
+  }
+  function markRead(a){
+    const map = getLastSeen();
+    map[a] = new Date().toISOString();
+    saveLastSeen(map);
+    paintBadge(a, 0);
+  }
+  function paintBadge(name, count){
+    document.querySelectorAll('.sb-badge[data-for="' + CSS.escape(name) + '"]').forEach(b => {
+      if (count > 0){
+        b.className = 'badge count';
+        b.textContent = count > 99 ? '99+' : String(count);
+      } else {
+        b.className = 'sb-badge';
+        b.textContent = '';
+      }
+    });
+  }
+  async function refreshBadges(){
+    const map = getLastSeen();
+    // Find the OLDEST "last seen" across all agents — that's our floor.
+    // Then bucket server-side.
+    const seens = Object.values(map);
+    const floor = seens.length ? seens.sort()[0] : null;
+    const url = '/api/chat/unread' + (floor ? ('?since=' + encodeURIComponent(floor)) : '');
+    try {
+      const r = await fetch(url);
+      const d = await r.json();
+      // For each agent, compute per-agent unread — events only count if
+      // they're newer than THAT agent's last-seen.
+      const sinceMap = {};
+      for (const a in d.counts) sinceMap[a] = d.counts[a];
+      // Server's counts are for the global floor; we need per-agent so
+      // re-fetch per agent when an agent has non-zero and its last_seen
+      // is newer than floor. Simpler: trust the global count as an upper
+      // bound and let the SSE stream correct in real time as new events arrive.
+      document.querySelectorAll('.sb-badge').forEach(b => {
+        const a = b.dataset.for;
+        // If this agent has been opened since floor, zero it out.
+        if (map[a] && floor && map[a] > floor){
+          paintBadge(a, 0);
+        } else {
+          paintBadge(a, sinceMap[a] || 0);
+        }
+      });
+    } catch(_){}
+  }
+  function handleLiveEvent(ev){
+    // Ignore our own operator prompts — they're not "unread" for us.
+    if (ev.from === 'operator') return;
+    const targetAgent = ev.agent;
+    if (!targetAgent) return;
+    // An agent replying in its own channel isn't unread either.
+    if (ev.from === targetAgent && ev.type !== 'routed'){
+      // But if THIS tab is viewing that agent, live-append the reply.
+      if (targetAgent === agentName && ev.thread === activeThread){
+        addMessage('assistant', ev.preview, ev.ts);
+      }
+      return;
+    }
+    // If THIS tab is looking at that agent's active thread, it's already "seen".
+    if (targetAgent === agentName){
+      // Auto-mark read so tabs don't keep incrementing while you watch.
+      markRead(agentName);
+      // Live-append any inbound traffic on the active thread: routed from
+      // another agent, or a Discord-mirrored user message from the operator.
+      if (ev.thread === activeThread){
+        if (ev.type === 'routed'){
+          addMessage('routed', ev.preview, ev.ts, {from: ev.from});
+        } else if (ev.type === 'user'){
+          addMessage('user', ev.preview, ev.ts);
+        }
+      }
+      return;
+    }
+    // Bump the sidebar badge for the OTHER agent.
+    const badge = document.querySelector('.sb-badge[data-for="' + CSS.escape(targetAgent) + '"]');
+    const cur = badge ? parseInt(badge.textContent || '0', 10) : 0;
+    paintBadge(targetAgent, (cur || 0) + 1);
+    // Desktop notification when tab is hidden.
+    if (document.visibilityState !== 'visible'
+        && 'Notification' in window
+        && Notification.permission === 'granted'){
+      new Notification('@' + targetAgent + ' got a message', {
+        body: (ev.from ? '📡 from @' + ev.from + ' · ' : '') + (ev.preview || ''),
+        tag: 'agentos-route-' + targetAgent,
+        icon: '/static/icon-192.png',
+      });
+    }
+  }
+  function connectSSE(){
+    const es = new EventSource('/api/chat/events');
+    es.onmessage = (m) => {
+      try { handleLiveEvent(JSON.parse(m.data)); } catch(_){}
+    };
+    es.onerror = () => {
+      // Auto-reconnect after a short backoff.
+      es.close();
+      setTimeout(connectSSE, 3000);
+    };
+  }
+
+  // Opening this agent's chat = all caught up.
+  markRead(agentName);
+  refreshBadges();
+  connectSSE();
+
   // Bootstrap: honour #t=<id> in the URL if present.
   const initial = readHash();
   if (initial) activeThread = initial;
@@ -1650,7 +1853,8 @@ def chat_page_html(agent: str, agents_list: list[dict], nav_html: str, css: str)
         hist_note = (f'<span class="agent-meta">{a["history_lines"]}</span>'
                      if a.get("history_lines") else '')
         sidebar_items.append(
-            f'<a class="{cls}" href="/chat/{esc(a["name"])}">@{esc(a["name"])}{hist_note}</a>'
+            f'<a class="{cls}" data-agent="{esc(a["name"])}" href="/chat/{esc(a["name"])}">'
+            f'@{esc(a["name"])}<span class="sb-badge" data-for="{esc(a["name"])}"></span>{hist_note}</a>'
         )
 
     return f"""<!doctype html>
@@ -1708,19 +1912,69 @@ def chat_index_html(agents_list: list[dict], nav_html: str, css: str) -> str:
     cards = []
     for a in agents_list:
         cards.append(f"""
-        <a class="stat" style="text-decoration:none;display:block;" href="/chat/{esc(a['name'])}">
+        <a class="stat" style="text-decoration:none;display:block;position:relative;" href="/chat/{esc(a['name'])}">
           <div class="label">agent</div>
-          <div class="value" style="font-size:1.3em;">@{esc(a['name'])}</div>
-          <div class="sub">{a['history_lines']} msgs in web history</div>
+          <div class="value" style="font-size:1.3em;">@{esc(a['name'])}<span class="sb-badge" data-for="{esc(a['name'])}" style="position:absolute;top:0.8em;right:0.8em;"></span></div>
+          <div class="sub">{a['history_lines']} msgs · {a.get('thread_count', 1)} thread{'s' if a.get('thread_count',1)!=1 else ''}</div>
         </a>""")
+    # Small inline script — same badge painting as the full chat page, but
+    # without the per-agent marking (index is neutral, you haven't opened anything).
+    js = r"""
+    (function(){
+      const LAST_SEEN_KEY = 'agentos-last-seen';
+      function getMap(){ try { return JSON.parse(localStorage.getItem(LAST_SEEN_KEY)||'{}'); } catch(_){ return {}; } }
+      function paint(name, count){
+        document.querySelectorAll('.sb-badge[data-for="' + CSS.escape(name) + '"]').forEach(b => {
+          if (count > 0){ b.className = 'badge count'; b.textContent = count > 99 ? '99+' : String(count); }
+          else { b.className = 'sb-badge'; b.textContent = ''; }
+        });
+      }
+      async function refresh(){
+        const map = getMap();
+        const seens = Object.values(map);
+        const floor = seens.length ? seens.sort()[0] : null;
+        const r = await fetch('/api/chat/unread' + (floor ? '?since=' + encodeURIComponent(floor) : ''));
+        const d = await r.json();
+        document.querySelectorAll('.sb-badge').forEach(b => {
+          const a = b.dataset.for;
+          if (map[a] && floor && map[a] > floor) paint(a, 0);
+          else paint(a, (d.counts||{})[a] || 0);
+        });
+      }
+      function connectSSE(){
+        const es = new EventSource('/api/chat/events');
+        es.onmessage = (m) => {
+          try {
+            const ev = JSON.parse(m.data);
+            if (ev.from === 'operator') return;
+            if (!ev.agent) return;
+            // Agent replying in its own channel isn't unread either.
+            if (ev.from === ev.agent && ev.type !== 'routed') return;
+            const b = document.querySelector('.sb-badge[data-for="' + CSS.escape(ev.agent) + '"]');
+            const cur = b ? parseInt(b.textContent || '0', 10) : 0;
+            paint(ev.agent, (cur || 0) + 1);
+          } catch(_){}
+        };
+        es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };
+      }
+      refresh();
+      connectSSE();
+    })();
+    """
+    css_inline = """
+    .sb-badge{display:inline-block;}
+    .badge{display:inline-block;min-width:0.55em;height:0.55em;border-radius:50%;background:var(--fail,#e66);vertical-align:middle;}
+    .badge.count{min-width:1.4em;height:1.2em;line-height:1.2em;border-radius:0.7em;padding:0 0.45em;font-size:0.72em;color:#fff;font-weight:600;text-align:center;}
+    """
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Chat</title>
-<style>{css}</style></head>
+<style>{css}{css_inline}</style></head>
 <body>{nav_html}
 <div class="wrap">
   <h1>Chat</h1>
-  <div class="meta">Pick an agent to talk to. Separate session from Discord — same memory, same identity.</div>
+  <div class="meta">Pick an agent to talk to. Separate session from Discord — same memory, same identity. Red dot = new activity since you last opened that agent.</div>
   <br>
   <div class="grid cols-3">{''.join(cards)}</div>
 </div>
+<script>{js}</script>
 </body></html>"""

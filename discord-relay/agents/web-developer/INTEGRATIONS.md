@@ -18,11 +18,20 @@ If a service is not on this list, I do not have it. I ask before assuming I can 
 - **Access:** `Bash`
 - **Use:** `git`, `pnpm`, `vercel` CLI, `gh` CLI, `lighthouse`, `curl` for header checks. No raw `crontab` (hook blocks it).
 
+### Sentry (REST API, read)
+- **Access:** `curl` with `Authorization: Bearer $SENTRY_AUTH_TOKEN` (env from relay `.env`, wired 2026-04-20)
+- **Org:** `prana-labs` (`$SENTRY_ORG`)
+- **Project:** `javascript-nextjs` (`$SENTRY_PROJECT`)
+- **Common calls:**
+  - `GET /api/0/projects/$SENTRY_ORG/$SENTRY_PROJECT/issues/?statsPeriod=24h` — recent issues
+  - `GET /api/0/organizations/$SENTRY_ORG/releases/?project=$SENTRY_PROJECT` — release list
+  - `GET /api/0/issues/{shortId}/events/` — drill into specific fingerprint
+- **Scope:** read-only (`project:read`, `event:read`). No resolve/ignore/delete without explicit ask.
+
 ## Available but not wired (ask before using)
 
 - **Web codebases** — repo paths to be confirmed on first session, then recorded in TOOLS.md
 - **Vercel API / CLI** — assume `vercel` CLI is logged in for Dhruv's account; confirm scope before any deploy command
-- **Sentry** — read API for error fingerprints, recent regressions; intent only until token wired
 - **GitHub** — `gh` CLI for PRs / issues; never push to main without sign-off
 - **PostHog** — read-only intent for funnel + Core Web Vitals correlation
 - **Cloudflare** — DNS / WAF — confirm before changes; this is a high-blast-radius surface

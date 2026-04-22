@@ -83,6 +83,13 @@ class RelayBot(discord.Client):
             return False
         if message.author.bot and not agent.allow_bots:
             return False
+        # Webhook-posted messages without a routing header are self-echoes
+        # (e.g. an agent curl-posting an attachment back into its own
+        # channel) or outside webhooks we don't own. Real agent-to-agent
+        # traffic always has the `📡 @target (via @sender, hop N/M)` header.
+        if message.webhook_id is not None:
+            if not parse_routing_header(message.content or ""):
+                return False
         # Empty text is fine as long as there's at least an attachment —
         # dropping a file with no caption should still trigger a response.
         if not message.content.strip() and not message.attachments:
@@ -287,6 +294,32 @@ class RelayBot(discord.Client):
             + attach_block
         )
 
+        # Mirror the inbound Discord message into the receiver's web chat
+        # history so operators watching the web UI see the same traffic
+        # that's hitting Discord. Best-effort — don't block the turn if it
+        # fails.
+        # _append_history publishes its own event to the bus, so we don't
+        # need to call publish_event here — one write, one event.
+        try:
+            from web_chat import _append_history, DEFAULT_THREAD
+            if sender:  # agent-to-agent routing
+                _append_history(
+                    agent.name, "routed", body,
+                    meta={"from": sender, "hop": current_hop, "max": max_hops,
+                          "origin": "discord"},
+                    thread_id=DEFAULT_THREAD,
+                )
+            else:
+                _append_history(
+                    agent.name, "user", body,
+                    meta={"from": "operator", "origin": "discord",
+                          "discord_author": str(message.author)},
+                    thread_id=DEFAULT_THREAD,
+                )
+        except Exception as e:
+            log.warning("[%s] failed to mirror inbound discord → web: %s",
+                        self.label, e)
+
         placeholder = await message.channel.send(
             self.streaming_cfg.get("thinking_indicator", "…")
         )
@@ -305,7 +338,7 @@ class RelayBot(discord.Client):
                 # which made long tool chains feel stuck even though work
                 # was happening.
                 async with message.channel.typing():
-                    _, session_id = await run_agent(
+                    final_text, session_id = await run_agent(
                         agent,
                         prompt,
                         sink,
@@ -316,6 +349,22 @@ class RelayBot(discord.Client):
                 if session_id:
                     self.sessions[channel_id] = session_id
                     _save_sessions(self.sessions)
+
+                # Mirror the agent's outbound reply into the web chat too,
+                # so operators watching the web UI see the answer alongside
+                # the inbound message we mirrored above.
+                if final_text:
+                    try:
+                        from web_chat import _append_history, DEFAULT_THREAD
+                        _append_history(
+                            agent.name, "assistant", final_text,
+                            meta={"origin": "discord",
+                                  "session_id": session_id},
+                            thread_id=DEFAULT_THREAD,
+                        )
+                    except Exception as e:
+                        log.warning("[%s] failed to mirror agent reply → web: %s",
+                                    self.label, e)
             except Exception as e:
                 log.exception("[%s] agent %s failed", self.label, agent.name)
                 await sink.finalize(f"⚠️ `{agent.name}` error: {e}")

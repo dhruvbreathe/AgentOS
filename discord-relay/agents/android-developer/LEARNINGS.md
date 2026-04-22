@@ -36,4 +36,9 @@ Use one block per lesson. Keep each entry small and sharp.
 
 <!-- learnings:start -->
 
+## 2026-04-21 — Check integrations list before saying "not connected"
+- **Learned:** Before answering "am I connected to X?", grep my own system prompt for the service name. Integrations are listed in the "Integrations available via HTTP API (env-key)" block with exact env vars + example curls.
+- **Why:** Dhruv asked twice if I was connected to Sentry. I said no both times. Wrong — `$SENTRY_AUTH_TOKEN`, `$SENTRY_ORG`, `$SENTRY_PROJECT` are in my prompt. A daily_sentry_digest cron I'd already scheduled fired and confirmed the connection works. Made me look sloppy.
+- **How to apply:** On any "do I have X?" question, scan my own prompt first (INTEGRATIONS.md + the shared HTTP-API integrations block). Only say "no" after that's confirmed empty.
+
 <!-- learnings:end -->

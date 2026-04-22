@@ -135,6 +135,20 @@ except Exception as _e:
     _TASKS_READY = False
 
 
+# Cross-process event fan-in: tail logs/events.jsonl so events published by
+# other processes (bot.py's send_to_agent, scheduled tasks, etc.) reach the
+# dashboard's in-memory bus and show up in SSE subscribers' browsers.
+@app.on_event("startup")
+async def _start_event_tailer() -> None:
+    try:
+        import asyncio as _asyncio
+        from events import tail_events_forever
+        _asyncio.create_task(tail_events_forever())
+        print("event tailer started (logs/events.jsonl → in-memory bus)", file=sys.stderr)
+    except Exception as _e:
+        print(f"warn: event tailer not started: {_e}", file=sys.stderr)
+
+
 def esc(s) -> str:
     return html_lib.escape(str(s or ""))
 

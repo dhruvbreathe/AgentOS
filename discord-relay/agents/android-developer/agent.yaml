@@ -1,3 +1,4 @@
+# edited via dashboard at 2026-04-20T21:04:09+00:00
 # Template — copy to agents/<name>/ and fill in.
 name: android-developer
 channel_id: "1471023591033278484"
@@ -20,4 +21,12 @@ disallowed_tools: []
 
 allow_bots: true
 effort: high
-mcp_servers: {}
+mcp_servers:
+  sentry:
+    type: env
+    note: Sentry — crash reports, error tracking across iOS, Android, web. Release monitoring.
+env_passthrough:
+  - SENTRY_AUTH_TOKEN
+  - SENTRY_ORG
+env:
+  SENTRY_PROJECT: android

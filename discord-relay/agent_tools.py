@@ -147,6 +147,11 @@ def build_comms_server(
             log.warning("send_to_agent webhook post failed: %s", result)
             return {"content": [{"type": "text", "text": f"Post failed: {result}"}]}
 
+        # NOTE: we don't mirror into target's web_chat here. The webhook post
+        # will cause Discord to deliver the message to the target's channel,
+        # where bot.py's on_message handler mirrors it. Mirroring in both
+        # places produced duplicates in the web UI.
+
         return {
             "content": [
                 {

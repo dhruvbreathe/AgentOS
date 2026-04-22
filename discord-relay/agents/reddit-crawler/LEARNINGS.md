@@ -57,3 +57,18 @@ Use one block per lesson. Keep each entry small and sharp.
 - **Learned:** Before pursuing GraphQL/captcha/OAuth rabbit holes, check the rendered DOM for explicit ban text ("banned from this community"). Reddit's modern UI hides the composer entirely on subs where the user is banned, instead of showing the legacy `banned-user-banner` element. The legacy element being empty does NOT mean the account isn't banned.
 - **Why:** Burned ~2h debugging CreateComment 500 on r/breathwork as if it were a request-shape problem, then found `u/Icy_Imagination_5040` is explicitly banned from r/Meditation (and likely silent-banned from r/breathwork). Could've found it in 30s.
 - **How to apply:** First step on any "post failing" debug — visit the thread in Tandem, scan `document.body.innerText` for "banned from this community", "quarantined", "this community is private". If banner-empty but composer-missing on a non-archived non-locked post → assume sub-level ban, escalate to Dhruv. Don't chase request mechanics.
+
+## 2026-04-21 — Reddit composer expand via `comment-composer-host.focus()`
+- **Learned:** Reddit's shreddit composer loads in a collapsed shadow state. `<shreddit-composer>` is in DOM but its contenteditable is 0x0 until `<comment-composer-host>` swaps its shadow slots. Trigger the swap with `document.querySelector("comment-composer-host").focus()` (NOT by clicking `faceplate-textarea-input[data-testid="trigger-button"]` — that's 0x0 unclickable until after the expand).
+- **Why:** Burned 20+ tool calls debugging why `/type` wrote into `document.body` — composer was 0x0 the whole time. Fix was one host.focus() call.
+- **How to apply:** Posting chain: open tab → wait 5s → `comment-composer-host.focus()` → verify `ce.getBoundingClientRect().width > 0` → `/type` into `shreddit-composer [contenteditable=true]` → submit via `/find/click {by:"role",value:"button",name:"Comment"}`. First live post: r/breathwork 1sojcx9 → comment ohgxcv8.
+
+## 2026-04-21 — Reddit submit needs `/find/click`, not `/click` selector
+- **Learned:** `POST /click` with CSS selector on `button[slot="submit-button"]` does NOT trigger the submit handler — form swallows the synthetic event. `POST /find/click` with `{by:"role",value:"button",name:"Comment"}` dispatches Playwright real-click (trusted pointer event) which DOES submit.
+- **Why:** After typing worked, first submit showed only noise (`EvaluateCommentAutomationsByPostId` spam) — no `create-comment`, no `recaptcha`. Switched to `/find/click` → immediately saw `/svc/shreddit/t3_*/create-comment 200` + achievements unlocked.
+- **How to apply:** Reddit form submits — always `/find/click` role+name. Never `/click` CSS selector for submit. Probably generalises to any SPA form that gates on event trust.
+
+## 2026-04-21 — Verify Reddit login BEFORE drafting the engagement comment
+- **Learned:** Check `reddit-main` session is still logged in as `u/Icy_Imagination_5040` as step one of any engagement flow. Sessions expire silently; Reddit redirects `/settings/account` to `/login` if the cookie is stale.
+- **Why:** Today I drafted + workshopped a 192-word Biohackers comment before checking login. When I went to post, the session was dead and the composer wasn't rendering. Wasted effort on a comment I couldn't fire. Should've verified first.
+- **How to apply:** Step one of every engagement attempt: `goto /settings/account` — if it redirects to `/login`, stop, surface to operator for re-login, skip drafting. Only draft once login is confirmed.

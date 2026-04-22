@@ -20,19 +20,35 @@ If a service is not on this list, I do not have it. I ask before assuming I can 
 
 ### Himalaya (email read)
 - **Access:** `himalaya envelope list -a dhruv --folder INBOX`
-- **Use:** read inbox for reply triage. Read-only — sends go through draft-for-approval.
+- **Use:** read inbox for reply triage. Read-only.
 - **Accounts wired:** `dhruv`, `info` (per 2026-02-13 fix). `breathe` and `deepali` may be wired separately — confirm.
+
+### Apollo.io (PRIMARY OUTREACH CHANNEL)
+- **Access:** parent MCP tools `mcp__claude_ai_Apollo_io__*`
+- **Use:** source + verify prospects, enroll into emailer campaigns — **Apollo is how we send**, not Gmail drafts. Connected mailbox on Apollo side does the actual delivery on the sequence schedule.
+- **Key tools:**
+  - `apollo_mixed_people_api_search` — prospect search
+  - `apollo_people_match` / `apollo_people_bulk_match` — verify email (`email_status: verified` required)
+  - `apollo_mixed_companies_search` / `apollo_organizations_enrich` — account research
+  - `apollo_contacts_create` / `apollo_contacts_update` — CRM side
+  - `apollo_emailer_campaigns_search` — find the live sequence
+  - `apollo_emailer_campaigns_add_contact_ids` — enroll into sequence (the send)
+  - `apollo_emailer_campaigns_remove_or_stop_contact_ids` — pull someone out
+  - `apollo_email_accounts_index` — confirm sending mailbox
+- **Autonomy:** per 2026-04-19 grant, daily batch enrolls without per-email approval. Hard requirement: every contact `email_status: verified` before enrollment. No pattern-guessed addresses.
+
+### Gmail (parent MCP)
+- **Access:** `mcp__claude_ai_Gmail__*` — create_draft, search_threads, get_thread, labels
+- **Use:** reply triage + drafting inbound replies. One-off personal replies when Apollo sequence isn't the right surface. Not the primary outbound channel.
 
 ## Available but not wired (ask before assuming)
 
-- **gog CLI** — queued. Replaces Himalaya for full Gmail/Calendar/Drive/Contacts access once OAuth is done. `gog auth add dhruv@vayu-prana.com --services gmail,calendar,drive,contacts,sheets`. Browser flow needed; Dhruv to do in person on Mac Studio.
-- **Apollo.io** — MCP available in the broader Claude ecosystem. Confirm wiring before use. Read-heavy; never trigger Apollo-side sends without explicit approval.
-- **Gmail outbound (sending)** — never. Drafts only. Send is human action.
-- **Mixpanel** — read-only intent for reply→meeting funnel attribution. Design-metrics owns dashboards.
+- **gog CLI** — queued. Full Gmail/Calendar/Drive/Contacts once OAuth done. Browser flow needed; Dhruv to do in person on Mac Studio.
+- **Mixpanel** — read-only intent for reply→meeting funnel attribution (tools now loaded via parent MCP). Design-metrics owns dashboards.
 
 ## Off-limits
 
-- **Sending email of any kind.** I draft. Dhruv sends. No exceptions.
+- **Outbound outside Apollo sequences or approved Gmail replies.** No ad-hoc sends from other accounts.
 - **Pricing changes, contract commitments, refund offers** — escalate
 - **Social media posting** — `social-media`
 - **Paid ad spend** — `ads`
