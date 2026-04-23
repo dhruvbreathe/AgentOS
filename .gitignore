@@ -1,25 +1,53 @@
-# Secrets — never commit
+# ── Secrets ───────────────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 
-# Vendored SDK clone (install via pip instead; keeps repo small & tidy)
+# Dashboard basic-auth creds (auto-generated on first launch)
+logs/dashboard-creds.txt
+
+# Certs and keys
+certs/
+*.key
+*.pem
+*.crt
+
+# ── Runtime state ─────────────────────────────────────────────────────────
+logs/
+.mcp_data/
+
+# Private operator content. Only `_template/` ships with the public repo;
+# every other agent directory is considered private (channel IDs, webhook env
+# names, org-specific integrations, accumulated memory/learnings). Operators
+# can selectively un-ignore any agent they want to publish as an example.
+agents/*/
+!agents/_template/
+
+# Trajectory logs
+logs/trajectories/
+
+# ── Vendored / local-only ─────────────────────────────────────────────────
+# SDK clone used as reference during development; install via pip instead.
 claude-agent-sdk-python/
 
-# Python
+# Local Vercel proxy scratch
+vercel-proxy/.vercel/
+
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
 
-# Relay runtime state
-discord-relay/logs/
-
-# macOS
+# ── Editor / OS ───────────────────────────────────────────────────────────
 .DS_Store
+.idea/
+.vscode/
 
-# Claude workspace cruft
+# ── Claude Code workspace cruft ───────────────────────────────────────────
 .claude/
-.mcp_data/
