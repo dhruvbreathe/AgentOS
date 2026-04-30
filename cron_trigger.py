@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +25,9 @@ from dotenv import load_dotenv
 
 from agent_loader import load_agent
 from relay import CollectingSink, run_agent
+
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+LABEL_PREFIX = "com.agentos"
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
@@ -81,6 +86,9 @@ async def _run(agent_name: str, task_name: str) -> int:
     # to the agent's channel via webhook.
     kind = str(fm.get("kind", "")).strip().lower()
     silent = bool(fm.get("silent")) or kind in ("systemevent", "system_event", "internal")
+    # One-shot deferred runs created via scripts/defer.py — after this run
+    # we delete the plist + task file so the agent doesn't re-fire.
+    oneshot = bool(fm.get("oneshot"))
 
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "
@@ -88,28 +96,63 @@ async def _run(agent_name: str, task_name: str) -> int:
     )
 
     sink = CollectingSink()
-    text, _session = await run_agent(agent, prompt, sink)
+    try:
+        text, _session = await run_agent(agent, prompt, sink)
 
-    if silent:
-        log.info(
-            "systemEvent task %s/%s completed (kind=%s) — output in trajectory, no webhook post",
-            agent.name, task_name, kind or "silent",
-        )
-        print(text)
+        if silent:
+            log.info(
+                "systemEvent task %s/%s completed (kind=%s) — output in trajectory, no webhook post",
+                agent.name, task_name, kind or "silent",
+            )
+            print(text)
+        elif not agent.webhook_url:
+            log.warning(
+                "Agent %s has no webhook_url; printing to stdout instead", agent.name
+            )
+            print(text)
+        else:
+            header = f"**[{task_name}]**\n"
+            await _post_webhook(
+                agent.webhook_url, header + text, username=f"{agent.name} (scheduled)"
+            )
         return 0
+    finally:
+        if oneshot:
+            _cleanup_oneshot(agent_name, task_name, task_file)
 
-    if not agent.webhook_url:
-        log.warning(
-            "Agent %s has no webhook_url; printing to stdout instead", agent.name
+
+def _cleanup_oneshot(agent_name: str, task_name: str, task_file: Path) -> None:
+    """Bootout + delete the launchd plist + task file for a one-shot deferred run.
+
+    Order matters: unlink the files BEFORE issuing `launchctl bootout`. We
+    are running INSIDE the launchd-managed process; bootout sends SIGTERM
+    to the calling process before returning, so any work after the bootout
+    call is unreliable. Files-first guarantees the on-disk state is clean
+    even if our process gets killed.
+
+    Best-effort: failures are logged but never raised — a stuck plist is
+    inconvenient but not data-corrupting, and we don't want cleanup errors
+    to mask the actual run result.
+    """
+    label = f"{LABEL_PREFIX}.{agent_name}-{task_name}"
+    plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
+    for p in (plist_path, task_file):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("oneshot unlink failed for %s: %s", p, e)
+    log.info("oneshot files removed: %s", label)
+    # Bootout last. launchd will SIGTERM us once it processes this; we may
+    # never return from this subprocess.run call. That's fine — the on-disk
+    # cleanup above is what matters.
+    try:
+        uid = os.getuid()
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/{label}"],
+            capture_output=True, text=True, timeout=10,
         )
-        print(text)
-        return 0
-
-    header = f"**[{task_name}]**\n"
-    await _post_webhook(
-        agent.webhook_url, header + text, username=f"{agent.name} (scheduled)"
-    )
-    return 0
+    except Exception as e:
+        log.warning("oneshot bootout failed for %s: %s", label, e)
 
 
 def main() -> None:
