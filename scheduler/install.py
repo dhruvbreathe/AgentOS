@@ -248,12 +248,17 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
         plan = [e for e in plan if (e["agent"], e["task"]) not in cron_active]
 
     # Determine which labels we're keeping; anything managed but not in the plan
-    # gets removed.
+    # gets removed — except one-shot deferred labels (prefix `<...>-_deferred_`),
+    # which are owned by scripts/defer.py and self-clean after firing. The
+    # recurring-scheduler must not clobber a pending deferred run.
     desired = {e["label"] for e in plan}
     loaded = set(list_managed())
     # Plus plists on disk under our prefix, even if not currently loaded.
     on_disk = {p.stem for p in LAUNCH_AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.plist")}
-    stale = (loaded | on_disk) - desired
+    stale = {
+        label for label in (loaded | on_disk) - desired
+        if "-_deferred_" not in label
+    }
 
     for label in sorted(stale):
         rc, err = bootout(label)

@@ -110,6 +110,16 @@ Delete the task file and run `scheduler/install.py --apply`. The installer booto
 
 To nuke all scheduled work: `scheduler/install.py --remove-all`.
 
+## One-shot deferred runs (single fire, then self-clean)
+
+Recurring schedules belong in `tasks/*.md`. If I just need to wake myself up **once** at a future time (a single follow-up, an approval window, an external batch settling), use the deferred runner instead — see CONTINUATION.md for the full rules:
+
+```bash
+python {AGENTOS_ROOT}/scripts/defer.py <my-name> "in 30m" "<the prompt I want fired at me>"
+```
+
+That writes a one-shot launchd plist + task file, fires once at the target time, posts to my channel via webhook, then deletes itself. The recurring `scheduler/install.py` skips deferred-run plists, so it's safe to mix the two. **Never** use a recurring `cron:` task for a one-time follow-up.
+
 ## How to restart the relay from Discord
 
 If I've changed config files (agent.yaml, shared/*.md, config.yaml) and need a restart:

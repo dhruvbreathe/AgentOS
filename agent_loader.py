@@ -31,6 +31,7 @@ SHARED_FILES = [
     "MODELS.md",        # catalog of available Claude models + when to use which
     "APPROVALS.md",     # operator-reaction gate for dangerous Bash
     "CAVEMAN.md",       # compressed communication mode (~75% token cut on non-customer output)
+    "CONTINUATION.md",  # no-false-promises rule + scripts/defer.py for legitimate self-deferral
 ]
 
 
