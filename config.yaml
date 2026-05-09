@@ -78,6 +78,11 @@ save:
   emoji: "💾"
   ack_emoji: "✅"
   error_emoji: "⚠️"
+  # Hermes-style auto-react: bot adds its own 💾 to substantive replies so
+  # the operator can ✅ to confirm save (or ignore). Off by default — flip
+  # on when ready and the bot will mark long/structured replies for one-tap save.
+  auto_react: false
+  auto_react_min_chars: 500
 
 # Streaming behaviour for live Discord message edits.
 streaming:
