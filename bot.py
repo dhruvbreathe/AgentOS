@@ -48,6 +48,26 @@ def _save_sessions(data: dict[str, str]) -> None:
     SESSIONS_FILE.write_text(json.dumps(data, indent=2))
 
 
+# Heuristic for the Hermes-style auto-save 💾 reaction. A reply counts as
+# "substantive" if it is long enough OR has the kind of structure that
+# signals a real decision/handoff rather than a quick ack.
+_SUBSTANTIVE_MARKERS = (
+    "**", "##", "\n- ", "\n* ", "\n1. ",
+    "Decision", "decision", "→", "✅", "⚠️", "🎯", "📋",
+)
+
+
+def _is_substantive_reply(text: str, min_chars: int) -> bool:
+    if not text:
+        return False
+    # Tool-only output ("🔧 Edit → ...") shouldn't be auto-marked.
+    if text.lstrip().startswith("🔧"):
+        return False
+    if len(text) >= min_chars:
+        return True
+    return any(m in text for m in _SUBSTANTIVE_MARKERS)
+
+
 class RelayBot(discord.Client):
     """One discord.Client, scoped to the set of agents that share its
     bot token. Messages in channels not bound to this client are ignored."""
@@ -332,12 +352,25 @@ class RelayBot(discord.Client):
         async with self._channel_lock(channel_id):
             resume = self.sessions.get(channel_id)
             try:
-                # `async with channel.typing():` keeps Discord's "typing..."
-                # indicator alive for the whole turn. The single-shot
-                # channel.typing() call it replaces expires after ~10s,
-                # which made long tool chains feel stuck even though work
-                # was happening.
-                async with message.channel.typing():
+                # Keep Discord's "typing..." indicator alive for the whole
+                # turn (single-shot expires after ~10s and made long tool
+                # chains feel stuck). But the typing endpoint itself is
+                # rate-limited per channel and can return 429 / error 40062
+                # under load — when that happens we still want the turn to
+                # run, just without the indicator.
+                typing_cm = message.channel.typing()
+                typing_started = False
+                try:
+                    await typing_cm.__aenter__()
+                    typing_started = True
+                except discord.HTTPException as e:
+                    if not (e.status == 429 or getattr(e, "code", None) == 40062):
+                        raise
+                    log.warning(
+                        "[%s] typing indicator rate-limited (%s) — running turn without it",
+                        self.label, getattr(e, "code", e.status),
+                    )
+                try:
                     final_text, session_id = await run_agent(
                         agent,
                         prompt,
@@ -346,6 +379,12 @@ class RelayBot(discord.Client):
                         current_hop=current_hop,
                         max_hops=max_hops,
                     )
+                finally:
+                    if typing_started:
+                        try:
+                            await typing_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
                 if session_id:
                     self.sessions[channel_id] = session_id
                     _save_sessions(self.sessions)
@@ -365,6 +404,25 @@ class RelayBot(discord.Client):
                     except Exception as e:
                         log.warning("[%s] failed to mirror agent reply → web: %s",
                                     self.label, e)
+
+                # Hermes-style auto-react: bot adds 💾 to its own substantive
+                # replies so the operator can ✅ to save with one tap. Guarded
+                # by save.auto_react in config.yaml. The existing reaction
+                # handler ignores reactions added by the bot itself
+                # (payload.user_id == self.user.id check), so this won't
+                # auto-trigger a save — operator confirmation is still required.
+                if final_text and self.save_cfg.get("auto_react", False):
+                    min_chars = int(self.save_cfg.get("auto_react_min_chars", 500))
+                    if _is_substantive_reply(final_text, min_chars):
+                        anchor = sink.messages[0] if sink.messages else None
+                        if anchor is not None:
+                            try:
+                                await anchor.add_reaction(
+                                    self.save_cfg.get("emoji", "💾")
+                                )
+                            except Exception as e:
+                                log.warning("[%s] auto-react failed: %s",
+                                            self.label, e)
             except Exception as e:
                 log.exception("[%s] agent %s failed", self.label, agent.name)
                 await sink.finalize(f"⚠️ `{agent.name}` error: {e}")
