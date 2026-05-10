@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -87,6 +88,12 @@ class RelayBot(discord.Client):
         self.streaming_cfg = self.global_cfg.get("streaming", {}) or {}
         self.save_cfg = self.global_cfg.get("save", {}) or {}
         self.sessions = _load_sessions()
+        # channel_id → unix-time after which we'll try typing again. When
+        # Discord returns 40062 ("service resource is being rate limited")
+        # we mark the channel for 30 min and skip typing entirely. This
+        # prevents discord.py's 5-retry-on-429 loop from burning more
+        # API calls and re-arming the cooldown on every turn.
+        self._typing_cooldown_until: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def on_ready(self) -> None:
@@ -354,22 +361,34 @@ class RelayBot(discord.Client):
             try:
                 # Keep Discord's "typing..." indicator alive for the whole
                 # turn (single-shot expires after ~10s and made long tool
-                # chains feel stuck). But the typing endpoint itself is
-                # rate-limited per channel and can return 429 / error 40062
-                # under load — when that happens we still want the turn to
-                # run, just without the indicator.
+                # chains feel stuck). But the typing endpoint is rate-
+                # limited per channel and returns 429 / error 40062 under
+                # load. We do two things:
+                #   1. If we've already been rate-limited on this channel
+                #      recently, skip typing entirely until the cooldown
+                #      expires. discord.py retries internally 5x on 429,
+                #      and each retry is itself a typing call — those
+                #      retries re-arm the cooldown indefinitely.
+                #   2. If typing __aenter__ raises 40062, mark a 30-min
+                #      cooldown so future turns skip cleanly.
                 typing_cm = message.channel.typing()
                 typing_started = False
-                try:
-                    await typing_cm.__aenter__()
-                    typing_started = True
-                except discord.HTTPException as e:
-                    if not (e.status == 429 or getattr(e, "code", None) == 40062):
-                        raise
-                    log.warning(
-                        "[%s] typing indicator rate-limited (%s) — running turn without it",
-                        self.label, getattr(e, "code", e.status),
-                    )
+                cooldown_until = self._typing_cooldown_until.get(channel_id, 0.0)
+                if cooldown_until > time.time():
+                    pass  # silently skip typing this turn
+                else:
+                    try:
+                        await typing_cm.__aenter__()
+                        typing_started = True
+                    except discord.HTTPException as e:
+                        if not (e.status == 429 or getattr(e, "code", None) == 40062):
+                            raise
+                        cool_for_s = 30 * 60
+                        self._typing_cooldown_until[channel_id] = time.time() + cool_for_s
+                        log.warning(
+                            "[%s] typing rate-limited (%s) on channel %s — skipping indicator for %ds",
+                            self.label, getattr(e, "code", e.status), channel_id, cool_for_s,
+                        )
                 try:
                     final_text, session_id = await run_agent(
                         agent,
