@@ -299,9 +299,14 @@ class RelayBot(discord.Client):
 
         # If the message has no text body but does have a transcript,
         # promote the transcript as the effective body so agents that
-        # check "did the user say anything?" still see intent.
+        # check "did the user say anything?" still see intent. We
+        # PREFIX a voice-origin marker so the agent knows the medium —
+        # otherwise the transcript looks identical to a typed message
+        # and agents have been confidently telling operators "voice
+        # doesn't work" when in fact the transcript reached them
+        # cleanly. Be loud about it.
         if not body.strip() and transcripts:
-            body = transcripts[0][1]
+            body = f"🎙️ _(voice message, transcribed)_\n\n{transcripts[0][1]}"
             voice_block = ""  # already in body
 
         # Only list non-audio attachments in the file list — audio files
