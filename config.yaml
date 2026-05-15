@@ -65,6 +65,10 @@ defaults:
       - '\bkillall\s+[A-Za-z]'
       - '\bshutdown\b'
       - '\breboot\b'
+      # Destructive AgentOS operation: rolling back agent state. Always
+      # surface for ✅ before executing — the operator deserves to see
+      # which checkpoint is about to be applied.
+      - '\bcheckpoint_gate(\.py)?\s+restore\b'
       # Add site-specific regex patterns below to protect sensitive files
       # from agent edits. Example: '/path/to/important/file\.md'
 

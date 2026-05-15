@@ -1,0 +1,91 @@
+{
+  // Project-wide markdownlint config for the AgentOS repo.
+  // Rules are tuned for prose-heavy vault notes + agent identity files,
+  // NOT for strict tech-docs style. Goal: catch actual breakage (broken
+  // links, mis-nested lists, dead anchors) without yelling about line
+  // length or trailing punctuation in headings.
+  //
+  // Add overrides per-file via inline comments:
+  //   <!-- markdownlint-disable-file MD025 -->
+  //   <!-- markdownlint-disable MD013 -->
+
+  "config": {
+    "default": true,
+
+    // Off: line length. Prose flows naturally; hard-wrap mid-sentence
+    // hurts diff readability and isn't valuable for human reading.
+    "MD013": false,
+
+    // Off: multiple H1s in a file. Our identity files concatenate;
+    // each section starts with its own H1.
+    "MD025": false,
+
+    // Off: trailing punctuation in headings. Some headings end with `?`
+    // or `.` on purpose ("Removing a task" + "Done?" patterns).
+    "MD026": false,
+
+    // Off: inline HTML. Our skill docs reference <function> blocks.
+    "MD033": false,
+
+    // Off: bare URLs. We use them inline in agent docs.
+    "MD034": false,
+
+    // Off: first line H1. Some files start with frontmatter or notes.
+    "MD041": false,
+
+    // Off: heading style consistency. We mix ATX and setext intentionally.
+    "MD003": false,
+
+    // Off: unordered list style. We mix `-` and `*` in skill files.
+    "MD004": false,
+
+    // Off: list spacing — our compact lists are intentional.
+    "MD030": false,
+
+    // Off: fenced-code-block language. Some shell snippets are language-less.
+    "MD040": false,
+
+    // Off: blank lines around headings. Compact prose notes pack headings
+    // directly against content on purpose. Stylistic, not breakage.
+    "MD022": false,
+
+    // Off: blank lines around lists. Same reasoning — compact lists are
+    // intentional in skill files and identity docs.
+    "MD032": false,
+
+    // Off: blank lines around fenced code. Sometimes a fence butts against
+    // a heading or list item by design.
+    "MD031": false,
+
+    // Off: emphasis-used-instead-of-heading. We use `**bold**` for compact
+    // sub-sections in prose notes, intentionally not promoting to H3.
+    "MD036": false,
+
+    // Off: ordered list item prefix. Sometimes lists use `1. 1. 1.` so
+    // markdown auto-numbers; sometimes explicit. Either fine.
+    "MD029": false,
+
+    // Pin emphasis style to asterisk. Our default is `*italics*` and
+    // `**bold**`; the LEARNINGS template's underscored _intro_ was
+    // mis-inferring the file style and tripping every emphasis below.
+    "MD049": { "style": "asterisk" },
+    "MD050": { "style": "asterisk" },
+
+    // Off: multiple consecutive blank lines. We use double-blanks between
+    // major sections of long-form notes (LEARNINGS entries, sprint logs)
+    // for breathing room. Stylistic, not breakage.
+    "MD012": false,
+
+    // Off: table column style. We mix compact (`|---|---|`) and padded
+    // (`| --- | --- |`) tables. Both render fine; rule is pure style.
+    "MD060": false
+  },
+
+  "ignores": [
+    "node_modules/**",
+    "**/__pycache__/**",
+    ".venv/**",
+    "claude-agent-sdk-python/**",
+    "logs/**"
+  ]
+}

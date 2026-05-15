@@ -104,6 +104,37 @@ When `kind: systemEvent` (or `silent: true`), the cron runs me normally — full
 
 **Default is posted.** Only add `kind: systemEvent` when there's a real reason the operator shouldn't see the output in-channel.
 
+## Lite bootstrap — token-cheap cron turns
+
+A task can opt into a stripped system prompt with `bootstrap: lite`:
+
+```markdown
+---
+cron: 0 9 * * *
+kind: systemEvent
+bootstrap: lite
+---
+Daily DB health check — query Supabase, write any anomalies to memory/.
+```
+
+When `bootstrap: lite` is set, the cron loads me with only the bare minimum:
+`IDENTITY.md` + `TOOLS.md` + `INTEGRATIONS.md` + `MEMORY.md`. Everything else
+(HUMANIZER / EXPRESSION / SOUL / USER / AGENTS / SCHEDULING / LEARNINGS / skills
+/ legacy system prompt) is **skipped** for that run. Net: ~70% token cut per fire.
+
+**Use for:**
+- Pure-data crons (DB health checks, metrics polls, vault hygiene)
+- Anything where personality/voice doesn't matter — silent housekeeping
+- Long-running cadences (hourly, every-15-min) where token cost compounds
+
+**Don't use for:**
+- Anything that posts to Discord (voice/style files matter)
+- Anything that involves judgement, prioritisation, or cross-agent routing
+- Daily digests, weekly reports, status memos — those need the full stack
+
+Default is full bootstrap. Only add `bootstrap: lite` when you can articulate
+why the agent doesn't need its personality for this specific job.
+
 ## Removing a task
 
 Delete the task file and run `scheduler/install.py --apply`. The installer bootouts and deletes any managed plist whose task file no longer exists.

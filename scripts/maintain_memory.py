@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta
@@ -20,6 +21,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 AGENTS = ROOT / "agents"
+
+# Matches YYYY-MM-DD at start of stem, optionally followed by -<slug>.
+# Examples that match: 2026-05-14, 2026-05-14-yogaworks, 2026-05-14-hermes-scan.
+_DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-.+)?$")
+
+
+def _parse_date_prefix(stem: str):
+    """Pull YYYY-MM-DD from a memory filename stem.
+
+    Accepts both `2026-05-14` (date-only, written by Stop/PreCompact hook)
+    and `2026-05-14-<slug>` (threaded notes the agent writes explicitly).
+    Returns a date or None.
+    """
+    m = _DATE_PREFIX.match(stem)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def _maintain(agent_dir: Path, archive_days: int) -> dict[str, int]:
@@ -30,10 +51,8 @@ def _maintain(agent_dir: Path, archive_days: int) -> dict[str, int]:
     cutoff = datetime.now().date() - timedelta(days=archive_days)
     archived = kept = 0
     for path in mem.glob("20*.md"):
-        # Parse YYYY-MM-DD from filename; skip anything not matching.
-        try:
-            date = datetime.strptime(path.stem, "%Y-%m-%d").date()
-        except ValueError:
+        date = _parse_date_prefix(path.stem)
+        if date is None:
             continue
         if date < cutoff:
             dest = mem / "archive" / f"{date.strftime('%Y-%m')}"
@@ -52,11 +71,8 @@ def _recent_summary(agent_dir: Path, days: int = 7) -> str:
     cutoff = datetime.now().date() - timedelta(days=days)
     lines = []
     for path in sorted(mem.glob("20*.md")):
-        try:
-            date = datetime.strptime(path.stem, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if date < cutoff:
+        date = _parse_date_prefix(path.stem)
+        if date is None or date < cutoff:
             continue
         content = path.read_text().strip()
         if content:

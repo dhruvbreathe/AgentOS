@@ -69,9 +69,10 @@ async def _post_webhook(webhook_url: str, content: str, username: str) -> None:
 
 
 async def _run(agent_name: str, task_name: str) -> int:
-    agent = load_agent(agent_name)
-
-    task_file = (agent.tasks_dir or Path()) / f"{task_name}.md"
+    # Peek at the task file before loading the agent — `bootstrap: lite`
+    # in the frontmatter changes how we load the system prompt.
+    tasks_dir = Path(__file__).resolve().parent / "agents" / agent_name / "tasks"
+    task_file = tasks_dir / f"{task_name}.md"
     if not task_file.exists():
         log.error("No task file at %s", task_file)
         return 2
@@ -89,6 +90,14 @@ async def _run(agent_name: str, task_name: str) -> int:
     # One-shot deferred runs created via scripts/defer.py — after this run
     # we delete the plist + task file so the agent doesn't re-fire.
     oneshot = bool(fm.get("oneshot"))
+    # Lite bootstrap — strip SOUL/USER/HUMANIZER/etc. for single-shot
+    # housekeeping crons that don't need the full personality. ~70% token cut.
+    bootstrap = str(fm.get("bootstrap", "")).strip().lower()
+    lite = bootstrap in ("lite", "minimal", "light")
+
+    agent = load_agent(agent_name, lite=lite)
+    if lite:
+        log.info("Loaded %s in lite-bootstrap mode (task=%s)", agent_name, task_name)
 
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "

@@ -32,6 +32,7 @@ SHARED_FILES = [
     "APPROVALS.md",     # operator-reaction gate for dangerous Bash
     "CAVEMAN.md",       # compressed communication mode (~75% token cut on non-customer output)
     "CONTINUATION.md",  # no-false-promises rule + scripts/defer.py for legitimate self-deferral
+    "FILE_DELIVERY.md", # always attach files via webhook, not vault paths (operator rule 2026-05-14)
 ]
 
 
@@ -120,6 +121,19 @@ LAYERED_FILES = [
     "MEMORY.md",  # curated facts about people/places/preferences (distinct from LEARNINGS)
 ]
 
+# Stripped layer for `bootstrap: lite` cron tasks. No SOUL/USER/AGENTS/
+# SCHEDULING/LEARNINGS — those are personality/process files that don't
+# help a single-shot status ping or hygiene job. Keep identity (so the
+# agent still posts as itself), tools (so paths work), integrations
+# (so HTTP-API recipes are reachable), and curated MEMORY facts.
+# Net effect: ~70% token cut on each lite cron fire vs. full bootstrap.
+LAYERED_FILES_LITE = [
+    "IDENTITY.md",
+    "TOOLS.md",
+    "INTEGRATIONS.md",
+    "MEMORY.md",
+]
+
 
 def _has_unsafe_crontab(cmd: str) -> bool:
     """Scan every `crontab` occurrence. Anything other than -l/--list writes."""
@@ -190,6 +204,160 @@ def _build_session_log_hooks(agent_name: str):
         return {}
 
     return on_stop, on_precompact
+
+
+def _build_post_write_lint_hook(agent_name: str, enabled: bool = True):
+    """PostToolUse hook on Write/Edit/MultiEdit: lint the file that was
+    just written.
+
+    Observational — never blocks the write (the tool has already run by the
+    time PostToolUse fires). Warnings + errors land in:
+      - The agent's trajectory log (always, via this hook's return)
+      - additionalContext for the next turn (so the agent sees its mistake)
+
+    If a linter is missing on the host, the file is silently skipped — no
+    noise. The hook is fail-open by design; it should never break a session.
+    """
+    if not enabled:
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    from lint_gate import lint_file
+
+    async def _on_post(input_data, tool_use_id, context):
+        try:
+            tool_name = input_data.get("tool_name", "")
+            if tool_name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                return {}
+            tool_input = input_data.get("tool_input", {}) or {}
+            # Write/Edit use `file_path`; MultiEdit too; NotebookEdit uses
+            # `notebook_path`.
+            path_str = (
+                tool_input.get("file_path")
+                or tool_input.get("notebook_path")
+                or ""
+            )
+            if not path_str:
+                return {}
+            result = lint_file(Path(path_str))
+            if not result.is_problem:
+                return {}
+            # Surface as additionalContext on the next assistant turn so the
+            # agent sees it and can self-correct.
+            prefix = "⚠️" if result.status == "warn" else "❌"
+            note = (
+                f"{prefix} [post-write lint · {result.linter}] {Path(path_str).name}: "
+                f"{result.message or result.status}"
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": note,
+                }
+            }
+        except Exception:
+            # Fail open — lint hook must never break the session.
+            return {}
+
+    return _on_post
+
+
+def _build_pre_write_checkpoint_hook(agent_name: str, cwd: Path, enabled: bool = True):
+    """PreToolUse hook on Write/Edit/MultiEdit: snapshot file state before
+    the edit fires, so /rollback can restore later.
+
+    Two modes auto-detected from cwd:
+      - git-stash for code agents (cwd has .git)
+      - file-snapshot for vault/non-git agents
+
+    Fails open: if checkpoint creation errors out, the write still proceeds.
+    The agent's safety bet is "rollback if you regret it", not "block if you
+    might regret it". Debounced — fast-fire edits in the same turn bundle
+    into one snapshot.
+    """
+    if not enabled:
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    from checkpoint_gate import create_checkpoint
+
+    async def _on_pre(input_data, tool_use_id, context):
+        try:
+            tool_name = input_data.get("tool_name", "")
+            if tool_name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                return {}
+            tool_input = input_data.get("tool_input", {}) or {}
+            path_str = (
+                tool_input.get("file_path")
+                or tool_input.get("notebook_path")
+                or ""
+            )
+            if not path_str:
+                return {}
+            p = Path(path_str)
+            if not p.exists():
+                # New file — nothing to checkpoint.
+                return {}
+            meta = create_checkpoint(
+                agent_name,
+                cwd,
+                [p],
+                tool=tool_name,
+                message="auto pre-edit",
+            )
+            if meta is None:
+                return {}
+            # Don't surface in additionalContext on every edit — it'd flood
+            # the trajectory with low-value noise. The checkpoint is
+            # silent; agents discover it via /rollback list when they need
+            # it.
+            return {}
+        except Exception:
+            # Hook must never break the session.
+            return {}
+
+    return _on_pre
+
+
+def _build_subagent_start_hook(parent_name: str):
+    """SubagentStart hook: prepend parent attribution + scope reminder into the
+    subagent's session as additionalContext.
+
+    Inspired by OpenClaw's `sessions_spawn` first-message injection — instead of
+    relying on the parent agent to remember to add context to every Task prompt,
+    the SDK injects it automatically. Subagent gets:
+      - who spawned them (parent agent name)
+      - reminder they are scoped and should fail fast on missing context
+      - clear instruction to focus on the immediate user message
+
+    Cost: ~150 tokens of system context per subagent spawn. Worth it for less
+    "subagent guesses at what the parent wanted" failure mode.
+    """
+
+    async def _on_start(input_data, tool_use_id, context):
+        agent_type = (
+            input_data.get("agent_type", "subagent") if isinstance(input_data, dict) else "subagent"
+        )
+        ctx = (
+            f"[Subagent context]\n"
+            f"- Spawned by: `{parent_name}` (parent agent)\n"
+            f"- Your agent_type: `{agent_type}`\n"
+            f"- You are a scoped specialist. Focus on the task in the user "
+            f"message; do not invent adjacent work.\n"
+            f"- If essential context is missing, fail fast with a clear "
+            f"question rather than guessing.\n"
+            f"- Return a tight, structured answer. The parent will synthesize."
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": ctx,
+            }
+        }
+
+    return _on_start
 
 
 def _build_approval_hook(
@@ -327,12 +495,18 @@ async def _block_raw_crontab(input_data, tool_use_id, context):
     }
 
 
-def _load_layered_prompt(agent_dir: Path) -> str:
+def _load_layered_prompt(agent_dir: Path, lite: bool = False) -> str:
     """Concatenate OpenClaw-style per-agent files (if present) into a single
     system prompt. Each file starts with its own H1, so we just separate with
-    blank lines."""
+    blank lines.
+
+    When `lite=True`, only the minimum identity + reference files are loaded —
+    used by `bootstrap: lite` cron tasks where SOUL/USER/AGENTS/SCHEDULING/
+    LEARNINGS would be dead weight for a single-shot housekeeping job.
+    """
     chunks: list[str] = []
-    for name in LAYERED_FILES:
+    files = LAYERED_FILES_LITE if lite else LAYERED_FILES
+    for name in files:
         p = agent_dir / name
         if p.exists():
             chunks.append(p.read_text().rstrip())
@@ -358,7 +532,15 @@ def _resolve_vault_path(global_cfg: dict[str, Any]) -> str | None:
     return os.environ.get(env_var)
 
 
-def load_agent(name: str) -> AgentConfig:
+def load_agent(name: str, lite: bool = False) -> AgentConfig:
+    """Load an agent's runtime config.
+
+    `lite=True` strips the system prompt down to the bare minimum
+    (IDENTITY + TOOLS + INTEGRATIONS + MEMORY, no SHARED files, no skills,
+    no legacy system_prompt). Use only for `bootstrap: lite` cron tasks —
+    single-shot housekeeping jobs where loading SOUL/USER/HUMANIZER/etc.
+    would burn 30-50K tokens for no behavioural benefit.
+    """
     agent_dir = AGENTS_DIR / name
     cfg_path = agent_dir / "agent.yaml"
     if not cfg_path.exists():
@@ -459,15 +641,23 @@ def load_agent(name: str) -> AgentConfig:
 
     # System prompt: shared universals + layered per-agent files + optional
     # legacy system_prompt.md + skills + inline integration notes.
-    shared = _load_shared_prompt()
-    layered = _load_layered_prompt(agent_dir)
-    legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
-    legacy_sp = ""
-    if legacy_name:
-        legacy_sp_file = agent_dir / legacy_name
-        if legacy_sp_file.is_file():
-            legacy_sp = legacy_sp_file.read_text()
-    skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
+    # `lite=True` skips SHARED + skills + legacy and uses LAYERED_FILES_LITE
+    # for the layered chunk — keeps the integration notes (cheap, scope-aware).
+    if lite:
+        shared = ""
+        layered = _load_layered_prompt(agent_dir, lite=True)
+        legacy_sp = ""
+        skills = ""
+    else:
+        shared = _load_shared_prompt()
+        layered = _load_layered_prompt(agent_dir)
+        legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
+        legacy_sp = ""
+        if legacy_name:
+            legacy_sp_file = agent_dir / legacy_name
+            if legacy_sp_file.is_file():
+                legacy_sp = legacy_sp_file.read_text()
+        skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
 
     system_prompt = "\n\n".join(
         [
@@ -548,6 +738,26 @@ def load_agent(name: str) -> AgentConfig:
 
     subagents = _load_subagents(agent_dir, agent_cfg)
     on_stop, on_precompact = _build_session_log_hooks(name)
+    on_subagent_start = _build_subagent_start_hook(name)
+
+    # Post-write lint — per-agent opt-out via `lint_on_write: false`.
+    # Default ON; observational only (never blocks). Cheap because each
+    # linter early-exits when not installed on the host.
+    _lint_enabled = agent_cfg.get(
+        "lint_on_write",
+        defaults.get("lint_on_write", True),
+    )
+    on_post_write_lint = _build_post_write_lint_hook(name, enabled=bool(_lint_enabled))
+
+    # Pre-write checkpoint — per-agent opt-out via `checkpoint_on_write: false`.
+    # Default ON for everyone except agents that don't write files (none yet).
+    _checkpoint_enabled = agent_cfg.get(
+        "checkpoint_on_write",
+        defaults.get("checkpoint_on_write", True),
+    )
+    on_pre_write_checkpoint = _build_pre_write_checkpoint_hook(
+        name, cwd, enabled=bool(_checkpoint_enabled),
+    )
 
     # Approval gate config — merge per-agent override on top of defaults.
     _approval_defaults = defaults.get("approval") or {}
@@ -636,13 +846,17 @@ def load_agent(name: str) -> AgentConfig:
         hooks={
             "PreToolUse": [
                 # Order matters: crontab guard first (structural rule),
-                # approval gate second (pattern-based, may await user).
+                # approval gate second (pattern-based, may await user),
+                # then checkpoint pre-write (snapshot state before mutation).
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
+                HookMatcher(hooks=[on_pre_write_checkpoint]),
             ],
             "UserPromptSubmit": [HookMatcher(hooks=[budget_hook])],
             "Stop": [HookMatcher(hooks=[on_stop])],
             "PreCompact": [HookMatcher(hooks=[on_precompact])],
+            "SubagentStart": [HookMatcher(hooks=[on_subagent_start])],
+            "PostToolUse": [HookMatcher(hooks=[on_post_write_lint])],
         },
         include_partial_messages=True,  # enable token-level streaming
         **_opts_extra,
