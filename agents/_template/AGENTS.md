@@ -62,16 +62,17 @@ Format (keep it tight — this file is loaded into my system prompt every sessio
 
 One-off facts belong in `memory/YYYY-MM-DD.md`, not here.
 
-## Writing rule: run the humanizer pass
+## Writing rule: run the humanizer pass on EVERY output (operator directive 2026-05-19)
 
-Every piece of prose I send outward — Discord replies, drafted emails, memos, blog posts, any pitch — gets the final humanizer pass before it leaves me:
+Every output I emit (Discord replies, drafted emails, memos, blog posts, any pitch, vault notes, PR descriptions, commit messages, code comments, anything an operator or human reads) runs through the humanizer pass before it leaves me. No exceptions.
 
 1. Draft.
-2. "What makes this obviously AI generated?" — answer briefly with any tells that leaked in.
-3. "Now make it not obviously AI generated." — revise.
-4. Send.
+2. "What makes this obviously AI generated?" Answer briefly with any tells that leaked in.
+3. **Scan for em-dashes (`—`) and en-dashes (`–`). Strip every one.** Zero tolerance. Replace with comma, period, parens, or colon.
+4. "Now make it not obviously AI generated." Revise.
+5. Send.
 
-Skip only for one-liners ("ok", "on it", "ack"). Full rules live in `shared/HUMANIZER.md` (already loaded into my prompt) and the deep reference is at `{AGENTOS_ROOT}/shared/humanizer-full.md`.
+Skip only for true one-liners ("ok", "on it", "ack"). Anything longer gets the full pass. Full rules live in `shared/HUMANIZER.md` (already loaded into my prompt) and the deep reference is at `{AGENTOS_ROOT}/shared/humanizer-full.md`.
 
 ## Red Lines
 

@@ -8,6 +8,7 @@ Subcommands:
   apple-subs --date       Apple subscriber state (ASC Reports API, SUBSCRIPTION).
   apple-events --date     Apple subscription events (ASC Reports API, SUBSCRIPTION_EVENT).
   apple-finance --period  Apple financial report for a region+period (YYYY-MM or QQ-YYYY).
+  apple-reviews           Apple customer reviews, newest first (ASC API).
   play-stats --start --end   Google Play install stats (Play Developer API).
   play-reviews            Google Play reviews (Play Developer API).
   play-voided             Google Play voided purchases.
@@ -167,6 +168,41 @@ def cmd_apple_sales(args: argparse.Namespace) -> int:
     return 0
 
 
+VAYU_APPLE_APP_ID = "6744126459"  # Vayu iOS appstore app id
+
+
+def cmd_apple_reviews(args: argparse.Namespace) -> int:
+    """Apple customer reviews for Vayu iOS, newest first."""
+    kid, issuer, path = _resolve_asc_auth()
+    token = _asc_jwt(kid, issuer, path)
+    app_id = args.app_id or os.environ.get("APPLE_APP_ID") or VAYU_APPLE_APP_ID
+    params = {"sort": "-createdDate", "limit": args.limit}
+    r = _asc_get(f"/apps/{app_id}/customerReviews", token, **params)
+    if r.status_code != 200:
+        print(json.dumps({"error": f"asc {r.status_code}", "body": r.text[:500]}))
+        return 1
+    body = r.json()
+    reviews = []
+    for item in body.get("data", []):
+        a = item.get("attributes", {})
+        reviews.append({
+            "id": item.get("id"),
+            "rating": a.get("rating"),
+            "title": a.get("title"),
+            "body": a.get("body"),
+            "reviewerNickname": a.get("reviewerNickname"),
+            "createdDate": a.get("createdDate"),
+            "territory": a.get("territory"),
+        })
+    out = {
+        "app_id": app_id,
+        "count": len(reviews),
+        "reviews": reviews,
+    }
+    print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
 def _play_access_token() -> str:
     """Mint a Google OAuth2 access token from the service account JSON."""
     sa_path = os.environ["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"]
@@ -249,6 +285,10 @@ def main() -> int:
     p.add_argument("--frequency", default="DAILY", choices=["DAILY", "WEEKLY", "MONTHLY", "YEARLY"])
     p.add_argument("--limit", type=int, default=0, help="Max rows in output (0 = all).")
 
+    p = sub.add_parser("apple-reviews", help="Apple customer reviews, newest first.")
+    p.add_argument("--app-id", dest="app_id", help="ASC app id, default Vayu prod.")
+    p.add_argument("--limit", type=int, default=5)
+
     sub.add_parser("play-probe", help="Verify Play SA auth + find package.")
 
     p = sub.add_parser("play-reviews", help="Play reviews.")
@@ -264,6 +304,8 @@ def main() -> int:
         return cmd_apple_probe(args)
     if args.cmd == "apple-sales":
         return cmd_apple_sales(args)
+    if args.cmd == "apple-reviews":
+        return cmd_apple_reviews(args)
     if args.cmd == "play-probe":
         return cmd_play_probe(args)
     if args.cmd == "play-reviews":

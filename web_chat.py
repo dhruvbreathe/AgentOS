@@ -32,6 +32,7 @@ from typing import AsyncIterator
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
+import session_store
 from agent_loader import load_all_agents
 from relay import Sink, run_agent
 
@@ -46,19 +47,19 @@ def esc(s) -> str:
 
 
 # ---- session persistence ---------------------------------------------------
+# Delegates to session_store: the dashboard process shares logs/sessions.json
+# with every RelayBot client, so all mutations must be merge-only + locked.
 
 def _load_sessions() -> dict[str, str]:
-    if SESSIONS_FILE.exists():
-        try:
-            return json.loads(SESSIONS_FILE.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    return session_store.load()
 
 
-def _save_sessions(data: dict[str, str]) -> None:
-    SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps(data, indent=2))
+def _set_session(key: str, session_id: str) -> None:
+    session_store.set_session(key, session_id)
+
+
+def _drop_session(key: str) -> None:
+    session_store.update({key: None})
 
 
 DEFAULT_THREAD = "default"
@@ -183,9 +184,7 @@ def _delete_thread(agent: str, thread_id: str) -> bool:
     if p.exists():
         p.unlink()
     # Drop session mapping too.
-    sessions = _load_sessions()
-    sessions.pop(_session_key(agent, thread_id), None)
-    _save_sessions(sessions)
+    _drop_session(_session_key(agent, thread_id))
     return True
 
 
@@ -330,12 +329,13 @@ async def _run_turn(agent_cfg, prompt: str, sink: WebSink,
     """Drive run_agent and push results into the sink. Session persists
     under the web:<agent>:<thread_id> key so web history stays distinct
     from Discord and each tab has its own conversation."""
-    sessions = _load_sessions()
     key = _session_key(agent_cfg.name, thread_id)
-    resume = sessions.get(key)
-
     lock = _lock(agent_cfg.name, thread_id)
     async with lock:
+        # Read the resume id INSIDE the lock: two queued turns reading
+        # before the lock both got the same stale id, and the second
+        # resumed the pre-first-turn session, forking history.
+        resume = _load_sessions().get(key)
         try:
             final, session_id = await run_agent(
                 agent_cfg, prompt, sink,
@@ -344,8 +344,7 @@ async def _run_turn(agent_cfg, prompt: str, sink: WebSink,
                 max_hops=3,
             )
             if session_id:
-                sessions[key] = session_id
-                _save_sessions(sessions)
+                _set_session(key, session_id)
             _append_history(agent_cfg.name, "assistant", final,
                             meta={"session_id": session_id},
                             thread_id=thread_id)
@@ -649,9 +648,7 @@ def delete_thread(agent: str, thread_id: str) -> JSONResponse:
     if thread_id == DEFAULT_THREAD:
         # Don't remove the default — just clear it so the tab stays.
         removed = _clear_history(agent, DEFAULT_THREAD)
-        sessions = _load_sessions()
-        sessions.pop(_session_key(agent, DEFAULT_THREAD), None)
-        _save_sessions(sessions)
+        _drop_session(_session_key(agent, DEFAULT_THREAD))
         return JSONResponse({"agent": agent, "thread_id": thread_id,
                              "cleared_lines": removed, "deleted": False})
     ok = _delete_thread(agent, thread_id)
@@ -676,9 +673,7 @@ def chat_history(agent: str, limit: int = 200,
 def chat_clear(agent: str, thread: str = DEFAULT_THREAD) -> JSONResponse:
     if agent not in _agent_map():
         raise HTTPException(404, "no such agent")
-    sessions = _load_sessions()
-    sessions.pop(_session_key(agent, thread), None)
-    _save_sessions(sessions)
+    _drop_session(_session_key(agent, thread))
     removed = _clear_history(agent, thread_id=thread)
     return JSONResponse({"agent": agent, "thread_id": thread,
                          "cleared_lines": removed, "session_reset": True})

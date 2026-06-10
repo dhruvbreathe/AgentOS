@@ -47,15 +47,59 @@ def parse_routing_header(text: str) -> dict | None:
     }
 
 
+# Cloudflare blocks UA-less / default-aiohttp-UA posts with error 1010 → 403
+# (same lesson as scripts/doctor.py). Always send an explicit UA.
+_WEBHOOK_UA = "DiscordBot (PranaAgentOS, 1.0)"
+_WEBHOOK_TIMEOUT = aiohttp.ClientTimeout(total=30)
+_CHUNK_AT = 1900  # Discord hard cap is 2000; leave headroom
+
+
+def _split_chunks(text: str, limit: int = _CHUNK_AT) -> list[str]:
+    """Split on paragraph, then line, then hard boundaries. Never silently
+    drop the tail — long handoffs used to truncate mid-sentence at 1990."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for para in text.split("\n\n"):
+        candidate = f"{cur}\n\n{para}" if cur else para
+        if len(candidate) <= limit:
+            cur = candidate
+            continue
+        if cur:
+            chunks.append(cur)
+        while len(para) > limit:
+            cut = para.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = para.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            chunks.append(para[:cut])
+            para = para[cut:].lstrip()
+        cur = para
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 async def _post_to_webhook(webhook_url: str, content: str, username: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            webhook_url, json={"content": content[:1990], "username": username}
-        ) as resp:
-            if resp.status >= 300:
-                body = await resp.text()
-                return f"webhook {resp.status}: {body[:200]}"
-    return "ok"
+    # Strip em-dashes / en-dashes before posting (operator directive 2026-05-19).
+    from text_lint import sanitize as _strip_emdash
+    content = _strip_emdash(content, agent=username, surface="send_to_agent")
+    chunks = _split_chunks(content)
+    async with aiohttp.ClientSession(
+        timeout=_WEBHOOK_TIMEOUT, headers={"User-Agent": _WEBHOOK_UA}
+    ) as session:
+        for i, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                chunk = f"{chunk}\n-# part {i + 1}/{len(chunks)}"
+            async with session.post(
+                webhook_url, json={"content": chunk[:1990], "username": username}
+            ) as resp:
+                if resp.status >= 300:
+                    body = await resp.text()
+                    return f"webhook {resp.status} on part {i + 1}/{len(chunks)}: {body[:200]}"
+    return "ok" if len(chunks) == 1 else f"ok ({len(chunks)} parts)"
 
 
 def build_comms_server(

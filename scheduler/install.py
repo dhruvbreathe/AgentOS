@@ -109,6 +109,10 @@ def build_plan() -> list[dict]:
         return []
     plan: list[dict] = []
     for agent_dir in sorted(AGENTS_DIR.iterdir()):
+        # Skip templates / hidden dirs — _template tasks were getting
+        # installed as real launchd jobs and burning a weekly run.
+        if agent_dir.name.startswith(("_", ".")):
+            continue
         tasks = agent_dir / "tasks"
         if not tasks.is_dir():
             continue
@@ -269,7 +273,13 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
 
     for entry in plan:
         plist_path = entry["plist"]
-        data = build_plist(entry)
+        try:
+            data = build_plist(entry)
+        except ValueError as e:
+            # One bad cron expression must not abort the whole apply —
+            # report it and keep installing the rest.
+            print(f"! {entry['label']}  SKIPPED: {e}")
+            continue
         plist_path.write_bytes(plistlib.dumps(data))
 
         # If already loaded, bootout first so bootstrap picks up changes.

@@ -23,9 +23,12 @@ _status() {
     ps -o pid,lstart,cmd -p $pids 2>/dev/null | head -5 || true
     if [ -f "$LOG" ]; then
         local up want
-        up="$(grep -ac 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
+        # Count only since the most recent "starting N Discord" marker —
+        # under autorestart.sh the log appends across restarts, so a naive
+        # grep -c would sum every historical login.
+        up="$(awk '/starting [0-9]+ Discord/{n=0} /logged in as/{n++} END{print n+0}' "$LOG" 2>/dev/null || echo 0)"
         up="${up:-0}"
-        want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+        want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)"
         want="${want:-?}"
         echo "clients: $up / $want"
     fi
@@ -56,13 +59,13 @@ echo "── waiting for clients to connect ──"
 # That's agents grouped by unique bot_token, which is the real Discord client count.
 want=""
 for i in $(seq 1 10); do
-    want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || true)"
+    want="$(grep -aoE 'starting [0-9]+ Discord' "$LOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)"
     [ -n "$want" ] && break
     sleep 1
 done
 want="${want:-0}"
 for i in $(seq 1 40); do
-    up="$(grep -ac 'logged in as' "$LOG" 2>/dev/null | head -1 || true)"
+    up="$(awk '/starting [0-9]+ Discord/{n=0} /logged in as/{n++} END{print n+0}' "$LOG" 2>/dev/null || echo 0)"
     up="${up:-0}"
     if [ "$want" -gt 0 ] && [ "${up:-0}" -ge "${want:-0}" ]; then
         echo "✅ $up/$want clients up"

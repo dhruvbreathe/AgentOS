@@ -5,8 +5,8 @@ guild_id_env: DISCORD_GUILD_ID
 
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
-  model: claude-opus-4-7              # pinned 2026-04-16 — GA today, subscription default not yet flipped
-  fallback_model: claude-sonnet-4-6   # 2026-04-20 — Sonnet fallback when Opus rate-limited (operator call)
+  model: claude-fable-5               # 2026-06-09: Fable 5 GA today, Mythos-class. Orchestrator-tier (main, project-manager, deepali, atlas, investor-relations) inherits this.
+  fallback_model: claude-opus-4-8     # 2026-06-09: bumped sonnet-4-6 to opus-4-8 (Opus 4.8 GA 2026-05-28, 1M context).
   permission_mode: acceptEdits
   max_turns: 40                       # was 20 — long exploration chains were getting clipped mid-turn
   # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the

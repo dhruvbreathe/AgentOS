@@ -76,7 +76,12 @@ async def request_approval(
         f"_Timeout {int(timeout_seconds)}s → auto-deny._"
     )
 
-    async with aiohttp.ClientSession() as session:
+    # UA mandatory (Cloudflare 1010 blocks default aiohttp UA); per-request
+    # 30s timeout so a hung Discord call can't wedge the approval gate.
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30),
+        headers={"User-Agent": "DiscordBot (PranaAgentOS, 1.0)"},
+    ) as session:
         # POST with wait=true so we get the full message (need its id).
         try:
             async with session.post(

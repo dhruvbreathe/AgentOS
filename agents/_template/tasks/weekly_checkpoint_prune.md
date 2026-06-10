@@ -1,6 +1,7 @@
 ---
 cron: 0 4 * * 0
 kind: systemEvent
+bootstrap: lite
 ---
 
 Weekly checkpoint pruning — silent maintenance, no Discord post.

@@ -409,9 +409,18 @@ def api_agent_clone(name: str, payload: ClonePayload):
             "needs_channel": not payload.new_channel_id}
 
 
+def _require_agent(name: str) -> str:
+    """Validate a {name} path param against real agent dirs. Blocks path
+    traversal (`name=../..`) on every task route."""
+    if name not in _list_agents():
+        raise HTTPException(404, f"no such agent: {name!r}")
+    return name
+
+
 @router.get("/api/agents/{name}/tasks/{task}")
 def api_task_get(name: str, task: str):
-    path = AGENTS_DIR / name / "tasks" / f"{task}.md"
+    _require_agent(name)
+    path = AGENTS_DIR / name / "tasks" / f"{_slugify(task)}.md"
     if not path.exists():
         raise HTTPException(404, "no such task")
     meta, body = _parse_task_file(path)
@@ -425,6 +434,7 @@ class TaskPayload(BaseModel):
 
 @router.post("/api/agents/{name}/tasks/{task}")
 def api_task_save(name: str, task: str, payload: TaskPayload):
+    _require_agent(name)
     task_safe = _slugify(task)
     path = AGENTS_DIR / name / "tasks" / f"{task_safe}.md"
     _write_task_file(path, payload.meta, payload.body)
@@ -433,7 +443,8 @@ def api_task_save(name: str, task: str, payload: TaskPayload):
 
 @router.delete("/api/agents/{name}/tasks/{task}")
 def api_task_delete(name: str, task: str):
-    path = AGENTS_DIR / name / "tasks" / f"{task}.md"
+    _require_agent(name)
+    path = AGENTS_DIR / name / "tasks" / f"{_slugify(task)}.md"
     if not path.exists():
         raise HTTPException(404, "no such task")
     path.unlink()
@@ -442,6 +453,7 @@ def api_task_delete(name: str, task: str):
 
 @router.get("/api/agents/{name}/tasks")
 def api_tasks_list(name: str):
+    _require_agent(name)
     tdir = AGENTS_DIR / name / "tasks"
     if not tdir.exists():
         return {"tasks": []}
@@ -719,7 +731,7 @@ def api_connector_toggle(name: str, connector_id: str, payload: ConnectorToggle)
 # over the Cloudflare tunnel / Vercel proxy. The dashboard is meant to be
 # operated from the same box the bot runs on; tunnel access stays read-ish.
 
-_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1"}
 # Tailscale CGNAT range — treat tailnet peers as trusted (same as localhost).
 # Cloudflare tunnel requests come from Cloudflare IPs, so those stay blocked.
 import ipaddress as _ipaddress
@@ -737,8 +749,9 @@ def _is_localhost_request(request: Request) -> bool:
             return True
     except (ValueError, TypeError):
         pass
-    host_header = (request.headers.get("host") or "").split(":")[0].strip().lower()
-    return host_header in _LOCALHOST_HOSTS
+    # No Host-header fallback: the Host header is client-controlled and a
+    # tunnel request with "Host: localhost" must NOT unlock .env writes.
+    return False
 
 
 # Conservative var-name regex: uppercase letters, digits, underscores.

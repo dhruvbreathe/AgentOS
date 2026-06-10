@@ -56,16 +56,30 @@ log = logging.getLogger("cron-trigger")
 CHUNK_LIMIT = 1900  # Discord message cap is 2000; leave room.
 
 
-async def _post_webhook(webhook_url: str, content: str, username: str) -> None:
+# Cloudflare blocks UA-less / default-aiohttp-UA posts with error 1010 → 403.
+_WEBHOOK_UA = "DiscordBot (PranaAgentOS, 1.0)"
+_WEBHOOK_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+
+async def _post_webhook(webhook_url: str, content: str, username: str) -> bool:
+    """Post (chunked) to a Discord webhook. Returns True if every chunk landed."""
+    # Strip em-dashes / en-dashes before chunking (operator directive 2026-05-19).
+    from text_lint import sanitize as _strip_emdash
+    content = _strip_emdash(content, agent=username, surface="cron_webhook")
     # Split into chunks to respect Discord's 2000-char limit.
     chunks = [content[i : i + CHUNK_LIMIT] for i in range(0, len(content), CHUNK_LIMIT)] or [content]
-    async with aiohttp.ClientSession() as session:
+    ok = True
+    async with aiohttp.ClientSession(
+        timeout=_WEBHOOK_TIMEOUT, headers={"User-Agent": _WEBHOOK_UA}
+    ) as session:
         for chunk in chunks:
             payload = {"content": chunk, "username": username}
             async with session.post(webhook_url, json=payload) as resp:
                 if resp.status >= 300:
                     body = await resp.text()
                     log.error("webhook post failed %s: %s", resp.status, body)
+                    ok = False
+    return ok
 
 
 async def _run(agent_name: str, task_name: str) -> int:
@@ -98,6 +112,18 @@ async def _run(agent_name: str, task_name: str) -> int:
     agent = load_agent(agent_name, lite=lite)
     if lite:
         log.info("Loaded %s in lite-bootstrap mode (task=%s)", agent_name, task_name)
+        # Default lite cron fires to Sonnet. Mechanical housekeeping
+        # (memory maintenance, doctor checks, health pings, audits) doesn't
+        # need Opus-grade reasoning. Task frontmatter `model:` overrides.
+        lite_model = str(fm.get("model", "")).strip() or "claude-sonnet-4-6"
+        if getattr(agent.options, "model", None) != lite_model:
+            try:
+                agent.options.model = lite_model
+                log.info("Lite override → model=%s", lite_model)
+            except Exception:
+                # ClaudeAgentOptions could be frozen in some SDK versions;
+                # fail open — Opus still runs, just slower/pricier.
+                log.warning("Could not downshift to %s; keeping default", lite_model)
 
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "
@@ -121,9 +147,13 @@ async def _run(agent_name: str, task_name: str) -> int:
             print(text)
         else:
             header = f"**[{task_name}]**\n"
-            await _post_webhook(
+            posted = await _post_webhook(
                 agent.webhook_url, header + text, username=f"{agent.name} (scheduled)"
             )
+            if not posted:
+                # Output exists in the trajectory + task log, but the operator
+                # never saw it. Nonzero exit so launchd logs show the failure.
+                return 3
         return 0
     finally:
         if oneshot:
@@ -164,12 +194,43 @@ def _cleanup_oneshot(agent_name: str, task_name: str, task_file: Path) -> None:
         log.warning("oneshot bootout failed for %s: %s", label, e)
 
 
+def _record_run(agent: str, task: str, rc: int, started: float) -> None:
+    """Append a structured run record to logs/cron_runs.jsonl. Pattern from
+    OpenClaw's gateway cron (JSONL run history) — gives doctor.py and weekly
+    health digests something better than grepping per-task text logs."""
+    import json as _json
+    import time as _time
+    from datetime import datetime, timezone
+    try:
+        path = Path(__file__).resolve().parent / "logs" / "cron_runs.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "agent": agent,
+            "task": task,
+            "exit": rc,
+            "duration_s": round(_time.monotonic() - started, 1),
+        }
+        with open(path, "a") as f:
+            f.write(_json.dumps(rec) + "\n")
+    except Exception as e:
+        log.warning("run record write failed: %s", e)
+
+
 def main() -> None:
+    import time as _time
     p = argparse.ArgumentParser()
     p.add_argument("agent", help="Agent name (folder under agents/)")
     p.add_argument("task", help="Task name (file under agents/<agent>/tasks/<task>.md)")
     args = p.parse_args()
-    sys.exit(asyncio.run(_run(args.agent, args.task)))
+    started = _time.monotonic()
+    try:
+        rc = asyncio.run(_run(args.agent, args.task))
+    except Exception:
+        _record_run(args.agent, args.task, rc=1, started=started)
+        raise
+    _record_run(args.agent, args.task, rc=rc, started=started)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

@@ -103,7 +103,10 @@ if os.environ.get("DASHBOARD_AUTH") == "1":
                 u, _, pw = decoded.partition(":")
             except Exception:
                 return Response("Bad auth", status_code=401)
-            if (u, pw) != creds:
+            # Constant-time compare — plain tuple != leaks timing info.
+            import secrets as _secrets
+            cu, cp = creds
+            if not (_secrets.compare_digest(u, cu) and _secrets.compare_digest(pw, cp)):
                 return Response("Forbidden", status_code=403)
             return await call_next(request)
 

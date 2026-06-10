@@ -18,6 +18,7 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
+import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
 from agent_tools import parse_routing_header
 from relay import DiscordMessageSink, run_agent
@@ -36,17 +37,14 @@ SESSIONS_FILE = ROOT / "logs" / "sessions.json"
 
 
 def _load_sessions() -> dict[str, str]:
-    if SESSIONS_FILE.exists():
-        try:
-            return json.loads(SESSIONS_FILE.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    return session_store.load()
 
 
-def _save_sessions(data: dict[str, str]) -> None:
-    SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps(data, indent=2))
+def _save_session(key: str, session_id: str) -> None:
+    # Merge-only write via session_store: ~15 RelayBot clients plus the
+    # dashboard all share logs/sessions.json. Whole-file rewrites from a
+    # stale snapshot were clobbering other channels' session ids.
+    session_store.set_session(key, session_id)
 
 
 # Heuristic for the Hermes-style auto-save 💾 reaction. A reply counts as
@@ -359,6 +357,7 @@ class RelayBot(discord.Client):
             placeholder,
             edit_interval=float(self.streaming_cfg.get("edit_interval_seconds", 1.2)),
             max_length=int(self.streaming_cfg.get("max_message_length", 1900)),
+            agent_name=agent.name,
         )
 
         async with self._channel_lock(channel_id):
@@ -407,7 +406,7 @@ class RelayBot(discord.Client):
                             pass
                 if session_id:
                     self.sessions[channel_id] = session_id
-                    _save_sessions(self.sessions)
+                    _save_session(channel_id, session_id)
 
                 # Mirror the agent's outbound reply into the web chat too,
                 # so operators watching the web UI see the answer alongside

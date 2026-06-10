@@ -33,6 +33,7 @@ SHARED_FILES = [
     "CAVEMAN.md",       # compressed communication mode (~75% token cut on non-customer output)
     "CONTINUATION.md",  # no-false-promises rule + scripts/defer.py for legitimate self-deferral
     "FILE_DELIVERY.md", # always attach files via webhook, not vault paths (operator rule 2026-05-14)
+    "VISUALS.md",       # visual-first output: charts for 3+ numbers, Components V2 for structure (operator hard rule 2026-06-09)
 ]
 
 
@@ -437,17 +438,17 @@ def _build_budget_hook(agent_name: str, monthly_budget: int | None,
         except Exception:
             return {}
         if block_pct is not None and pct >= block_pct:
+            # UserPromptSubmit blocking uses the TOP-LEVEL decision field;
+            # permissionDecision inside hookSpecificOutput is ignored for
+            # this event and the prompt would sail through.
             return {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"Budget: {agent_name} is at {pct:.0f}% of monthly cap "
-                        f"({used:,} / {monthly_budget:,} tokens). Hard block at "
-                        f"{block_pct}%. Operator must raise the cap in "
-                        f"agent.yaml or wait for next month."
-                    ),
-                }
+                "decision": "block",
+                "reason": (
+                    f"Budget: {agent_name} is at {pct:.0f}% of monthly cap "
+                    f"({used:,} / {monthly_budget:,} tokens). Hard block at "
+                    f"{block_pct}%. Operator must raise the cap in "
+                    f"agent.yaml or wait for next month."
+                ),
             }
         if pct >= warn_pct:
             return {
@@ -474,8 +475,9 @@ async def _block_raw_crontab(input_data, tool_use_id, context):
     cmd = input_data.get("tool_input", {}).get("command", "") or ""
     if "crontab" not in cmd:
         return {}
-    # Whitelist: both the new scheduler and the legacy installer.
-    if "scheduler/install.py" in cmd or "cron/install.py" in cmd:
+    # Whitelist: the launchd scheduler only. The legacy cron/install.py
+    # hangs in-sandbox (TCC gate) — no reason to let it through anymore.
+    if "scheduler/install.py" in cmd:
         return {}
     # Allow read-only crontab usage.
     if not _has_unsafe_crontab(cmd):

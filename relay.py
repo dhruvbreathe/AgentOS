@@ -29,6 +29,7 @@ from claude_agent_sdk import (
 
 from agent_loader import AgentConfig
 from agent_tools import build_comms_server
+from text_lint import sanitize as _strip_emdash
 
 ROOT = Path(__file__).parent
 TRAJECTORY_ROOT = ROOT / "logs" / "trajectories"
@@ -65,7 +66,9 @@ class DiscordMessageSink(Sink):
         edit_interval: float = 1.2,
         max_length: int = 1900,
         continuation_marker: str = "…",
+        agent_name: str | None = None,
     ) -> None:
+        self._agent_name = agent_name
         # `messages` grows as the reply overflows past `max_length`. The
         # first element is the placeholder we were handed; subsequent ones
         # are sent via channel.send as continuations land.
@@ -104,6 +107,9 @@ class DiscordMessageSink(Sink):
         return chunks
 
     async def _flush(self, text: str, finalizing: bool) -> None:
+        # Strip em-dashes / en-dashes before any chunking. Operator directive
+        # 2026-05-19: zero tolerance on `—` and `–` in any output.
+        text = _strip_emdash(text, agent=getattr(self, "_agent_name", None), surface="discord_sink")
         chunks = self._chunk(text)
         channel = self.messages[0].channel
         # Add placeholders for new overflow chunks.
@@ -111,16 +117,27 @@ class DiscordMessageSink(Sink):
             try:
                 new_msg = await channel.send(self.continuation)
                 self.messages.append(new_msg)
-            except Exception:
-                return  # couldn't allocate — skip this flush, try again next tick
+            except Exception as e:
+                if finalizing:
+                    # On the final flush, dropping silently means the tail of
+                    # the reply is lost forever. Log it and render what we can
+                    # into the messages we DO have.
+                    log.warning(
+                        "relay finalize: couldn't allocate overflow message "
+                        "(%s) — rendering %d/%d chunks", e, len(self.messages), len(chunks)
+                    )
+                    break
+                return  # streaming tick — skip this flush, try again next tick
         # Edit each message to its chunk content.
         empty_placeholder = "*(no output)*" if finalizing else self.continuation
         for msg, chunk in zip(self.messages, chunks):
             content = chunk[: self.max_length] if chunk else empty_placeholder
             try:
                 await msg.edit(content=content)
-            except Exception:
-                pass
+            except Exception as e:
+                # One failed edit must not eat the rest of the reply.
+                log.warning("relay _flush: edit failed on a chunk: %s", e)
+                continue
 
     async def update(self, text: str) -> None:
         now = time.monotonic()
@@ -272,8 +289,10 @@ async def run_agent(
     caller to resume a conversation in the same Discord thread next time.
     """
     options = agent.options
-    if resume_session_id:
-        options.resume = resume_session_id
+    # Always assign (never conditionally): `agent.options` is a cached object,
+    # so a stale resume id from a previous turn would leak into a fresh
+    # conversation if we only set it when truthy.
+    options.resume = resume_session_id or None
 
     # Mount the agent-comms MCP server with this turn's hop context.
     comms_server = build_comms_server(
