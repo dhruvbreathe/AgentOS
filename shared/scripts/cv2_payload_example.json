@@ -1,0 +1,18 @@
+{
+  "username": "Vayu",
+  "flags": 32768,
+  "components": [
+    {
+      "type": 17,
+      "accent_color": 5231045,
+      "components": [
+        {"type": 10, "content": "## 📊 Company signals · live pull"},
+        {"type": 14, "divider": true, "spacing": 1},
+        {"type": 10, "content": "**Revenue:** 83 active subs, MRR ~$6K CAD\n**Growth:** signups **+20% WoW** (220 vs 184), iOS sessions **+39% WoW** (450 vs 323)\n**Verdict on Sat dip:** noise. Sun and Mon both hit week highs."},
+        {"type": 12, "items": [{"media": {"url": "attachment://vayu-signals-2026-06-09.png"}, "description": "Vayu company signals infographic"}]},
+        {"type": 14, "divider": true, "spacing": 1},
+        {"type": 10, "content": "-# Watch item: 5:1 open-to-complete ratio. Sources: Supabase prod + Mixpanel segmentation, pulled live. 💨"}
+      ]
+    }
+  ]
+}
