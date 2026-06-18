@@ -415,6 +415,147 @@ def _build_approval_hook(
     return _gate
 
 
+def _build_loop_guard_hook(agent_name: str, threshold: int = 5, enabled: bool = True):
+    """Build a PreToolUse hook that aborts phantom / runaway tool-call loops
+    early, before `max_turns` burns out the whole budget.
+
+    Two failure modes are caught:
+
+    1. CONSECUTIVE identical calls. We track, per session, the last
+       (tool_name, fingerprint) where fingerprint is a stable hash of the
+       JSON-serialized tool_input. When the SAME pair arrives >= `threshold`
+       times in a row we DENY and tell the model to change approach.
+
+       Why identical-input (not just same-tool) repetition is the right
+       signal: legitimate loops vary their input — reading many files,
+       grepping many patterns, editing many locations all change
+       `tool_input` every call, so the fingerprint changes and the
+       consecutive counter resets to 1. Only a genuinely stuck agent
+       re-issues the byte-for-byte identical call. So this fires on the true
+       phantom-loop signal and leaves normal fan-out work untouched (no false
+       positives on "read 20 files").
+
+    2. EMPTY / missing / whitespace tool_name. This is the empty-name
+       phantom tool-call that Hermes #47967 dampened upstream; we keep a
+       host-side backstop so a malformed stream can't spin even once.
+
+    State is bounded:
+      - one small entry per session: (last_key, count);
+      - sessions are evicted LRU-style once we exceed _MAX_SESSIONS, and
+        idle sessions older than _SESSION_TTL_S are dropped on access.
+    Fail-open everywhere: any internal error lets the call through — a loop
+    guard must never be the thing that breaks a healthy session.
+    """
+    if not enabled or threshold is None or int(threshold) < 2:
+        # threshold < 2 is meaningless (would deny the first repeat); disable.
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    import hashlib
+    import json
+    import time
+    from collections import OrderedDict
+
+    threshold = int(threshold)
+    _MAX_SESSIONS = 256          # hard cap on tracked sessions (memory bound)
+    _SESSION_TTL_S = 3600.0      # drop a session's counter after 1h idle
+
+    # session_id -> {"key": (tool_name, fp) | None, "count": int, "ts": float}
+    # OrderedDict so we can evict the least-recently-used session cheaply.
+    _state: "OrderedDict[str, dict]" = OrderedDict()
+
+    def _fingerprint(tool_input) -> str:
+        try:
+            blob = json.dumps(tool_input, sort_keys=True, default=str)
+        except Exception:
+            blob = repr(tool_input)
+        return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _evict_if_needed(now: float) -> None:
+        # Drop expired sessions first (cheap scan, bounded by _MAX_SESSIONS).
+        stale = [s for s, v in _state.items() if now - v.get("ts", now) > _SESSION_TTL_S]
+        for s in stale:
+            _state.pop(s, None)
+        # Then enforce the hard cap LRU-style.
+        while len(_state) > _MAX_SESSIONS:
+            _state.popitem(last=False)
+
+    async def _guard(input_data, tool_use_id, context):
+        try:
+            if not isinstance(input_data, dict):
+                return {}
+            tool_name = input_data.get("tool_name")
+
+            # (2) Empty / missing / whitespace tool_name → deny immediately.
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Loop guard: empty or missing tool name. This is a "
+                            "malformed / phantom tool call. STOP emitting empty "
+                            "tool calls. Either produce a normal text reply to "
+                            "the operator, or issue a well-formed tool call with "
+                            "a concrete tool name and input."
+                        ),
+                    }
+                }
+
+            tool_input = input_data.get("tool_input", {})
+            fp = _fingerprint(tool_input)
+            key = (tool_name, fp)
+
+            now = time.monotonic()
+            sid = input_data.get("session_id") or f"agent:{agent_name}"
+
+            entry = _state.get(sid)
+            if entry is None:
+                entry = {"key": key, "count": 1, "ts": now}
+                _state[sid] = entry
+            else:
+                _state.move_to_end(sid)  # mark as recently used
+                entry["ts"] = now
+                if entry["key"] == key:
+                    entry["count"] += 1
+                else:
+                    # (1-reset) A different call arrived — reset the counter.
+                    entry["key"] = key
+                    entry["count"] = 1
+
+            _evict_if_needed(now)
+
+            # (1) Consecutive-identical threshold reached → deny.
+            if entry["count"] >= threshold:
+                # Reset so that if the operator/model legitimately retries the
+                # same call later it isn't insta-denied on the very next turn;
+                # it gets a fresh run-up to the threshold.
+                entry["count"] = 0
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Loop guard: `{tool_name}` has been called with the "
+                            f"exact same input {threshold} times in a row. You are "
+                            f"stuck in a loop and burning turns/tokens. STOP "
+                            f"repeating this identical call. Change approach: vary "
+                            f"the input, use a different tool, re-read the last "
+                            f"tool result to see why it isn't advancing you, or "
+                            f"reply to the operator explaining what's blocking "
+                            f"you. Do NOT re-issue the same call."
+                        ),
+                    }
+                }
+            return {}
+        except Exception:
+            # Fail open — the loop guard must never break a healthy session.
+            return {}
+
+    return _guard
+
+
 def _build_budget_hook(agent_name: str, monthly_budget: int | None,
                        warn_pct: float = 80.0, block_pct: float | None = None):
     """UserPromptSubmit hook — on each turn, check this agent's month-to-date
@@ -774,6 +915,19 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         enabled=bool(approval_cfg.get("enabled", True)),
     )
 
+    # Loop guard config — mirrors the approval block. Aborts phantom /
+    # runaway tool-call loops early instead of letting them burn all
+    # max_turns. Per-agent override on top of config.yaml defaults; disable
+    # with `loop_guard: {enabled: false}` in agent.yaml.
+    _loop_guard_defaults = defaults.get("loop_guard") or {}
+    _loop_guard_override = agent_cfg.get("loop_guard") or {}
+    loop_guard_cfg = {**_loop_guard_defaults, **_loop_guard_override}
+    loop_guard_hook = _build_loop_guard_hook(
+        agent_name=name,
+        threshold=int(loop_guard_cfg.get("threshold", 5)),
+        enabled=bool(loop_guard_cfg.get("enabled", True)),
+    )
+
     # Budget hook — warn / deny on monthly token cap. Per-agent override on
     # top of config.yaml defaults. Accepts either a flat int or a dict with
     # {monthly, warn_pct, block_pct}.
@@ -847,9 +1001,13 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         agents=subagents,
         hooks={
             "PreToolUse": [
-                # Order matters: crontab guard first (structural rule),
-                # approval gate second (pattern-based, may await user),
-                # then checkpoint pre-write (snapshot state before mutation).
+                # Order matters. Loop guard first (cheapest, kills phantom /
+                # runaway loops before anything awaits): matcher=None so it
+                # inspects EVERY tool call, not just Bash. Then crontab guard
+                # (structural rule), approval gate (pattern-based, may await a
+                # Discord reaction), then checkpoint pre-write (snapshot state
+                # before mutation). Any single deny blocks the call.
+                HookMatcher(hooks=[loop_guard_hook]),
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
                 HookMatcher(hooks=[on_pre_write_checkpoint]),

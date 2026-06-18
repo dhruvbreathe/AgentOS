@@ -23,7 +23,12 @@ trap '_log "autorestart wrapper stopped (SIGINT/SIGTERM)"; exit 0' INT TERM
 
 while true; do
     _log "starting bot.py"
-    ./.venv/bin/python bot.py >> logs/bot.log 2>&1 || true
+    # bot.py now OWNS logs/bot.log via a rotating logging handler. Redirect
+    # the shell's stdout/stderr to a SEPARATE file so uncaught tracebacks and
+    # bare print()s are still captured WITHOUT a second writer fighting the
+    # rotating handler over logs/bot.log. restart.sh's markers come from the
+    # logger and still land in logs/bot.log, so it is unaffected.
+    ./.venv/bin/python bot.py >> logs/bot.console.log 2>&1 || true
     EXIT_CODE=$?
     _log "bot.py exited (code $EXIT_CODE) — restarting in 3s"
     sleep 3

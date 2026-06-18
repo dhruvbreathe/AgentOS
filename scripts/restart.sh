@@ -13,6 +13,12 @@ LOG="logs/bot.log"
 mkdir -p logs
 
 _status() {
+    # service: is com.agentos.bot loaded under launchd (gui domain)?
+    if launchctl print "gui/$(id -u)/com.agentos.bot" >/dev/null 2>&1; then
+        echo "service: ✅ loaded (com.agentos.bot)"
+    else
+        echo "service: ❌ not loaded (run scripts/install_bot_service.sh)"
+    fi
     local pids
     pids="$(pgrep -f "Python bot.py" || true)"
     if [ -z "$pids" ]; then
@@ -40,6 +46,17 @@ if [ "${1:-}" = "--status" ]; then
     exit 0
 fi
 
+# If the launchd service (com.agentos.bot) owns the gateway, a manual
+# pkill + relaunch here would race the KeepAlive wrapper and briefly
+# double-run bot.py into Discord. Delegate the restart to launchd instead.
+if launchctl print "gui/$(id -u)/com.agentos.bot" >/dev/null 2>&1; then
+    echo "service com.agentos.bot is loaded — restarting via launchctl kickstart"
+    launchctl kickstart -k "gui/$(id -u)/com.agentos.bot" || true
+    sleep 3
+    _status
+    exit 0
+fi
+
 echo "── stopping ──"
 pkill -f "Python bot.py" 2>/dev/null || true
 sleep 2
@@ -50,7 +67,10 @@ if pgrep -f "Python bot.py" >/dev/null; then
 fi
 
 echo "── starting ──"
-./.venv/bin/python bot.py > "$LOG" 2>&1 &
+# bot.py owns logs/bot.log via its rotating handler; send the shell's
+# stdout/stderr to a separate console file so the two don't fight over the
+# rotated file. restart.sh still parses "$LOG" (bot.log) for the markers.
+./.venv/bin/python bot.py > logs/bot.console.log 2>&1 &
 BOT_PID=$!
 echo "pid: $BOT_PID"
 

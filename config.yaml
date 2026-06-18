@@ -5,8 +5,8 @@ guild_id_env: DISCORD_GUILD_ID
 
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
-  model: claude-fable-5               # 2026-06-09: Fable 5 GA today, Mythos-class. Orchestrator-tier (main, project-manager, deepali, atlas, investor-relations) inherits this.
-  fallback_model: claude-opus-4-8     # 2026-06-09: bumped sonnet-4-6 to opus-4-8 (Opus 4.8 GA 2026-05-28, 1M context).
+  model: claude-opus-4-8              # 2026-06-13: operator directive — Opus 4.8 primary across all agents. Inherited by main, project-manager, deepali, marketing, etc.
+  fallback_model: claude-sonnet-4-6   # 2026-06-13: Sonnet 4.6 as secondary/fallback per operator directive.
   permission_mode: acceptEdits
   max_turns: 40                       # was 20 — long exploration chains were getting clipped mid-turn
   # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the
@@ -71,6 +71,20 @@ defaults:
       - '\bcheckpoint_gate(\.py)?\s+restore\b'
       # Add site-specific regex patterns below to protect sensitive files
       # from agent edits. Example: '/path/to/important/file\.md'
+
+  # Phantom / runaway tool-call loop guard. A PreToolUse hook (runs on
+  # EVERY tool, alongside the approval gate) that DENIES a call when the
+  # SAME tool is invoked with the byte-for-byte SAME input `threshold`
+  # times in a row, or when the tool name is empty/missing/whitespace
+  # (the empty-name phantom call). Identical-input repetition is the true
+  # loop signal: legitimate fan-out (reading many files, editing many
+  # spots) varies its input every call, so the consecutive counter resets
+  # and never trips. This aborts a stuck agent in ~5 turns instead of
+  # burning all of max_turns. Disable per-agent with
+  # `loop_guard: {enabled: false}` in agent.yaml; tune with `threshold`.
+  loop_guard:
+    enabled: true
+    threshold: 5
 
 # Save-to-vault gate. Operator reacts `emoji` on any agent message to
 # persist the most recent turn (last user prompt + assistant outputs)

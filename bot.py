@@ -26,11 +26,70 @@ from transcribe import is_audio, transcribe
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+# --- Concurrent-safe rotating logging ------------------------------------
+# bot.py OWNS logs/bot.log. Under scripts/autorestart.sh the old and new
+# bot.py can briefly overlap during a restart, and logs/bot.log also grows
+# unbounded with no rotation. We attach a ROTATING file handler to the ROOT
+# logger (so discord.py's `discord.*` loggers and our child loggers —
+# agent-comms, agent-loader, transcribe, approval-gate, save-marker — all
+# propagate into the same file) plus a console StreamHandler so the terminal
+# still shows logs.
+#
+# IMPORTANT: scripts/autorestart.sh must NOT redirect shell stdout/stderr to
+# logs/bot.log anymore (it now uses logs/bot.console.log). Two writers on one
+# file fight when rotation renames it out from under the shell's fd.
+#
+# restart.sh parses logs/bot.log for `starting [0-9]+ Discord` and
+# `logged in as`; both come from the agentos logger below, so they still land
+# in bot.log unchanged.
+try:
+    # Multi-process safe: takes a cross-process file lock around rotation so
+    # the brief old+new bot.py overlap during autorestart can't corrupt the
+    # file. Preferred — see requirements.txt (concurrent-log-handler).
+    from concurrent_log_handler import ConcurrentRotatingFileHandler as _RotatingHandler
+    _CONCURRENT_LOGGING = True
+except ImportError:
+    # Fallback: stdlib RotatingFileHandler is NOT multi-process safe. If two
+    # bot.py processes overlap during a restart, a rotation by one can drop
+    # or interleave the other's lines. Install concurrent-log-handler to
+    # fully close the double-writer hazard.
+    from logging.handlers import RotatingFileHandler as _RotatingHandler
+    _CONCURRENT_LOGGING = False
+
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "bot.log"
+
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_formatter = logging.Formatter(_LOG_FORMAT)
+
+_file_handler = _RotatingHandler(
+    str(_LOG_FILE),
+    maxBytes=20 * 1024 * 1024,  # 20 MB per file
+    backupCount=5,              # bot.log + bot.log.1 .. bot.log.5 (~120 MB cap)
+    encoding="utf-8",
 )
+_file_handler.setFormatter(_formatter)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_formatter)
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+# Replace any handlers a stray basicConfig/import may have attached so we own
+# logs/bot.log exclusively (and don't double-log to console).
+for _h in list(_root.handlers):
+    _root.removeHandler(_h)
+_root.addHandler(_file_handler)
+_root.addHandler(_console_handler)
+
 log = logging.getLogger("agentos")
+log.info(
+    "logging initialized: %s (rotating 20MB x5, concurrent=%s)",
+    _LOG_FILE,
+    _CONCURRENT_LOGGING,
+)
+# -------------------------------------------------------------------------
 
 ROOT = Path(__file__).parent
 SESSIONS_FILE = ROOT / "logs" / "sessions.json"
