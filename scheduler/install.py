@@ -186,15 +186,52 @@ def bootstrap(plist_path: Path) -> tuple[int, str]:
     return r.returncode, (r.stderr or "").strip()
 
 
+def _agent_names() -> set[str]:
+    """Real agent directory names (mirrors build_plan's iteration filter)."""
+    if not AGENTS_DIR.exists():
+        return set()
+    return {
+        d.name for d in AGENTS_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(("_", "."))
+    }
+
+
+def is_managed_task_label(label: str, agents: set[str] | None = None) -> bool:
+    """True ONLY for scheduler-owned task plists of the shape
+    `com.agentos.<agent>-<task>`, where <agent> is a real agent directory.
+
+    This is the guard that stops the scheduler from reaping unrelated jobs
+    that merely share the `com.agentos` stem. On 2026-06-17 the boot-survival
+    service `com.agentos.bot` matched the old `com.agentos.*.plist` glob and
+    was booted out + deleted by `--apply`, taking the whole fleet down. The
+    bot service now lives at `com.agentos-gateway` (no dot after the stem, so
+    it can't match), and this predicate additionally ensures any future
+    `com.agentos.<x>` job that isn't an actual agent task is left untouched.
+
+    NOTE: matching against *current* agent dirs means orphaned plists for a
+    deleted agent are no longer auto-reaped by --apply — remove those with
+    --remove-all or by hand. That trade is deliberate: never delete a plist
+    we can't positively identify as ours.
+    """
+    if agents is None:
+        agents = _agent_names()
+    # Agent names themselves contain hyphens (web-developer, reddit-crawler,
+    # market-intelligence-engine), so we can't split on '-'. Match the full
+    # `com.agentos.<agent>-` prefix against each known agent instead.
+    return any(label.startswith(f"{LABEL_PREFIX}.{a}-") for a in agents)
+
+
 def list_managed() -> list[str]:
     r = _launchctl(["list"])
     if r.returncode != 0:
         return []
-    return [
-        line.split("\t")[-1]
-        for line in r.stdout.splitlines()
-        if LABEL_PREFIX + "." in line
-    ]
+    agents = _agent_names()
+    labels = []
+    for line in r.stdout.splitlines():
+        label = line.split("\t")[-1]
+        if is_managed_task_label(label, agents):
+            labels.append(label)
+    return labels
 
 
 def _cron_active_tasks() -> set[tuple[str, str]]:
@@ -227,10 +264,16 @@ def _cron_active_tasks() -> set[tuple[str, str]]:
 
 def remove_all() -> None:
     """Bootout every currently-loaded managed job and delete its plist."""
+    agents = _agent_names()
     for label in list_managed():
         rc, err = bootout(label)
         print(f"bootout {label}: rc={rc} {err or 'ok'}")
     for p in LAUNCH_AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.plist"):
+        # Only delete plists we positively own (com.agentos.<agent>-<task>).
+        # Never touch unrelated com.agentos.* jobs (e.g. a service plist).
+        if not is_managed_task_label(p.stem, agents):
+            print(f"skipped {p.name} (not a scheduler task plist)")
+            continue
         p.unlink()
         print(f"deleted {p.name}")
 
@@ -264,8 +307,14 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
     # recurring-scheduler must not clobber a pending deferred run.
     desired = {e["label"] for e in plan}
     loaded = set(list_managed())
-    # Plus plists on disk under our prefix, even if not currently loaded.
-    on_disk = {p.stem for p in LAUNCH_AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.plist")}
+    # Plus plists on disk under our prefix, even if not currently loaded —
+    # but only ones we positively own (com.agentos.<agent>-<task>), never an
+    # unrelated com.agentos.* job that happens to share the stem.
+    _agents = _agent_names()
+    on_disk = {
+        p.stem for p in LAUNCH_AGENTS_DIR.glob(f"{LABEL_PREFIX}.*.plist")
+        if is_managed_task_label(p.stem, _agents)
+    }
     stale = {
         label for label in (loaded | on_disk) - desired
         if "-_deferred_" not in label
