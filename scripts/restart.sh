@@ -13,9 +13,9 @@ LOG="logs/bot.log"
 mkdir -p logs
 
 _status() {
-    # service: is com.agentos.bot loaded under launchd (gui domain)?
-    if launchctl print "gui/$(id -u)/com.agentos.bot" >/dev/null 2>&1; then
-        echo "service: ✅ loaded (com.agentos.bot)"
+    # service: is com.agentos-gateway loaded under launchd (gui domain)?
+    if launchctl print "gui/$(id -u)/com.agentos-gateway" >/dev/null 2>&1; then
+        echo "service: ✅ loaded (com.agentos-gateway)"
     else
         echo "service: ❌ not loaded (run scripts/install_bot_service.sh)"
     fi
@@ -46,12 +46,12 @@ if [ "${1:-}" = "--status" ]; then
     exit 0
 fi
 
-# If the launchd service (com.agentos.bot) owns the gateway, a manual
+# If the launchd service (com.agentos-gateway) owns the gateway, a manual
 # pkill + relaunch here would race the KeepAlive wrapper and briefly
 # double-run bot.py into Discord. Delegate the restart to launchd instead.
-if launchctl print "gui/$(id -u)/com.agentos.bot" >/dev/null 2>&1; then
-    echo "service com.agentos.bot is loaded — restarting via launchctl kickstart"
-    launchctl kickstart -k "gui/$(id -u)/com.agentos.bot" || true
+if launchctl print "gui/$(id -u)/com.agentos-gateway" >/dev/null 2>&1; then
+    echo "service com.agentos-gateway is loaded — restarting via launchctl kickstart"
+    launchctl kickstart -k "gui/$(id -u)/com.agentos-gateway" || true
     sleep 3
     _status
     exit 0

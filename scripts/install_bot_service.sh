@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install/uninstall the com.agentos.bot LaunchAgent — the boot-survival
+# Install/uninstall the com.agentos-gateway LaunchAgent — the boot-survival
 # service for the persistent Discord gateway.
 #
 # Replaces the manual `nohup scripts/autorestart.sh &`. launchd starts the
@@ -25,7 +25,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-LABEL="com.agentos.bot"
+# NOTE: label MUST stay outside the `com.agentos.*` namespace that
+# scheduler/install.py owns — its --apply/--remove-all bootout + DELETE every
+# com.agentos.*.plist not in the task plan, which would nuke this service (it
+# did, on 2026-06-17, taking the whole fleet down). `com.agentos-gateway` does
+# not match the scheduler's `com.agentos.*.plist` glob or its substring check.
+LABEL="com.agentos-gateway"
 UID_NUM="$(id -u)"
 DOMAIN="gui/${UID_NUM}"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
