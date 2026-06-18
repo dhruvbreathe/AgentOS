@@ -90,17 +90,24 @@ def cron_to_calendar_interval(expr: str) -> list[dict]:
 
     # Reject anything we don't handle yet — fail loud so we don't silently
     # install a wrong schedule.
-    for name, val in [("minute", minute), ("hour", hour)]:
-        if not val.isdigit():
-            raise ValueError(f"unsupported {name} field {val!r} in {expr!r}")
+    if not minute.isdigit():
+        raise ValueError(f"unsupported minute field {minute!r} in {expr!r}")
+    # Hour accepts a single value ("8") or a comma list ("8,13,18").
+    hour_parts = hour.split(",")
+    if not all(p.isdigit() for p in hour_parts):
+        raise ValueError(f"unsupported hour field {hour!r} in {expr!r}")
     if dom != "*" or month != "*":
         raise ValueError(f"day-of-month / month not yet supported: {expr!r}")
 
-    base = {"Minute": int(minute), "Hour": int(hour)}
     weekdays = _parse_weekdays(dow)
-    if not weekdays:
-        return [base]
-    return [{**base, "Weekday": d} for d in weekdays]
+    entries: list[dict] = []
+    for h in hour_parts:
+        base = {"Minute": int(minute), "Hour": int(h)}
+        if not weekdays:
+            entries.append(base)
+        else:
+            entries.extend({**base, "Weekday": d} for d in weekdays)
+    return entries
 
 
 def build_plan() -> list[dict]:
