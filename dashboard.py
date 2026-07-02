@@ -197,6 +197,23 @@ def _run_doctor_json() -> list[dict]:
         return [{"error": str(e)}]
 
 
+def _run_asserts_json(days: int = 1) -> dict:
+    try:
+        out = subprocess.check_output(
+            [sys.executable, str(SCRIPTS / "assert_trajectories.py"),
+             "--all", "--days", str(days), "--json"],
+            cwd=ROOT, text=True, timeout=60,
+            stderr=subprocess.DEVNULL,
+        )
+        data = _parse_json_lenient(out)
+        if isinstance(data, dict):
+            return data
+        # legacy/lenient fallback: a bare list of reports
+        return {"reports": data, "drift": {}}
+    except Exception as e:
+        return {"reports": [], "drift": {}, "error": str(e)}
+
+
 # ---- data gathering --------------------------------------------------------
 
 def _list_agents() -> list[str]:
@@ -648,7 +665,8 @@ CSS = """
 
 NAV_ITEMS = [("/", "Overview"), ("/chat", "Chat"), ("/tasks", "Tasks"),
              ("/goals", "Goals"), ("/budgets", "Budgets"),
-             ("/activity", "Activity"), ("/schedule", "Schedule"),
+             ("/activity", "Activity"), ("/traces", "Traces"),
+             ("/asserts", "Asserts"), ("/schedule", "Schedule"),
              ("/health", "Health"), ("/vault", "Vault"), ("/search", "Search")]
 
 # Bottom-nav (mobile) — 5 primary destinations with inline SVG icons.
@@ -748,6 +766,116 @@ def _summarize_event(ev: dict) -> str:
     if t == "result":
         return f"🏁 stop={esc(ev.get('stop_reason'))} turns={esc(ev.get('num_turns','?'))}"
     return esc(t)
+
+
+# ---- handoff traces --------------------------------------------------------
+# A multi-agent system fails at the seams, not the models. These helpers stitch
+# cross-agent handoffs from trajectory JSONL so a misbehaving chain is visible:
+# routing errors, hop-ceiling stalls, A->B->A ping-pong loops, and the >=1900
+# char truncation failure mode (see LEARNINGS 2026-05-08).
+
+SEND_TOOL = "mcp__agent_comms__send_to_agent"
+TRUNCATE_LIMIT = 1900  # send_to_agent payloads at/over this silently truncate
+
+# Inbound routed prompt: "... from @<sender> (agent, hop N/M) ..."
+_ROUTED_RE = re.compile(
+    r"from\s+@?(?P<sender>[\w-]+)\s*\(agent,\s*hop\s*(?P<hop>\d+)\s*/\s*(?P<max>\d+)\)"
+)
+
+
+def _recent_trajectories(agent: str, hours: int) -> list[Path]:
+    d = TRAJ_DIR / agent
+    if not d.exists():
+        return []
+    cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+    out = [p for p in d.glob("*.jsonl") if p.stat().st_mtime >= cutoff]
+    return sorted(out, key=lambda p: p.stat().st_mtime)
+
+
+def _build_traces(hours: int = 24) -> dict:
+    """Scan every agent's recent trajectories for cross-agent handoffs.
+
+    Returns {"hops": [...chronological...], "anomalies": [...]}.
+    Each hop: {ts, kind(out|in), frm, to, hop, max, text, error, length, session}.
+    """
+    hops: list[dict] = []
+    for agent in _list_agents():
+        for path in _recent_trajectories(agent, hours):
+            pending_out: dict | None = None
+            for ev in _read_trajectory_events(path, limit=0):
+                t = ev.get("type")
+                ts = ev.get("ts", "")
+                if t == "prompt":
+                    m = _ROUTED_RE.search(ev.get("content") or "")
+                    if m:
+                        hops.append({
+                            "ts": ts, "kind": "in",
+                            "frm": m.group("sender"), "to": agent,
+                            "hop": int(m.group("hop")), "max": int(m.group("max")),
+                            "text": (ev.get("content") or "").strip()[:200],
+                            "error": False, "length": 0, "session": path.stem[:8],
+                        })
+                elif t == "tool_use" and ev.get("name") == SEND_TOOL:
+                    inp = ev.get("input") or {}
+                    msg = str(inp.get("message") or "")
+                    pending_out = {
+                        "ts": ts, "kind": "out",
+                        "frm": agent, "to": inp.get("agent", "?"),
+                        "hop": None, "max": None,
+                        "text": msg.strip()[:200], "error": False,
+                        "length": len(msg), "session": path.stem[:8],
+                    }
+                    hops.append(pending_out)
+                elif t == "tool_result" and pending_out is not None:
+                    if ev.get("is_error"):
+                        pending_out["error"] = True
+                    pending_out = None
+    hops.sort(key=lambda h: h.get("ts", ""))
+    anomalies = _trace_anomalies(hops)
+    return {"hops": hops, "anomalies": anomalies}
+
+
+def _trace_anomalies(hops: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for h in hops:
+        if h["kind"] == "out" and h["error"]:
+            out.append({"sev": "fail", "ts": h["ts"], "kind": "routing error",
+                        "detail": f'{h["frm"]} → {h["to"]} send_to_agent failed '
+                                  f'(hop cap, dead target, or relay error)'})
+        if h["kind"] == "out" and h["length"] >= TRUNCATE_LIMIT:
+            out.append({"sev": "warn", "ts": h["ts"], "kind": "truncation risk",
+                        "detail": f'{h["frm"]} → {h["to"]} message {h["length"]} chars '
+                                  f'(≥{TRUNCATE_LIMIT}, splits silently)'})
+    # Sustained A->B->A->B loop: 3+ outbound messages alternating between the
+    # same pair within 15 min. A single round-trip (2 msgs) is healthy and is
+    # NOT flagged — only a stuck back-and-forth is.
+    outs = [h for h in hops if h["kind"] == "out" and h.get("ts")]
+    run_start = 0
+    for i in range(1, len(outs) + 1):
+        prev, cur = outs[i - 1], (outs[i] if i < len(outs) else None)
+        same_pair_alt = (
+            cur is not None
+            and {prev["frm"], prev["to"]} == {cur["frm"], cur["to"]}
+            and prev["frm"] == cur["to"] and prev["to"] == cur["frm"]
+            and (_ts_gap_min(prev["ts"], cur["ts"]) or 99) <= 15
+        )
+        if not same_pair_alt:
+            run = outs[run_start:i]
+            if len(run) >= 3:
+                pair = sorted({run[0]["frm"], run[0]["to"]})
+                out.append({"sev": "warn", "ts": run[-1]["ts"], "kind": "silent loop",
+                            "detail": f'{pair[0]} ↔ {pair[1]} alternated {len(run)} hops'})
+            run_start = i
+    return sorted(out, key=lambda x: x.get("ts", ""), reverse=True)
+
+
+def _ts_gap_min(a: str, b: str) -> int | None:
+    try:
+        ta = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        tb = datetime.fromisoformat(b.replace("Z", "+00:00"))
+        return abs(int((tb - ta).total_seconds() // 60))
+    except Exception:
+        return None
 
 
 # ---- routes: pages ---------------------------------------------------------
@@ -1167,6 +1295,139 @@ def activity():
     <div class="panel">{rows or "<div class='meta'>no events</div>"}</div>
     """
     return HTMLResponse(_page("Activity", "/activity", body))
+
+
+@app.get("/traces", response_class=HTMLResponse)
+def traces_page():
+    data = _build_traces(hours=24)
+    hops, anomalies = data["hops"], data["anomalies"]
+
+    if anomalies:
+        anom_rows = "".join(
+            f'<div class="event"><span class="ts">{esc(a.get("ts","")[:19])}</span>'
+            f'<span class="agent"><span class="pill {esc(a["sev"])}">{esc(a["kind"])}</span></span>'
+            f'<span class="truncate">{esc(a["detail"])}</span></div>'
+            for a in anomalies
+        )
+        anom_html = f'<div class="panel">{anom_rows}</div>'
+    else:
+        anom_html = '<div class="panel"><div class="meta">no handoff anomalies in window — chains clean</div></div>'
+
+    def _hop_row(h: dict) -> str:
+        if h["kind"] == "out":
+            arrow = f'{esc(h["frm"])} <span class="pill accent">→</span> {esc(h["to"])}'
+            tag = "send"
+            flags = ""
+            if h["error"]:
+                flags += ' <span class="pill fail">error</span>'
+            if h["length"] >= TRUNCATE_LIMIT:
+                flags += f' <span class="pill warn">{h["length"]}c</span>'
+        else:
+            arrow = f'{esc(h["frm"])} <span class="pill dim">↳</span> {esc(h["to"])}'
+            tag = f'recv h{h["hop"]}/{h["max"]}'
+            flags = ""
+        return (
+            f'<div class="event"><span class="ts">{esc(h.get("ts","")[:19])}</span>'
+            f'<span class="agent">{arrow}</span>'
+            f'<span class="type">{tag}{flags}</span>'
+            f'<span class="truncate">{esc(h["text"])}</span></div>'
+        )
+
+    feed = "".join(_hop_row(h) for h in reversed(hops))
+    body = f"""
+    <h1>Traces</h1>
+    <div class="meta">cross-agent handoffs, last 24h — {len(hops)} hops, {len(anomalies)} anomalies</div>
+    <br>
+    <h2>Anomalies</h2>
+    {anom_html}
+    <br>
+    <h2>Handoff feed <span class="meta">(newest first)</span></h2>
+    <div class="panel">{feed or "<div class='meta'>no handoffs in window</div>"}</div>
+    """
+    return HTMLResponse(_page("Traces", "/traces", body))
+
+
+@app.get("/api/traces")
+def api_traces(hours: int = 24):
+    return JSONResponse(_build_traces(hours=hours))
+
+
+@app.get("/asserts", response_class=HTMLResponse)
+def asserts_page():
+    raw = _run_asserts_json(days=1)
+    reports = [r for r in raw.get("reports", []) if "agent" in r]
+    drift = raw.get("drift") or {}
+    err = {"error": raw["error"]} if raw.get("error") else None
+    total_fail = sum(r.get("fail", 0) for r in reports)
+    total_warn = sum(r.get("warn", 0) for r in reports)
+
+    dirty = [r for r in reports if r.get("violations")]
+    clean = [r for r in reports if r.get("sessions") and not r.get("violations")]
+
+    blocks: list[str] = []
+    for r in sorted(dirty, key=lambda r: (-r["fail"], -r["warn"])):
+        counts = " ".join(
+            f'<span class="pill {"fail" if "secret" in k else "warn"}">{esc(k)} ×{n}</span>'
+            for k, n in sorted(r["by_check"].items())
+        )
+        rows = ""
+        shown: dict[str, int] = {}
+        for v in r["violations"]:
+            if shown.get(v["check"], 0) >= 3:
+                continue
+            shown[v["check"]] = shown.get(v["check"], 0) + 1
+            sev = "fail" if v["sev"] == "fail" else "warn"
+            rows += (
+                f'<div class="event"><span class="ts">{esc(v.get("ts","")[:19])}</span>'
+                f'<span class="agent"><span class="pill {sev}">{esc(v["check"])}</span></span>'
+                f'<span class="truncate">{esc(v["detail"])}</span></div>'
+            )
+        blocks.append(
+            f'<h3><a href="/agents/{esc(r["agent"])}">{esc(r["agent"])}</a> {counts}</h3>'
+            f'<div class="panel">{rows}</div><br>'
+        )
+
+    clean_html = ""
+    if clean:
+        pills = " ".join(f'<span class="pill ok">{esc(r["agent"])}</span>' for r in clean)
+        clean_html = f'<h2>Clean</h2><div class="panel">{pills}</div>'
+
+    err_html = f'<div class="panel"><span class="pill fail">harness error</span> {esc(err["error"])}</div>' if err else ""
+    headline = ("✓ all clear" if total_fail == 0 and total_warn == 0
+                else f"{total_fail} fail, {total_warn} warn")
+
+    # dash-drift: em-dashes caught + stripped by text_lint before posting.
+    # Info only — proof the guard fires, nothing ships. NOT a violation.
+    drift_html = ""
+    if drift.get("total"):
+        top = sorted(drift.get("by_agent", {}).items(), key=lambda kv: kv[1], reverse=True)
+        agent_pills = " ".join(f'<span class="pill ok">{esc(a)} ×{n}</span>' for a, n in top)
+        surf_pills = " ".join(
+            f'<span class="pill warn">{esc(s)} ×{n}</span>'
+            for s, n in sorted(drift.get("by_surface", {}).items(), key=lambda kv: kv[1], reverse=True))
+        drift_html = (
+            f'<h2>Dash-drift <span class="meta">(caught + stripped, did NOT ship)</span></h2>'
+            f'<div class="meta">{drift["total"]} em-dashes generated then removed by text_lint in the last '
+            f'{drift.get("window_days",1)}d. Generation-hygiene signal, not a regression.</div>'
+            f'<div class="panel">by agent: {agent_pills}<br><br>by surface: {surf_pills}</div>'
+        )
+
+    body = f"""
+    <h1>Assertions</h1>
+    <div class="meta">deterministic rule checks over the last 24h of outputs, {esc(headline)}. checks measure what actually ships: leaked-secret (fail), route-over-1900 (warn).</div>
+    <br>
+    {err_html}
+    {''.join(blocks) or '<div class="panel"><div class="meta">no violations in window</div></div><br>'}
+    {drift_html}
+    <br>
+    {clean_html}
+    """
+    return HTMLResponse(_page("Assertions", "/asserts", body))
+
+
+@app.get("/api/asserts")
+def api_asserts(days: int = 1):
+    return JSONResponse(_run_asserts_json(days=days))
 
 
 @app.get("/schedule", response_class=HTMLResponse)

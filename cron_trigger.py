@@ -124,6 +124,19 @@ async def _run(agent_name: str, task_name: str) -> int:
                 # ClaudeAgentOptions could be frozen in some SDK versions;
                 # fail open — Opus still runs, just slower/pricier.
                 log.warning("Could not downshift to %s; keeping default", lite_model)
+        # The CLI refuses to start if --fallback-model equals --model. Lite
+        # crons downshift the primary to Sonnet, which collides with the
+        # default fallback_model (also Sonnet since 2026-06-13). When they
+        # match, drop the fallback so the run can start. (This silently
+        # killed every lite housekeeping cron across all agents for ~12 days.)
+        try:
+            if getattr(agent.options, "fallback_model", None) == getattr(
+                agent.options, "model", None
+            ):
+                agent.options.fallback_model = None
+                log.info("Cleared fallback_model (collided with lite model)")
+        except Exception:
+            log.warning("Could not reconcile fallback_model; run may fail")
 
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "

@@ -152,6 +152,23 @@ class RelayBot(discord.Client):
         # this cache, discord.py's 5-retry-on-429 loop keeps re-arming the
         # cooldown on every turn and the indicator never returns.
         self._typing_cooldown_until: dict[str, float] = {}
+        # A5 (2026-07-01): message_id → session_id for every message a turn
+        # posted, so a 💾 on an OLDER message saves THAT turn, not whatever
+        # session the channel currently points at. In-memory, bounded.
+        self._msg_sessions: dict[int, str] = {}
+
+    def _remember_msg_sessions(self, sink, session_id: str) -> None:
+        """Map every message this turn's sink posted to its session id.
+        Bounded FIFO (~1000 entries) so long uptimes don't grow unbounded."""
+        try:
+            for m in getattr(sink, "messages", None) or []:
+                mid = getattr(m, "id", None)
+                if mid is not None:
+                    self._msg_sessions[int(mid)] = session_id
+            while len(self._msg_sessions) > 1000:
+                self._msg_sessions.pop(next(iter(self._msg_sessions)))
+        except Exception:
+            pass  # best-effort — save falls back to channel session
 
     async def on_ready(self) -> None:
         log.info(
@@ -258,7 +275,13 @@ class RelayBot(discord.Client):
             return
 
         from save_marker import save_turn
-        session_id = self.sessions.get(channel_id)
+        # A5: prefer the session the reacted MESSAGE belongs to; fall back
+        # to the channel's current session (pre-fix behaviour) for messages
+        # posted before this mapping existed or after a restart.
+        session_id = (
+            self._msg_sessions.get(payload.message_id)
+            or self.sessions.get(channel_id)
+        )
         try:
             out_path = save_turn(
                 agent_name=agent.name,
@@ -293,9 +316,10 @@ class RelayBot(discord.Client):
         # Parse agent-to-agent routing header if present.
         routing = parse_routing_header(message.content)
         max_hops = int(
-            (self.global_cfg.get("defaults", {}) or {}).get("max_hops", 3)
+            (self.global_cfg.get("defaults", {}) or {}).get("max_hops", 8)
         )
         current_hop = 0
+        chain = ""
         sender = None
         body = message.content
 
@@ -309,6 +333,7 @@ class RelayBot(discord.Client):
                 return
             current_hop = routing["hop"]
             max_hops = routing["max"]
+            chain = routing.get("chain", "")
             sender = routing["sender"]
             body = routing["body"].strip()
             # Hard stop: if the incoming message is already at max_hops,
@@ -456,6 +481,7 @@ class RelayBot(discord.Client):
                         resume_session_id=resume,
                         current_hop=current_hop,
                         max_hops=max_hops,
+                        chain=chain,
                     )
                 finally:
                     if typing_started:
@@ -466,6 +492,9 @@ class RelayBot(discord.Client):
                 if session_id:
                     self.sessions[channel_id] = session_id
                     _save_session(channel_id, session_id)
+                    # A5: remember which messages belong to this session so
+                    # a later 💾 on them saves the right turn.
+                    self._remember_msg_sessions(sink, session_id)
 
                 # Mirror the agent's outbound reply into the web chat too,
                 # so operators watching the web UI see the answer alongside

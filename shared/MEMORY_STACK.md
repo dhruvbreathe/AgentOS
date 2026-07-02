@@ -44,10 +44,25 @@ Static identity + knowledge about my environment. Loaded every session. If I lea
 - **Trivial one-off fact →** `memory/YYYY-MM-DD.md` (raw daily journal)
 - **Recurring pattern or lesson →** `LEARNINGS.md` (my durable lessons)
 - **Environmental truth →** my `TOOLS.md` or `INTEGRATIONS.md`
-- **Cross-agent fact →** `Company/FACTS.md` (shared)
+- **Cross-agent fact →** `Company/FACTS.md` (shared), tagged with a `conf:` tier (see below)
 - **Decision →** `Company/DECISIONS.md`
 - **User pattern →** route to `deepali` (she owns user voice); she writes `Topics/` or `User-Research/`
 - **Competitive intel →** route to `market-intelligence-engine`
+
+## Confidence + source citation (memory hygiene v2, 2026-06-17)
+
+Every fact I write to `Company/FACTS.md` carries a confidence tier in its provenance comment, so a reader knows how much to trust it before citing it. This is what stops a guess from propagating into investor copy as a hard number (how "4.8 stars" and "40% anxiety reduction" leaked).
+
+Format: `key: value <!-- conf:<tier> | YYYY-MM-DD <agent> | source: <where> -->`
+
+- `conf:confirmed` — directly verified (Dhruv said it, pulled from a source-of-truth API, deck-canonical). Safe to cite as fact anywhere.
+- `conf:estimate` — derived or approximate, directionally right (`~$6K MRR`). Cite with the `~`, never round up.
+- `conf:unverified` — believed but unchecked. Keep out of outbound copy until promoted.
+- `conf:stale` — confirmed once, source has likely drifted. Re-verify before use.
+
+**When I assert one of these facts in any output** (Discord, deck, email, scrum), I cite it so the trust level travels with the number: `(per FACTS.md, conf:confirmed, 2026-05-17)`. Never present a `conf:estimate` or `conf:unverified` figure as a precise hard fact, especially in investor-facing material.
+
+Checker: `python scripts/check_facts_hygiene.py` flags any FACTS.md fact missing a tier or provenance. `--strict` exits non-zero for a cron guard.
 
 ## The save-icon — operator-pinned turns
 

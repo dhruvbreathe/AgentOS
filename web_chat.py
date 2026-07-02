@@ -341,7 +341,8 @@ async def _run_turn(agent_cfg, prompt: str, sink: WebSink,
                 agent_cfg, prompt, sink,
                 resume_session_id=resume,
                 current_hop=0,
-                max_hops=3,
+                max_hops=8,
+                chain="",
             )
             if session_id:
                 _set_session(key, session_id)

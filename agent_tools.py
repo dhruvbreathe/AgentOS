@@ -21,15 +21,25 @@ from agent_loader import load_all_agents
 
 log = logging.getLogger("agent-comms")
 
+# `chain` is an optional `>`-joined list of every agent that has already
+# routed this message (e.g. "main>backend-developer"). It is what makes true
+# loop protection possible: we refuse routing to any agent already in the
+# chain, so A→B→A is blocked instantly regardless of depth. The numeric
+# hop/max pair is now only a safety ceiling on chain DEPTH, not the loop
+# guard. Old messages without a chain segment still parse (group is None).
 ROUTING_HEADER_RE = re.compile(
     r"^📡\s*@(?P<target>[\w-]+)\s*\(via\s*@(?P<sender>[\w-]+),\s*"
-    r"hop\s*(?P<hop>\d+)/(?P<max>\d+)\)\s*\n?",
+    r"hop\s*(?P<hop>\d+)/(?P<max>\d+)"
+    r"(?:,\s*chain:\s*(?P<chain>[\w>-]+))?\)\s*\n?",
     re.MULTILINE,
 )
 
 
-def format_routing_header(target: str, sender: str, hop: int, max_hops: int) -> str:
-    return f"📡 @{target} (via @{sender}, hop {hop}/{max_hops})\n"
+def format_routing_header(
+    target: str, sender: str, hop: int, max_hops: int, chain: str = ""
+) -> str:
+    chain_part = f", chain: {chain}" if chain else ""
+    return f"📡 @{target} (via @{sender}, hop {hop}/{max_hops}{chain_part})\n"
 
 
 def parse_routing_header(text: str) -> dict | None:
@@ -43,6 +53,7 @@ def parse_routing_header(text: str) -> dict | None:
         "sender": m.group("sender"),
         "hop": int(m.group("hop")),
         "max": int(m.group("max")),
+        "chain": m.group("chain") or "",
         "body": text[m.end() :],
     }
 
@@ -106,11 +117,23 @@ def build_comms_server(
     sender_name: str,
     current_hop: int,
     max_hops: int,
+    chain: str = "",
 ):
-    """Build an SDK MCP server scoped to the current turn. `current_hop` is
-    the hop value of the incoming message; outbound messages will be
-    stamped with `current_hop + 1`. If that would exceed `max_hops`, the
-    tool refuses."""
+    """Build an SDK MCP server scoped to the current turn.
+
+    Two independent guards on outbound routing:
+
+    1. Cycle detection (the real loop guard). `chain` is the `>`-joined list
+       of every agent that already routed this message. Routing to an agent
+       already in the chain (or to yourself) is refused as a true loop, at
+       any depth. This is what lets legitimate deep fan-outs proceed: a chain
+       of fresh agents never trips it.
+    2. Depth ceiling (safety backstop). `current_hop + 1 > max_hops` refuses
+       pathological runaway depth even when every agent is distinct. The
+       ceiling is generous now (see config.yaml `max_hops`) precisely because
+       cycle detection, not the number, is doing the loop-prevention work.
+    """
+    chain_list = [c for c in chain.split(">") if c]
 
     @tool(
         "send_to_agent",
@@ -126,26 +149,48 @@ def build_comms_server(
         message = args["message"].strip()
 
         outgoing_hop = current_hop + 1
-        if outgoing_hop > max_hops:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Refused: hop limit reached ({current_hop}/{max_hops}). "
-                            f"You cannot route further. Respond in your own channel "
-                            f"or stay silent."
-                        ),
-                    }
-                ]
-            }
+        # the agent now routing joins the chain the next agent will see
+        new_chain = ">".join(chain_list + [sender_name])
 
+        # Guard 1 — cycle detection (the real loop guard).
         if target_name == sender_name:
             return {
                 "content": [
                     {
                         "type": "text",
                         "text": "Refused: you cannot route to yourself.",
+                    }
+                ]
+            }
+        if target_name in chain_list:
+            path = " → ".join(chain_list + [sender_name, target_name])
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Refused: routing to @{target_name} would form a loop "
+                            f"({path}). @{target_name} already handled this chain — "
+                            f"if you need their input again, respond in your own "
+                            f"channel and let them pick it up fresh, or pick a "
+                            f"different agent."
+                        ),
+                    }
+                ]
+            }
+
+        # Guard 2 — depth ceiling (safety backstop against runaway fan-out).
+        if outgoing_hop > max_hops:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Refused: chain-depth ceiling reached "
+                            f"({current_hop}/{max_hops}). This chain has gone deep "
+                            f"enough that it's likely runaway. Respond in your own "
+                            f"channel or stay silent."
+                        ),
                     }
                 ]
             }
@@ -178,7 +223,11 @@ def build_comms_server(
             }
 
         header = format_routing_header(
-            target=target_name, sender=sender_name, hop=outgoing_hop, max_hops=max_hops
+            target=target_name,
+            sender=sender_name,
+            hop=outgoing_hop,
+            max_hops=max_hops,
+            chain=new_chain,
         )
         full_message = header + message
 

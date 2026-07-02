@@ -10,7 +10,10 @@ one JSON record per event (prompt, assistant text, tool_use, tool_result).
 """
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import logging
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -19,6 +22,7 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeSDKClient,
+    MirrorErrorMessage,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -33,6 +37,11 @@ from text_lint import sanitize as _strip_emdash
 
 ROOT = Path(__file__).parent
 TRAJECTORY_ROOT = ROOT / "logs" / "trajectories"
+CONTEXT_USAGE_LOG = ROOT / "logs" / "context-usage.jsonl"
+
+# relay.py used `log` in two exception paths without ever defining it — a
+# latent NameError that only fired when Discord message allocation failed.
+log = logging.getLogger("relay")
 
 
 # ---- Sinks ------------------------------------------------------------
@@ -246,6 +255,63 @@ class TrajectoryLogger:
             self._fp = None
 
 
+# ---- Context-usage telemetry -------------------------------------------
+
+_CONTEXT_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate to .1 past this
+
+
+def _write_context_line(line: dict) -> None:
+    """Append one telemetry line, rotating the log once past the size cap."""
+    try:
+        if (
+            CONTEXT_USAGE_LOG.exists()
+            and CONTEXT_USAGE_LOG.stat().st_size > _CONTEXT_LOG_MAX_BYTES
+        ):
+            CONTEXT_USAGE_LOG.replace(CONTEXT_USAGE_LOG.with_suffix(".jsonl.1"))
+    except OSError:
+        pass
+    CONTEXT_USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with CONTEXT_USAGE_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+async def _capture_context_usage(
+    client: ClaudeSDKClient, agent_name: str, session_id: str | None
+) -> None:
+    """Post-turn context telemetry (SDK 0.2.110 `get_context_usage`).
+
+    Writes one JSONL line per turn to logs/context-usage.jsonl; doctor.py
+    reads the tail and flags agents drifting toward their autocompact
+    threshold. Fail-open: telemetry must never break a turn.
+    """
+    try:
+        usage = await asyncio.wait_for(client.get_context_usage(), timeout=10)
+        cats = [
+            c
+            for c in (usage.get("categories") or [])
+            if (c.get("name") or "").lower() != "free space"
+        ]
+        cats.sort(key=lambda c: -(c.get("tokens") or 0))
+        line = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "agent": agent_name,
+            "session_id": session_id,
+            "total_tokens": usage.get("totalTokens"),
+            "max_tokens": usage.get("maxTokens"),
+            "percentage": round(float(usage.get("percentage") or 0.0), 1),
+            "model": usage.get("model"),
+            "autocompact_enabled": usage.get("isAutoCompactEnabled"),
+            "autocompact_threshold": usage.get("autoCompactThreshold"),
+            "top_categories": [
+                {"name": c.get("name"), "tokens": c.get("tokens")}
+                for c in cats[:5]
+            ],
+        }
+        await asyncio.to_thread(_write_context_line, line)
+    except Exception as e:
+        log.debug("context-usage capture skipped: %s", e)
+
+
 # ---- Runner -----------------------------------------------------------
 
 def _block_text(block) -> str | None:
@@ -276,27 +342,41 @@ async def run_agent(
     sink: Sink,
     resume_session_id: str | None = None,
     current_hop: int = 0,
-    max_hops: int = 3,
+    max_hops: int = 8,
+    chain: str = "",
 ) -> tuple[str, str | None]:
     """Run `prompt` through the agent and stream into `sink`.
 
     `current_hop` is the hop value of the incoming message (0 for human input,
-    1+ for agent-to-agent). `max_hops` caps the chain. The agent_comms MCP
-    server is mounted fresh each turn with these values closure-captured,
-    so the `send_to_agent` tool enforces the hop limit automatically.
+    1+ for agent-to-agent). `max_hops` is a generous depth ceiling; the real
+    loop guard is `chain` (the `>`-joined path of agents that already routed
+    this message), which lets `send_to_agent` refuse cycles at any depth. The
+    agent_comms MCP server is mounted fresh each turn with these values
+    closure-captured, so the tool enforces both guards automatically.
 
     Returns (final_text, session_id). session_id can be persisted by the
     caller to resume a conversation in the same Discord thread next time.
     """
-    options = agent.options
-    # Always assign (never conditionally): `agent.options` is a cached object,
-    # so a stale resume id from a previous turn would leak into a fresh
-    # conversation if we only set it when truthy.
+    # Work on a per-turn shallow copy, NEVER the cached `agent.options`.
+    # `agent_loader.load_all_agents` stores one AgentConfig per channel, so the
+    # primary channel and any extra_channel_ids of the same agent share this
+    # object. `bot.py` serializes per-channel (not per-agent), so two channels
+    # of the same agent can run turns concurrently. Mutating the shared options
+    # in place leaks one turn's resume id / mcp set / allowed_tools into the
+    # other. A shallow copy is sufficient because every field we touch below is
+    # reassigned to a fresh object (scalar resume, fresh dict, fresh list) —
+    # we never mutate a nested structure in place.
+    options = copy.copy(agent.options)
+    # Always assign (never conditionally): a stale resume id from a previous
+    # turn would leak into a fresh conversation if we only set it when truthy.
     options.resume = resume_session_id or None
 
     # Mount the agent-comms MCP server with this turn's hop context.
     comms_server = build_comms_server(
-        sender_name=agent.name, current_hop=current_hop, max_hops=max_hops
+        sender_name=agent.name,
+        current_hop=current_hop,
+        max_hops=max_hops,
+        chain=chain,
     )
     mcp_servers = dict(options.mcp_servers) if isinstance(options.mcp_servers, dict) else {}
     mcp_servers["agent_comms"] = comms_server
@@ -345,6 +425,13 @@ async def run_agent(
                     for block in msg.content:
                         if isinstance(block, ToolResultBlock):
                             traj.tool_result(block.content, block.is_error)
+            elif isinstance(msg, MirrorErrorMessage):
+                # SessionStore mirror failure (after SDK retries). Local disk
+                # still has the transcript; log loudly, never render to chat.
+                log.warning(
+                    "[%s] session-store mirror error: %s",
+                    agent.name, getattr(msg, "error", msg),
+                )
             elif isinstance(msg, ResultMessage):
                 if getattr(msg, "session_id", None):
                     session_id = msg.session_id
@@ -381,6 +468,10 @@ async def run_agent(
                     "genuinely nothing more to say, reply with a single line."
                 )
                 await _drain(client)
+
+            # Post-turn context telemetry — inside the async with (needs the
+            # live CLI), after all drains so it reflects the whole turn.
+            await _capture_context_usage(client, agent.name, session_id)
     finally:
         traj.close()
 

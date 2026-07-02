@@ -13,15 +13,19 @@ Design notes:
   reference.
 - 60s default timeout. No reaction → deny. Hard default, override per-agent.
 - Approve = ✅, Deny = ❌. Any other reaction ignored.
-- The operator is the only reactor who matters. We don't filter by user id;
-  any reaction on the webhook message counts (channels are private by
-  invite, so this is fine for our setup).
+- Reactor identity (audit A8, 2026-07-01): when `operator_id` + `bot_token`
+  are provided, a qualifying reaction only counts if the operator is among
+  the reactors (verified via the bot API — webhook tokens can't see WHO
+  reacted, only counts). Verification errors keep polling rather than
+  accepting unverified (fail-safe: deny by timeout). Without operator_id /
+  bot_token we fall back to legacy any-reaction-counts behaviour.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
+import urllib.parse
 
 import aiohttp
 
@@ -43,6 +47,35 @@ def _parse_webhook_url(url: str) -> tuple[str, str] | None:
     return m.group("id"), m.group("token")
 
 
+async def _operator_reacted(
+    session: aiohttp.ClientSession,
+    bot_token: str,
+    channel_id: str,
+    message_id: str,
+    emoji: str,
+    operator_id: str,
+) -> bool | None:
+    """Check via the bot API whether the operator is among the reactors for
+    `emoji`. Returns True/False, or None when the check itself failed
+    (caller should keep polling, not accept)."""
+    url = (
+        f"https://discord.com/api/v10/channels/{channel_id}"
+        f"/messages/{message_id}/reactions/{urllib.parse.quote(emoji)}"
+    )
+    try:
+        async with session.get(
+            url, headers={"Authorization": f"Bot {bot_token}"}
+        ) as resp:
+            if resp.status >= 300:
+                log.debug("reactor check %s -> %s", emoji, resp.status)
+                return None
+            users = await resp.json()
+    except Exception as e:
+        log.debug("reactor check error: %s", e)
+        return None
+    return any(str(u.get("id")) == str(operator_id) for u in users or [])
+
+
 async def request_approval(
     webhook_url: str,
     agent_name: str,
@@ -51,6 +84,8 @@ async def request_approval(
     reason: str = "",
     timeout_seconds: float = 60.0,
     poll_interval: float = 2.5,
+    operator_id: str | None = None,
+    bot_token: str | None = None,
 ) -> tuple[str, str]:
     """Post an approval request and poll for a reaction.
 
@@ -73,7 +108,9 @@ async def request_approval(
         f"```\n{body}\n```\n"
         + (f"> {reason}\n" if reason else "")
         + f"React {APPROVE_EMOJI} to approve or {DENY_EMOJI} to deny. "
-        f"_Timeout {int(timeout_seconds)}s → auto-deny._"
+        f"_Timeout {int(timeout_seconds)}s → auto-deny. Reactions only: a "
+        f"typed reply won't reach the agent until this resolves (the turn "
+        f"holds the channel)._"
     )
 
     # UA mandatory (Cloudflare 1010 blocks default aiohttp UA); per-request
@@ -98,6 +135,10 @@ async def request_approval(
         message_id = msg.get("id")
         if not message_id:
             return "error", "webhook response missing message id"
+        channel_id = msg.get("channel_id")
+        # Identity verification is only possible with a bot token + the
+        # channel id from the webhook response.
+        verify = bool(operator_id and bot_token and channel_id)
 
         fetch_url = (
             f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}"
@@ -119,12 +160,26 @@ async def request_approval(
             for r in data.get("reactions") or []:
                 emoji = (r.get("emoji") or {}).get("name")
                 count = r.get("count", 0)
-                if count >= 1 and emoji == APPROVE_EMOJI:
+                if count < 1 or emoji not in (APPROVE_EMOJI, DENY_EMOJI):
+                    continue
+                if verify:
+                    ok = await _operator_reacted(
+                        session, bot_token, str(channel_id),
+                        str(message_id), emoji, str(operator_id),
+                    )
+                    if ok is None:
+                        continue  # check failed — keep polling, don't accept
+                    if not ok:
+                        log.info(
+                            "[%s] %s reaction %s ignored (not operator)",
+                            agent_name, tool_name, emoji,
+                        )
+                        continue
+                if emoji == APPROVE_EMOJI:
                     log.info("[%s] %s approved (%s)", agent_name, tool_name, APPROVE_EMOJI)
                     return "approve", "operator approved"
-                if count >= 1 and emoji == DENY_EMOJI:
-                    log.info("[%s] %s denied (%s)", agent_name, tool_name, DENY_EMOJI)
-                    return "deny", "operator denied"
+                log.info("[%s] %s denied (%s)", agent_name, tool_name, DENY_EMOJI)
+                return "deny", "operator denied"
 
     log.info(
         "[%s] %s approval timeout (%.0fs) — default deny",

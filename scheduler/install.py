@@ -278,9 +278,57 @@ def remove_all() -> None:
         print(f"deleted {p.name}")
 
 
+def _surface_issues(issues: list[str]) -> None:
+    """A9 (2026-07-01): a mistyped cron used to die as a print nobody read.
+    Persist install problems to logs/ and best-effort ping the main Discord
+    channel so the operator actually sees them. Never raises."""
+    if not issues:
+        return
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        with (LOG_DIR / "scheduler-install-issues.log").open("a") as f:
+            for line in issues:
+                f.write(f"{stamp} {line}\n")
+    except Exception:
+        pass
+    # Webhook (stdlib only; .env fallback for bare-terminal runs).
+    url = os.environ.get("MAIN_WEBHOOK_URL")
+    if not url:
+        try:
+            for raw in (ROOT / ".env").read_text().splitlines():
+                raw = raw.strip()
+                if raw.startswith("MAIN_WEBHOOK_URL="):
+                    url = raw.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        except Exception:
+            url = None
+    if not url:
+        return
+    try:
+        import json as _json
+        import urllib.request
+        body = "\n".join(f"- {i}" for i in issues[:10])
+        if len(issues) > 10:
+            body += f"\n- (+{len(issues) - 10} more, see logs/scheduler-install-issues.log)"
+        payload = _json.dumps({
+            "username": "scheduler",
+            "content": f"⚠️ **scheduler/install.py: {len(issues)} issue(s)**\n{body}",
+        }).encode()
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "VayuAgentOS/1.0 (+https://vayu-prana.com)"},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception:
+        pass
+
+
 def apply_plan(plan: list[dict], force: bool = False) -> None:
     LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    issues: list[str] = []  # A9: collected and surfaced at the end
 
     # Skip anything still firing from legacy user crontab (would double-trigger).
     cron_active = _cron_active_tasks()
@@ -299,6 +347,9 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
             )
             for entry in skipped:
                 print(f"  - {entry['agent']}/{entry['task']}")
+            issues.extend(
+                f"legacy-crontab skip: {e['agent']}/{e['task']}" for e in skipped
+            )
         plan = [e for e in plan if (e["agent"], e["task"]) not in cron_active]
 
     # Determine which labels we're keeping; anything managed but not in the plan
@@ -335,6 +386,7 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
             # One bad cron expression must not abort the whole apply —
             # report it and keep installing the rest.
             print(f"! {entry['label']}  SKIPPED: {e}")
+            issues.append(f"bad cron, NOT installed: {entry['label']} ({e})")
             continue
         plist_path.write_bytes(plistlib.dumps(data))
 
@@ -344,6 +396,10 @@ def apply_plan(plan: list[dict], force: bool = False) -> None:
         rc, err = bootstrap(plist_path)
         status = "ok" if rc == 0 else f"ERR rc={rc} {err}"
         print(f"+ {entry['label']}  ({entry['cron']})  {status}")
+        if rc != 0:
+            issues.append(f"bootstrap failed: {entry['label']} rc={rc} {err}")
+
+    _surface_issues(issues)
 
 
 def describe_plan(plan: list[dict]) -> None:

@@ -56,7 +56,8 @@ Use `prompt_file:` instead of inline `prompt:` to pull a longer prompt from a sk
 
 ## Rules
 
-1. **One subagent call per turn, usually.** If I find myself spawning three subagents, I should probably be routing to a real agent instead.
-2. **Subagents don't have my identity.** Don't give them tools that would speak as me in Discord. `send_to_agent` is not in any subagent's tool list by default.
-3. **Keep prompts tight.** A subagent with a 2-page prompt defeats the purpose. 5–10 lines of instruction, clear output shape, go.
-4. **Prefer cheap models for scoped work.** Haiku or Sonnet, not Opus, unless the task genuinely needs deep reasoning.
+1. **Parallel fan-out is allowed for read-only research (B4, 2026-07-02).** Up to **3 subagents in one message** when the subtasks are independent and read-only (multi-source research, competitive scans, digest assembly). Send all Task calls in the SAME message so they run concurrently; sequential spawning wastes the whole point. Beyond 3, or for anything that writes or acts externally, route to a real agent instead.
+2. **One WRITING subagent at a time.** Parallel subagents that mutate files can race each other. Fan-out is for reading and analysis; writes stay serial.
+3. **Subagents don't have my identity.** Don't give them tools that would speak as me in Discord. `send_to_agent` is not in any subagent's tool list by default.
+4. **Keep prompts tight.** A subagent with a 2-page prompt defeats the purpose. 5–10 lines of instruction, clear output shape, go.
+5. **Prefer cheap models for scoped work.** Haiku or Sonnet, not Opus, unless the task genuinely needs deep reasoning.

@@ -192,6 +192,45 @@ def check_launchd_tasks(rep: AgentReport, agent_name: str, tasks_dir: Path) -> N
         rep.add("launchd_tasks", "ok", f"{len(task_files)} loaded")
 
 
+def check_cron_runs(rep: AgentReport, agent_name: str, tasks_dir: Path) -> None:
+    """Scan each task's run log for a recent failure.
+
+    check_launchd_tasks only confirms a plist is LOADED — it cannot see a cron
+    that fires and exits non-zero every time. That blind spot hid a 12-day,
+    27-cron outage (model==fallback collision, 2026-06-13). This reads the tail
+    of logs/<agent>-<task>.log and flags failure signatures so a silently
+    broken cron surfaces within a day instead of never.
+    """
+    if not tasks_dir.exists():
+        return
+    fail_sig = ("exit code 1", "ProcessError", "Traceback (most recent call last)",
+                "Not logged in", "ModuleNotFoundError")
+    # Markers that begin a single cron run — scope failure detection to the
+    # LAST run only, so a fix shows green on the next successful fire instead
+    # of lingering until old tracebacks scroll out of the window.
+    run_start = ("cron-trigger: Loaded", "Scheduled task `",
+                 "Using bundled Claude Code CLI")
+    broken: list[str] = []
+    for tf in sorted(tasks_dir.glob("*.md")):
+        log = LOGS_DIR / f"{agent_name}-{tf.stem}.log"
+        if not log.exists():
+            continue
+        try:
+            text = log.read_text(errors="ignore")[-12000:]
+        except Exception:
+            continue
+        # isolate the last run
+        cut = max((text.rfind(m) for m in run_start), default=-1)
+        last_run = text[cut:] if cut >= 0 else text[-4000:]
+        if any(sig in last_run for sig in fail_sig):
+            broken.append(tf.stem)
+    if broken:
+        rep.add("cron_runs", "fail",
+                f"{len(broken)} cron(s) failing: {', '.join(broken[:4])}")
+    else:
+        rep.add("cron_runs", "ok", "no recent cron failures")
+
+
 def check_trajectory(rep: AgentReport, agent_name: str) -> None:
     traj_dir = LOGS_DIR / "trajectories" / agent_name
     if not traj_dir.exists():
@@ -206,6 +245,63 @@ def check_trajectory(rep: AgentReport, agent_name: str) -> None:
         rep.add("trajectory", "warn", f"{latest.name} is empty")
     else:
         rep.add("trajectory", "ok", f"{latest.name} ({size // 1024}KB)")
+
+
+_context_latest_cache: dict[str, dict] | None = None
+
+
+def _context_latest() -> dict[str, dict]:
+    """Latest context-usage telemetry line per agent (relay writes these
+    post-turn on SDK 0.2.110). Parsed once per doctor run."""
+    global _context_latest_cache
+    if _context_latest_cache is not None:
+        return _context_latest_cache
+    latest: dict[str, dict] = {}
+    path = LOGS_DIR / "context-usage.jsonl"
+    if path.exists():
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    line = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(line, dict) and line.get("agent"):
+                    latest[line["agent"]] = line  # file is chronological
+        except OSError:
+            pass
+    _context_latest_cache = latest
+    return latest
+
+
+def check_context_usage(rep: AgentReport, agent_name: str) -> None:
+    """Flag agents whose live session context is drifting toward autocompact.
+
+    Thresholds are fractions of the autocompact threshold (or of the
+    effective max when the CLI doesn't report one): >=85% fail, >=60% warn.
+    """
+    line = _context_latest().get(agent_name)
+    if not line:
+        rep.add("context", "ok", "no telemetry yet")
+        return
+    total = line.get("total_tokens") or 0
+    limit = line.get("autocompact_threshold") or line.get("max_tokens") or 0
+    if not total or not limit:
+        rep.add("context", "ok", "telemetry incomplete")
+        return
+    frac = total / limit
+    detail = (
+        f"{total // 1000}k of {limit // 1000}k autocompact budget "
+        f"({frac * 100:.0f}%), window {line.get('percentage')}% used"
+    )
+    if frac >= 0.85:
+        rep.add("context", "fail", f"near autocompact: {detail}")
+    elif frac >= 0.60:
+        rep.add("context", "warn", detail)
+    else:
+        rep.add("context", "ok", detail)
 
 
 def check_env_completeness(rep: AgentReport, cfg: dict, dotenv: dict[str, str]) -> None:
@@ -242,7 +338,9 @@ def check_agent(agent_dir: Path, dotenv: dict[str, str]) -> AgentReport:
     check_bot_token(rep, bot_token)
 
     check_launchd_tasks(rep, agent_dir.name, agent_dir / "tasks")
+    check_cron_runs(rep, agent_dir.name, agent_dir / "tasks")
     check_trajectory(rep, agent_dir.name)
+    check_context_usage(rep, agent_dir.name)
     check_env_completeness(rep, cfg, dotenv)
     return rep
 

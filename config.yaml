@@ -5,8 +5,8 @@ guild_id_env: DISCORD_GUILD_ID
 
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
-  model: claude-opus-4-8              # 2026-06-13: operator directive — Opus 4.8 primary across all agents. Inherited by main, project-manager, deepali, marketing, etc.
-  fallback_model: claude-sonnet-4-6   # 2026-06-13: Sonnet 4.6 as secondary/fallback per operator directive.
+  model: claude-fable-5               # 2026-07-01: operator directive, Fable 5 primary across all agents (supersedes 2026-06-13 Opus 4.8). Validated live via CLI 2.1.197 (--model claude-fable-5, exit 0). Inherited by main, project-manager, deepali, marketing, etc.
+  fallback_model: claude-opus-4-8     # 2026-07-01: Opus 4.8 demoted to fallback (was Sonnet 4.6). Distinct from primary so the SDK fallback constraint holds.
   permission_mode: acceptEdits
   max_turns: 40                       # was 20 — long exploration chains were getting clipped mid-turn
   # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the
@@ -29,16 +29,25 @@ defaults:
   # can draft task files under agents/<self>/tasks/ for the managed
   # scheduler. Add extra absolute paths here for site-specific needs.
   add_dirs: []
-  # Cap for agent-to-agent message chains. A hop chain of N means up to
-  # N+1 messages total (root human prompt + N agent bounces). 3 is a
-  # conservative default that prevents runaway loops but allows real
-  # two-round-trip collaboration.
-  max_hops: 3
+  # Safety ceiling on agent-to-agent chain DEPTH. This is no longer the loop
+  # guard — cycle detection in agent_tools.py refuses routing to any agent
+  # already in the chain (A→B→A blocked at any depth), so legitimate deep
+  # fan-outs (Atlas needs Aria AND Ravi, who each need someone else) proceed
+  # freely. max_hops only stops pathological runaway depth where every agent
+  # is distinct. 8 gives real multi-agent collaboration room while still
+  # capping a fan-out gone wrong.
+  max_hops: 8
   # Extended thinking. "adaptive" lets the model decide when to think;
   # trivial tasks stay fast, non-trivial ones surface a ThinkingBlock so
   # the operator can see reasoning live in Discord. Per-agent override
   # available in agent.yaml.
   thinking: adaptive
+  # Reasoning effort. "max" = ultra-code mode: the model spends the most
+  # reasoning it can before acting. Operator directive 2026-07-01 (Fable 5
+  # ultra-code). Combined with adaptive thinking this is the max-reasoning
+  # coding config. Per-agent override via `effort:` in agent.yaml — noisy
+  # ack-only agents can drop to "medium"/"low" to save cost/latency.
+  effort: max
 
   # Exec-approval gate. When a Bash command matches one of these regex
   # patterns, the agent's PreToolUse hook posts an approval request to
@@ -49,6 +58,9 @@ defaults:
     enabled: true
     timeout_seconds: 60
     poll_interval_seconds: 2.5
+    # A8 (2026-07-01): only this Discord user's ✅/❌ counts. Verified via
+    # the relay bot token; without it the gate falls back to any-reaction.
+    operator_id: "702395666227265617"   # Dhruv
     dangerous_patterns:
       - '\brm\s+-rf?\b'            # rm -rf anything
       - '\bgit\s+push\s+[^|;&]*--force'
@@ -71,6 +83,33 @@ defaults:
       - '\bcheckpoint_gate(\.py)?\s+restore\b'
       # Add site-specific regex patterns below to protect sensitive files
       # from agent edits. Example: '/path/to/important/file\.md'
+    # A2 (2026-07-02): Write/Edit to these paths needs the same ✅ approval
+    # as dangerous Bash — closes the file-tool bypass and makes the
+    # protections APPROVALS.md documents (DECISIONS.md, .env) actually
+    # hold. Regexes match the tool call's file_path.
+    protected_paths:
+      - 'Company/DECISIONS\.md$'                  # decisions log = sign-off surface
+      - '(^|/)\.env(\.[A-Za-z0-9_.-]+)?$'         # secrets
+      - '\.claude/settings(\.local)?\.json$'      # permission allowlists
+      - 'agents/[^/]+/agent\.yaml$'               # per-agent tools/model/privileges
+      - 'ClaudeAgentSDK/config\.yaml$'            # this file — the gate itself
+
+  # Session transcript mirror (SDK >= 0.2.110 SessionStore). Every session's
+  # JSONL is mirrored so transcripts survive the CLI's cleanup sweep and
+  # become fork/list/delete-able via the SDK session APIs. Resume
+  # materializes from the mirror once a session has been mirrored; sessions
+  # that predate the mirror fall through to the CLI's local transcripts
+  # (zero-import migration, 2026-07-01).
+  # backend: "supabase" = Agent Nervous System project (agents.session_store,
+  # env SUPABASE_AGENT_NS_*; falls back to file if env missing, circuit-opens
+  # on outage — Supabase down degrades to pre-mirror behavior, never breaks
+  # resume). "file" = logs/session_store/<project_key>/.
+  # Per-agent opt-out: `session_store: {enabled: false}`.
+  session_store:
+    enabled: true
+    backend: supabase       # 2026-07-01, Dhruv: "Ok go" — was "file"
+    dir: logs/session_store # file backend + fallback target
+    flush: batched          # "eager" = flush per frame (near-realtime, chattier I/O)
 
   # Phantom / runaway tool-call loop guard. A PreToolUse hook (runs on
   # EVERY tool, alongside the approval gate) that DENIES a call when the

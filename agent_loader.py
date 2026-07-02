@@ -2,8 +2,10 @@
 ClaudeAgentOptions. One agent per Discord channel."""
 from __future__ import annotations
 
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,10 +16,52 @@ _CRONTAB_READONLY_RE = re.compile(r"^\s+(-l|--list)\b")
 import yaml
 from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
 
+import session_store_supabase
+from session_store_file import FileSessionStore
+
 ROOT = Path(__file__).parent
 AGENTS_DIR = ROOT / "agents"
 SHARED_DIR = ROOT / "shared"
 GLOBAL_CONFIG = ROOT / "config.yaml"
+
+# One store instance per backend/target, shared by every agent in this
+# process — the per-key asyncio locks inside the stores only serialise
+# appends if all agents route through the same instance.
+_file_session_stores: dict[str, FileSessionStore] = {}
+_supabase_session_store: list[object] = []  # [store] once built; [] = unbuilt
+_supabase_fallback_logged = False
+
+
+def _get_file_session_store(root: Path) -> FileSessionStore:
+    key = str(root)
+    store = _file_session_stores.get(key)
+    if store is None:
+        store = FileSessionStore(root)
+        _file_session_stores[key] = store
+    return store
+
+
+def _get_session_store(ss_cfg: dict) -> object:
+    """Resolve the configured backend; supabase falls back to file when the
+    Agent NS env isn't wired, so a missing key degrades loudly-but-safely."""
+    global _supabase_fallback_logged
+    backend = str(ss_cfg.get("backend") or "file").lower()
+    if backend == "supabase":
+        if not _supabase_session_store:
+            _supabase_session_store.append(session_store_supabase.from_env())
+        store = _supabase_session_store[0]
+        if store is not None:
+            return store
+        if not _supabase_fallback_logged:
+            logging.getLogger("agent-loader").warning(
+                "session_store backend=supabase but SUPABASE_AGENT_NS_URL/"
+                "SERVICE_ROLE_KEY missing — falling back to file store"
+            )
+            _supabase_fallback_logged = True
+    ss_dir = Path(ss_cfg.get("dir") or "logs/session_store")
+    if not ss_dir.is_absolute():
+        ss_dir = ROOT / ss_dir
+    return _get_file_session_store(ss_dir)
 
 # Universal files that get prepended to every agent's system prompt.
 # Concise, hard rules that don't vary per agent (writing style, safety, etc.).
@@ -368,9 +412,14 @@ def _build_approval_hook(
     timeout_seconds: float,
     poll_interval_seconds: float,
     enabled: bool,
+    operator_id: str | None = None,
 ):
     """Build a PreToolUse hook that gates dangerous Bash commands behind
-    a Discord reaction approval. Closure-captures agent context."""
+    a Discord reaction approval. Closure-captures agent context.
+
+    A8 (2026-07-01): when `operator_id` is configured and the relay bot
+    token is available, only the operator's reaction counts. Both absent →
+    legacy any-reaction behaviour."""
     from approval_gate import compile_patterns, match_dangerous, request_approval
 
     if not enabled or not webhook_url or not patterns:
@@ -395,6 +444,8 @@ def _build_approval_hook(
             reason=f"Matched dangerous pattern: `{hit}`",
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval_seconds,
+            operator_id=operator_id,
+            bot_token=os.environ.get("DISCORD_BOT_TOKEN"),
         )
         if decision == "approve":
             return {}  # pass through
@@ -408,6 +459,153 @@ def _build_approval_hook(
                     f"actually wants this to run, they can react ✅ to the "
                     f"approval message in Discord, or re-ask with an explicit "
                     f"operator instruction after approving."
+                ),
+            }
+        }
+
+    return _gate
+
+
+def _build_write_gate_hook(
+    agent_name: str,
+    webhook_url: str | None,
+    protected_paths: list,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    enabled: bool,
+    operator_id: str | None = None,
+):
+    """A2 (2026-07-02): gate Write/Edit on protected paths behind the same
+    Discord reaction approval as dangerous Bash. Closes the bypass where
+    rm-equivalent damage lands via file tools instead of Bash, and makes
+    APPROVALS.md's documented protections (DECISIONS.md, .env) actually
+    hold for Write/Edit. Regexes match against the tool's file_path."""
+    from approval_gate import compile_patterns, match_dangerous, request_approval
+
+    if not enabled or not webhook_url or not protected_paths:
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    compiled = compile_patterns(protected_paths)
+
+    async def _gate(input_data, tool_use_id, context):
+        tool = input_data.get("tool_name")
+        if tool not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            return {}
+        ti = input_data.get("tool_input", {}) or {}
+        path = ti.get("file_path") or ti.get("notebook_path") or ""
+        if not path:
+            return {}
+        hit = match_dangerous(path, compiled)
+        if not hit:
+            return {}
+        # Compact preview so the operator sees WHAT changes, not just where.
+        if tool == "Write":
+            body = (ti.get("content") or "")[:280]
+            preview = f"{path}\n--- new content (first 280 chars) ---\n{body}"
+        else:
+            old = (ti.get("old_string") or "")[:140]
+            new = (ti.get("new_string") or "")[:140]
+            preview = f"{path}\n--- old ---\n{old}\n--- new ---\n{new}"
+        decision, detail = await request_approval(
+            webhook_url=webhook_url,
+            agent_name=agent_name,
+            tool_name=tool,
+            command=preview,
+            reason=f"Protected path: `{hit}`",
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval_seconds,
+            operator_id=operator_id,
+            bot_token=os.environ.get("DISCORD_BOT_TOKEN"),
+        )
+        if decision == "approve":
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Write gate: {decision} ({detail}). `{path}` is a "
+                    f"protected path (`{hit}`). If this edit is genuinely "
+                    f"wanted, the operator can react ✅ on the approval "
+                    f"message in Discord and ask again."
+                ),
+            }
+        }
+
+    return _gate
+
+
+def _build_facts_hygiene_hook(agent_name: str, enabled: bool = True):
+    """PreToolUse gate on Write/Edit to Company/FACTS.md. Denies any write
+    that would add a fact line missing its `conf:<tier>` provenance tag, so
+    untagged guesses can't propagate into investor copy (the failure mode that
+    leaked "4.8 stars" / "40% anxiety reduction"). Reuses the exact scan logic
+    from scripts/check_facts_hygiene.py so the gate and the audit stay in sync.
+
+    Fail-open on every error path: if the checker can't load or the proposed
+    text can't be reconstructed, the write passes. A hygiene gate must never
+    block legitimate work because of its own bug.
+    """
+    if not enabled:
+        async def _noop(input_data, tool_use_id, context):
+            return {}
+        return _noop
+
+    scan_fn = None
+    try:
+        scripts_dir = str(ROOT / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from check_facts_hygiene import scan as scan_fn  # type: ignore
+    except Exception:
+        scan_fn = None
+
+    async def _gate(input_data, tool_use_id, context):
+        if scan_fn is None:
+            return {}
+        tool = input_data.get("tool_name")
+        if tool not in ("Write", "Edit"):
+            return {}
+        ti = input_data.get("tool_input", {}) or {}
+        fp = str(ti.get("file_path", "") or "")
+        if not fp.endswith("FACTS.md"):
+            return {}
+        try:
+            if tool == "Write":
+                proposed = ti.get("content", "") or ""
+            else:  # Edit — reconstruct the resulting file text, then scan it
+                old = ti.get("old_string", "")
+                new = ti.get("new_string", "")
+                try:
+                    current = Path(fp).read_text()
+                except Exception:
+                    current = ""
+                if ti.get("replace_all"):
+                    proposed = current.replace(old, new)
+                else:
+                    proposed = current.replace(old, new, 1)
+            findings = scan_fn(proposed)
+        except Exception:
+            return {}  # fail-open
+        if not findings:
+            return {}
+        preview = "; ".join(
+            f"L{f.get('line')} {f.get('issue')}: {f.get('text')}" for f in findings[:5]
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"FACTS.md hygiene gate: {len(findings)} fact line(s) lack a "
+                    f"valid conf:<tier> provenance tag ({preview}). Every fact "
+                    f"needs a provenance comment like "
+                    f"`<!-- conf:confirmed | YYYY-MM-DD <agent> | source: X -->` "
+                    f"with tier one of confirmed/estimate/unverified/stale. Add "
+                    f"the tier + provenance and retry — this is what keeps "
+                    f"untagged guesses out of investor-facing copy."
                 ),
             }
         }
@@ -823,18 +1021,33 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
     bot_token = os.environ.get(bot_token_env) if bot_token_env else None
 
     # Merge tool lists: defaults + agent-specific
-    allowed = list(
-        {
-            *(defaults.get("allowed_tools") or []),
-            *(agent_cfg.get("allowed_tools") or []),
-        }
+    # Ordered dedup (not set()) so the tool list is deterministic across
+    # loads/turns: defaults first, then per-agent additions, first occurrence
+    # wins. Then subtract disallowed from allowed so a tool named in both
+    # resolves to denied (least-privilege) with no ambiguity.
+    def _ordered_dedup(*lists: list) -> list:
+        seen: set = set()
+        out: list = []
+        for lst in lists:
+            for item in lst or []:
+                if item not in seen:
+                    seen.add(item)
+                    out.append(item)
+        return out
+
+    disallowed = _ordered_dedup(
+        defaults.get("disallowed_tools") or [],
+        agent_cfg.get("disallowed_tools") or [],
     )
-    disallowed = list(
-        {
-            *(defaults.get("disallowed_tools") or []),
-            *(agent_cfg.get("disallowed_tools") or []),
-        }
-    )
+    _disallowed_set = set(disallowed)
+    allowed = [
+        t
+        for t in _ordered_dedup(
+            defaults.get("allowed_tools") or [],
+            agent_cfg.get("allowed_tools") or [],
+        )
+        if t not in _disallowed_set
+    ]
 
     cwd = agent_cfg.get("cwd") or _resolve_vault_path(global_cfg)
 
@@ -902,6 +1115,15 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         name, cwd, enabled=bool(_checkpoint_enabled),
     )
 
+    # FACTS.md hygiene gate — deny writes that add untagged facts to the
+    # shared Company/FACTS.md. Default ON; per-agent opt-out via
+    # `facts_hygiene_gate: false`. Fail-open by construction.
+    _facts_gate_enabled = agent_cfg.get(
+        "facts_hygiene_gate",
+        defaults.get("facts_hygiene_gate", True),
+    )
+    on_facts_hygiene = _build_facts_hygiene_hook(name, enabled=bool(_facts_gate_enabled))
+
     # Approval gate config — merge per-agent override on top of defaults.
     _approval_defaults = defaults.get("approval") or {}
     _approval_override = agent_cfg.get("approval") or {}
@@ -913,6 +1135,27 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         timeout_seconds=float(approval_cfg.get("timeout_seconds", 60)),
         poll_interval_seconds=float(approval_cfg.get("poll_interval_seconds", 2.5)),
         enabled=bool(approval_cfg.get("enabled", True)),
+        # A8: reactor identity. config approval.operator_id, env override.
+        operator_id=str(
+            approval_cfg.get("operator_id")
+            or os.environ.get("DISCORD_OPERATOR_ID")
+            or ""
+        ) or None,
+    )
+    # A2: Write/Edit twin of the Bash gate — protected file paths need the
+    # same ✅ before mutation. Shares timeout/operator config with approval.
+    write_gate_hook = _build_write_gate_hook(
+        agent_name=name,
+        webhook_url=webhook_url,
+        protected_paths=approval_cfg.get("protected_paths") or [],
+        timeout_seconds=float(approval_cfg.get("timeout_seconds", 60)),
+        poll_interval_seconds=float(approval_cfg.get("poll_interval_seconds", 2.5)),
+        enabled=bool(approval_cfg.get("enabled", True)),
+        operator_id=str(
+            approval_cfg.get("operator_id")
+            or os.environ.get("DISCORD_OPERATOR_ID")
+            or ""
+        ) or None,
     )
 
     # Loop guard config — mirrors the approval block. Aborts phantom /
@@ -980,6 +1223,24 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         elif isinstance(_tb, dict) and "total" in _tb:
             _opts_extra["task_budget"] = {"total": int(_tb["total"])}
 
+    # Session transcript mirror (SDK >= 0.2.110). One process-wide store
+    # mirrors every session's JSONL — backend "supabase" (Agent Nervous
+    # System project, schema=agents) or "file" (logs/session_store/).
+    # Resume materializes from the mirror once a session has been mirrored;
+    # sessions the store has never seen fall through to the CLI's own local
+    # transcripts, so pre-migration conversations keep resuming unchanged.
+    # Skipped when file checkpointing is on — the SDK forbids the combo
+    # (validate_session_store_options raises). Per-agent opt-out:
+    # `session_store: {enabled: false}` in agent.yaml.
+    _ss_raw = {
+        **(defaults.get("session_store") or {}),
+        **(agent_cfg.get("session_store") or {}),
+    }
+    if _ss_raw.get("enabled") and not _opts_extra.get("enable_file_checkpointing"):
+        _opts_extra["session_store"] = _get_session_store(_ss_raw)
+        if _ss_raw.get("flush") in ("batched", "eager"):
+            _opts_extra["session_store_flush"] = _ss_raw["flush"]
+
     options = ClaudeAgentOptions(
         system_prompt=system_prompt or None,
         allowed_tools=allowed,
@@ -1010,6 +1271,12 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
                 HookMatcher(hooks=[loop_guard_hook]),
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
+                HookMatcher(matcher="Write", hooks=[on_facts_hygiene]),
+                HookMatcher(matcher="Edit", hooks=[on_facts_hygiene]),
+                # A2: protected-path gate AFTER the cheap local checks (it
+                # may await a Discord reaction), BEFORE the checkpoint.
+                HookMatcher(matcher="Write", hooks=[write_gate_hook]),
+                HookMatcher(matcher="Edit", hooks=[write_gate_hook]),
                 HookMatcher(hooks=[on_pre_write_checkpoint]),
             ],
             "UserPromptSubmit": [HookMatcher(hooks=[budget_hook])],

@@ -14,8 +14,13 @@ Approval is required for Bash commands matching any of these patterns (configure
 - **Remote-execute patterns:** `curl … | sh`, `curl … | bash`, `wget … | sh`
 - **Process killing:** `killall <name>`
 - **Shutdown/reboot**
-- **Writes to `Company/DECISIONS.md`** in the vault (it's the decisions log; edits deserve sign-off)
-- **Touching `.env` files** (secrets)
+**Write/Edit tools are gated too** (since 2026-07-02, `defaults.approval.protected_paths`) — the file-tool twin of the Bash gate. Editing any of these paths posts the same 🔐 request, with a preview of the change:
+
+- **`Company/DECISIONS.md`** in the vault (decisions log; edits deserve sign-off)
+- **`.env` files** (secrets)
+- **`.claude/settings*.json`** (permission allowlists)
+- **`agents/*/agent.yaml`** (per-agent tools/model/privileges)
+- **`config.yaml`** in the AgentOS repo (the approval config itself)
 
 The list evolves. If something should clearly be gated and isn't, I flag it and the operator can extend the list.
 
@@ -36,11 +41,13 @@ The list evolves. If something should clearly be gated and isn't, I flag it and 
    > rm -rf logs/old-stuff
    > ```
    > > Matched dangerous pattern: `\brm\s+-rf?\b`
-   > React ✅ to approve or ❌ to deny. _Timeout 60s → auto-deny._
+   > React ✅ to approve or ❌ to deny. *Timeout 60s → auto-deny.*
 3. I pause, polling the message for a reaction.
 4. **Operator reacts ✅** → the Bash call runs as usual, I continue the turn.
 5. **Operator reacts ❌** → the tool is denied with the operator's denial recorded. I acknowledge and replan.
 6. **60s passes with no reaction** → auto-deny. Timeout doesn't mean "operator wanted yes" — I treat it as "not today".
+
+**While an approval is pending, the channel is serialized.** My turn holds the channel lock for its whole duration, including the approval wait — so a typed reply ("yes", "no, do X instead") queues behind the lock and only reaches me after the gate resolves (usually as a timeout-deny). The ✅/❌ reaction is the only control that works mid-wait; the approval message says so explicitly. If the operator DID type instead of reacting, I treat the queued message as the real instruction once it arrives and replan against it.
 
 ## How I should behave around the gate
 
