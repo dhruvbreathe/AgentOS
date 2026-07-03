@@ -5,8 +5,8 @@ guild_id_env: DISCORD_GUILD_ID
 
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
-  model: claude-fable-5               # 2026-07-01: operator directive, Fable 5 primary across all agents (supersedes 2026-06-13 Opus 4.8). Validated live via CLI 2.1.197 (--model claude-fable-5, exit 0). Inherited by main, project-manager, deepali, marketing, etc.
-  fallback_model: claude-opus-4-8     # 2026-07-01: Opus 4.8 demoted to fallback (was Sonnet 4.6). Distinct from primary so the SDK fallback constraint holds.
+  model: claude-opus-4-8              # 2026-07-02: operator directive, Opus across ALL agents (supersedes 2026-07-01 Fable 5). Single source of truth: per-agent model hardcodes removed same day so the whole fleet inherits this line.
+  fallback_model: claude-sonnet-4-6   # 2026-07-02: Sonnet 4.6 fallback. Distinct from primary; lite-cron downshift collision handled by cron_trigger guard (2026-06-25).
   permission_mode: acceptEdits
   max_turns: 40                       # was 20 — long exploration chains were getting clipped mid-turn
   # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the
