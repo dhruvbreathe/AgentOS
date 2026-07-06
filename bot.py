@@ -18,6 +18,7 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
+import session_rotation
 import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
 from agent_tools import parse_routing_header
@@ -156,6 +157,11 @@ class RelayBot(discord.Client):
         # posted, so a 💾 on an OLDER message saves THAT turn, not whatever
         # session the channel currently points at. In-memory, bounded.
         self._msg_sessions: dict[int, str] = {}
+        # Phase-1 heartbeats (2026-07-05): scheduled in-session self-checks,
+        # silent unless action taken. Runs under the same channel locks as
+        # on_message so beats can never race a live turn.
+        from heartbeat import HeartbeatScheduler
+        self._heartbeat = HeartbeatScheduler(self)
 
     def _remember_msg_sessions(self, sink, session_id: str) -> None:
         """Map every message this turn's sink posted to its session id.
@@ -178,6 +184,8 @@ class RelayBot(discord.Client):
             sorted({a.name for a in self.agents.values()}),
             len(self.agents),
         )
+        # Idempotent — on_ready re-fires on reconnect; start() guards.
+        self._heartbeat.start()
 
     def _should_respond(self, message: discord.Message, agent: AgentConfig) -> bool:
         if message.author == self.user:
@@ -446,6 +454,17 @@ class RelayBot(discord.Client):
 
         async with self._channel_lock(channel_id):
             resume = self.sessions.get(channel_id)
+            # Phase-0 session rotation (2026-07-05): when the session's last
+            # reported context exceeds the ceiling, start FRESH seeded with a
+            # memory handoff instead of resuming a bloated session. Fail-open:
+            # check() returns None on any error and we resume as before.
+            _rot_note = session_rotation.check(
+                agent.name, resume,
+                (self.global_cfg.get("defaults", {}) or {}).get("session_rotation"),
+            )
+            if _rot_note is not None:
+                resume = None
+                prompt = f"{_rot_note}\n\n{prompt}"
             try:
                 # Show Discord's "is typing..." indicator for the duration
                 # of the turn. discord.py keeps the indicator alive by

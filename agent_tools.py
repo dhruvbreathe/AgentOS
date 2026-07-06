@@ -245,6 +245,25 @@ def build_comms_server(
         # where bot.py's on_message handler mirrors it. Mirroring in both
         # places produced duplicates in the web UI.
 
+        # Phase-1 task ledger (2026-07-05): first-hop routes are handoffs —
+        # auto-create a ledger entry so aging work is visible to Tempo's
+        # sweep instead of vanishing into chat history. Reply-routes deeper
+        # in a chain (hop 2+) are answers, not new work — skip those.
+        # Fail-open by contract: the message already delivered.
+        ledger_note = ""
+        if outgoing_hop == 1:
+            from task_ledger import aledger_create_handoff
+
+            task_id = await aledger_create_handoff(
+                sender_name, target_name, message
+            )
+            if task_id:
+                ledger_note = (
+                    f" Ledger task `{task_id}` created — the receiver (or you) "
+                    f"can close it with: ./.venv/bin/python task_ledger.py "
+                    f"update {task_id} --status done"
+                )
+
         return {
             "content": [
                 {
@@ -252,6 +271,7 @@ def build_comms_server(
                     "text": (
                         f"Sent to @{target_name} (hop {outgoing_hop}/{max_hops}). "
                         f"They will see it in their channel and decide whether to respond."
+                        + ledger_note
                     ),
                 }
             ]

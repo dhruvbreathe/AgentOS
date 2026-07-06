@@ -68,6 +68,7 @@ def _get_session_store(ss_cfg: dict) -> object:
 SHARED_FILES = [
     "HUMANIZER.md",
     "EXPRESSION.md",
+    "LESSONS.md",   # Phase-0 (2026-07-05): fleet-wide hard lessons — stops per-agent re-learning
     "AGENT_COMMS.md",
     "SUBAGENTS.md",
     "MEMORY_STACK.md",  # architecture doc; distinct from per-agent MEMORY.md
@@ -1086,6 +1087,26 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
             env_out[var] = val
     for k, v in (agent_cfg.get("env") or {}).items():
         env_out[k] = str(v)
+
+    # Subscription-only enforcement (2026-07-03, operator directive after a
+    # ~$20-in-2h API burn). The SDK's subprocess transport inherits the
+    # ENTIRE bot os.environ, then merges options.env on top (options.env
+    # wins). So if the bot was ever launched from a shell that exports
+    # ANTHROPIC_API_KEY, every agent's Claude CLI subprocess would silently
+    # bill API-per-token instead of using the Claude.ai subscription OAuth
+    # (stored in the macOS Keychain). Blanking these keys in options.env
+    # overrides any inherited value, forcing the CLI to fall back to the
+    # subscription. Empty string reads as "unset" to the CLI's auth check.
+    # Toggle off with `subscription_only: false` in config.yaml defaults or
+    # a specific agent.yaml (e.g. an agent that genuinely needs API billing).
+    _sub_only = agent_cfg.get("subscription_only")
+    if _sub_only is None:
+        _sub_only = defaults.get("subscription_only")
+    if _sub_only is None:
+        _sub_only = True
+    if _sub_only:
+        for _key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
+            env_out[_key] = ""
 
     # Sandbox settings — macOS/Linux bash sandboxing. Opt-in per agent
     # (default off); when enabled, bash is isolated from filesystem/network

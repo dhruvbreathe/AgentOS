@@ -304,17 +304,31 @@ def check_context_usage(rep: AgentReport, agent_name: str) -> None:
         rep.add("context", "ok", detail)
 
 
+# Vars the operator deliberately removed from .env — their absence is
+# intentional, not a failure. Flagging them as FAIL trains alarm fatigue
+# (9 agents showed red for GITHUB_TOKEN for weeks). Phase-0, 2026-07-05.
+DELIBERATELY_ABSENT = {
+    "GITHUB_TOKEN",  # 2026-05-27 Dhruv: auth via `gh` CLI keyring, do not re-add
+}
+
+
 def check_env_completeness(rep: AgentReport, cfg: dict, dotenv: dict[str, str]) -> None:
     missing: list[str] = []
+    intentional: list[str] = []
     for key in ("webhook_url_env", "bot_token_env"):
         var = cfg.get(key)
         if var and not resolve_env(var, dotenv):
             missing.append(var)
     for var in cfg.get("env_passthrough", []) or []:
         if not resolve_env(var, dotenv):
-            missing.append(var)
+            (intentional if var in DELIBERATELY_ABSENT else missing).append(var)
     if missing:
         rep.add("env", "fail", f"missing: {', '.join(missing)}")
+    elif intentional:
+        rep.add(
+            "env", "ok",
+            f"all present (deliberately absent: {', '.join(intentional)})",
+        )
     else:
         rep.add("env", "ok", "all referenced vars present")
 
@@ -391,11 +405,90 @@ def print_json(reports: list[AgentReport]) -> None:
     print(json.dumps(out, indent=2))
 
 
+# ---- Delta mode (Phase 1, masterplan item 7) --------------------------------
+# Doctor used to dump full state daily; a wall of known-warns trains everyone
+# to ignore it (alarm fatigue — the GITHUB_TOKEN lesson). Delta mode compares
+# against the previous run's snapshot and reports ONLY movement: new fails,
+# new warns, severity bumps — plus recoveries as one-liners. Green = silence.
+
+STATE_FILE = LOGS_DIR / "doctor-state.json"
+_RANK = {"ok": 0, "warn": 1, "fail": 2}
+
+
+def compute_delta(
+    reports: list[AgentReport], state_file: Path = STATE_FILE
+) -> dict:
+    """Diff current results vs the previous snapshot, then persist the new
+    snapshot. First run establishes a baseline and reports no regressions
+    (day-1 spam would poison the signal on day one)."""
+    current: dict[str, dict] = {}
+    for r in reports:
+        for c in r.checks:
+            current[f"{r.agent}/{c.name}"] = {
+                "severity": c.severity,
+                "detail": c.detail,
+            }
+
+    first_run = not state_file.exists()
+    previous: dict[str, dict] = {}
+    if not first_run:
+        try:
+            previous = json.loads(state_file.read_text())
+        except Exception:
+            previous = {}
+            first_run = True  # unreadable snapshot → re-baseline
+
+    regressions, recoveries = [], []
+    if not first_run:
+        for key, cur in current.items():
+            prev_sev = (previous.get(key) or {}).get("severity", "ok")
+            if _RANK[cur["severity"]] > _RANK.get(prev_sev, 0):
+                regressions.append(
+                    {
+                        "check": key,
+                        "was": prev_sev,
+                        "now": cur["severity"],
+                        "detail": cur["detail"],
+                    }
+                )
+            elif _RANK[cur["severity"]] < _RANK.get(prev_sev, 0):
+                recoveries.append(
+                    {"check": key, "was": prev_sev, "now": cur["severity"]}
+                )
+
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(current, indent=1))
+        tmp.replace(state_file)
+    except Exception as e:
+        print(f"warning: could not persist doctor state: {e}", file=sys.stderr)
+
+    worst = max(
+        (r.worst for r in reports),
+        key=lambda s: _RANK[s],
+        default="ok",
+    )
+    return {
+        "first_run": first_run,
+        "regressions": regressions,
+        "recoveries": recoveries,
+        "worst": worst,
+        "checks_total": len(current),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Prana AgentOS doctor")
     ap.add_argument("--agent", help="check a single agent by name")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--fix", action="store_true", help="attempt safe auto-fixes")
+    ap.add_argument(
+        "--delta",
+        action="store_true",
+        help="report only movement vs the last run's snapshot (JSON); "
+        "exit 1 only on regressions",
+    )
     args = ap.parse_args()
 
     if not AGENTS_DIR.exists():
@@ -430,6 +523,19 @@ def main() -> int:
         for rep in reports:
             for line in try_fix(rep):
                 print("  " + line)
+
+    if args.delta:
+        # Delta mode owns stdout completely: one JSON object, movement only.
+        # Note: --delta with --agent would snapshot a single agent's checks
+        # and mark everything else "disappeared" on the next full run — the
+        # snapshot is only meaningful fleet-wide, so refuse the combination.
+        if args.agent:
+            print("error: --delta requires a full-fleet run (drop --agent)",
+                  file=sys.stderr)
+            return 2
+        delta = compute_delta(reports)
+        print(json.dumps(delta, indent=2))
+        return 1 if delta["regressions"] else 0
 
     if args.json:
         print_json(reports)

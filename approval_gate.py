@@ -76,6 +76,23 @@ async def _operator_reacted(
     return any(str(u.get("id")) == str(operator_id) for u in users or [])
 
 
+async def _mark_resolution(
+    session: aiohttp.ClientSession, fetch_url: str, original: str, marker: str
+) -> None:
+    """A2.1 (2026-07-05): PATCH the approval message with its outcome so the
+    channel shows how every gate resolved. Before this, an approved gate was
+    indistinguishable in-channel from one that never fired, which got the
+    write gate misreported as 'inconsistent' (the P1 that wasn't). Best-effort:
+    a failed PATCH never changes the decision."""
+    try:
+        async with session.patch(
+            fetch_url, json={"content": f"{original}\n\n{marker}"}
+        ) as resp:
+            await resp.read()
+    except Exception as e:
+        log.debug("approval resolution mark failed: %s", e)
+
+
 async def request_approval(
     webhook_url: str,
     agent_name: str,
@@ -177,15 +194,30 @@ async def request_approval(
                         continue
                 if emoji == APPROVE_EMOJI:
                     log.info("[%s] %s approved (%s)", agent_name, tool_name, APPROVE_EMOJI)
+                    await _mark_resolution(
+                        session, fetch_url, content,
+                        "✅ **RESOLVED: approved** (operator reaction)",
+                    )
                     return "approve", "operator approved"
                 log.info("[%s] %s denied (%s)", agent_name, tool_name, DENY_EMOJI)
+                await _mark_resolution(
+                    session, fetch_url, content,
+                    "❌ **RESOLVED: denied** (operator reaction)",
+                )
                 return "deny", "operator denied"
 
-    log.info(
-        "[%s] %s approval timeout (%.0fs) — default deny",
-        agent_name, tool_name, timeout_seconds,
-    )
-    return "timeout", f"no reaction within {int(timeout_seconds)}s → default deny"
+        # Deadline passed with the session still open: mark the message so the
+        # channel shows the outcome, then deny.
+        log.info(
+            "[%s] %s approval timeout (%.0fs), default deny",
+            agent_name, tool_name, timeout_seconds,
+        )
+        await _mark_resolution(
+            session, fetch_url, content,
+            f"⏱️ **RESOLVED: denied by timeout** (no reaction in "
+            f"{int(timeout_seconds)}s)",
+        )
+        return "timeout", f"no reaction within {int(timeout_seconds)}s -> default deny"
 
 
 # ---- Pattern matching for "dangerous" commands ---------------------------

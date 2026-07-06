@@ -94,6 +94,16 @@ defaults:
       - 'agents/[^/]+/agent\.yaml$'               # per-agent tools/model/privileges
       - 'ClaudeAgentSDK/config\.yaml$'            # this file — the gate itself
 
+  # Phase-0 session rotation (2026-07-05 orchestration master plan). When a
+  # channel session's last post-turn context reading exceeds the ceiling,
+  # the next turn starts a FRESH session seeded with a memory handoff
+  # (tail of the agent's daily memory files) instead of resuming. Kills the
+  # 300-600k context bloat (20% of turns!), restores reasoning quality, and
+  # makes session-store mirrors chain-complete from birth. Fail-open.
+  session_rotation:
+    enabled: true
+    max_context_tokens: 150000
+
   # Session transcript mirror (SDK >= 0.2.110 SessionStore). Every session's
   # JSONL is mirrored so transcripts survive the CLI's cleanup sweep and
   # become fork/list/delete-able via the SDK session APIs. Resume
