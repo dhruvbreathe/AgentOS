@@ -56,6 +56,28 @@ console.log(JSON.stringify(outline));
 
 Rule of thumb: text outline first; screenshot when layout, imagery, state coloring, or "why does this look wrong" is the actual question. Visual QA always screenshots.
 
+## Coordinate mode (when selectors lie)
+
+Canvas widgets, shadow DOM, cross-origin iframes, SPA markup churn: click by pixel coordinates instead. Live-verified 2026-07-05 (vayu-prana.com smoke), three facts make it reliable:
+
+1. **Lock the viewport first, always:** `await page.setViewportSize({ width: 1280, height: 800 })` on setup. That forces DPR=1, so screenshot pixels map 1:1 to `page.mouse.click(x, y)` coordinates. Unset viewport on a retina-connected Chrome = every click lands in the wrong place.
+2. **Vision estimates miss by ~30-50px.** Reading coordinates off the screenshot is a first guess, not a target lock. Budget one correction round.
+3. **DOM-assisted targeting beats pure vision whenever a DOM exists.** Vision tells you WHAT to click; this dump tells you WHERE, exactly:
+
+```js
+const targets = await page.evaluate(() => [...document.querySelectorAll("a, button, input, [role=button]")]
+  .map(e => { const r = e.getBoundingClientRect(); return {
+    t: (e.innerText || e.getAttribute("aria-label") || "").trim().slice(0, 30),
+    x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2),
+    visible: r.width > 0 && r.y >= 0 && r.y < 800 }; })
+  .filter(l => l.t && l.visible));
+console.log(JSON.stringify(targets));
+```
+
+Match the element you SAW to its dump entry, click those exact center coordinates. Pure-vision coordinates are the last resort for surfaces with no queryable DOM at all.
+
+Coordinates are VIEWPORT-relative: after any scroll, re-screenshot before estimating, and scroll targets with y > 800 into view first.
+
 ## Failure modes and answers
 
 | Symptom | Move |
