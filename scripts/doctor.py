@@ -248,11 +248,14 @@ def check_trajectory(rep: AgentReport, agent_name: str) -> None:
 
 
 _context_latest_cache: dict[str, dict] | None = None
+_context_prev_cache: dict[str, dict] = {}
 
 
 def _context_latest() -> dict[str, dict]:
     """Latest context-usage telemetry line per agent (relay writes these
-    post-turn on SDK 0.2.110). Parsed once per doctor run."""
+    post-turn on SDK 0.2.110). Parsed once per doctor run. Also keeps the
+    second-to-latest line per agent in _context_prev_cache so the rotation
+    check can distinguish one stale/spike reading from consecutive misses."""
     global _context_latest_cache
     if _context_latest_cache is not None:
         return _context_latest_cache
@@ -269,24 +272,76 @@ def _context_latest() -> dict[str, dict]:
                 except ValueError:
                     continue
                 if isinstance(line, dict) and line.get("agent"):
-                    latest[line["agent"]] = line  # file is chronological
+                    name = line["agent"]
+                    if name in latest:
+                        _context_prev_cache[name] = latest[name]
+                    latest[name] = line  # file is chronological
         except OSError:
             pass
     _context_latest_cache = latest
     return latest
 
 
-def check_context_usage(rep: AgentReport, agent_name: str) -> None:
-    """Flag agents whose live session context is drifting toward autocompact.
+_rotation_cfg_cache: dict | None = None
 
-    Thresholds are fractions of the autocompact threshold (or of the
-    effective max when the CLI doesn't report one): >=85% fail, >=60% warn.
+
+def _rotation_ceiling(agent_name: str) -> int | None:
+    """Effective session-rotation ceiling for an agent from repo config.yaml
+    (defaults.session_rotation), honoring per_agent overrides. None when
+    rotation is disabled or config is unreadable. Phase-2 item 10, 2026-07-05."""
+    global _rotation_cfg_cache
+    if _rotation_cfg_cache is None:
+        cfg = {}
+        try:
+            raw = yaml.safe_load((ROOT / "config.yaml").read_text()) or {}
+            cfg = (raw.get("defaults") or {}).get("session_rotation") or {}
+        except Exception:  # noqa: BLE001 — doctor must not crash on config
+            cfg = {}
+        _rotation_cfg_cache = cfg
+    cfg = _rotation_cfg_cache
+    if not cfg or not cfg.get("enabled"):
+        return None
+    per_agent = cfg.get("per_agent") or {}
+    try:
+        return int(per_agent.get(agent_name, cfg.get("max_context_tokens", 150_000)))
+    except (TypeError, ValueError):
+        return None
+
+
+def check_context_usage(rep: AgentReport, agent_name: str) -> None:
+    """Context health, rotation-era semantics (Phase-2 item 10).
+
+    With session rotation live, drift toward autocompact (967k) can't happen;
+    the failure that matters is ROTATION NOT FIRING. A post-turn reading just
+    over the ceiling is normal (rotation triggers at next turn start), so:
+    >=1.5x ceiling fail (multiple missed rotations), >=1.1x warn (rotation
+    due). Falls back to the old autocompact fractions when rotation is off.
     """
     line = _context_latest().get(agent_name)
     if not line:
         rep.add("context", "ok", "no telemetry yet")
         return
     total = line.get("total_tokens") or 0
+    ceiling = _rotation_ceiling(agent_name)
+    if total and ceiling:
+        frac = total / ceiling
+        detail = (
+            f"{total // 1000}k vs {ceiling // 1000}k rotation ceiling "
+            f"({frac * 100:.0f}%)"
+        )
+        prev_total = (_context_prev_cache.get(agent_name) or {}).get(
+            "total_tokens"
+        ) or 0
+        if frac >= 1.5 and prev_total >= ceiling * 1.5:
+            # Two consecutive readings far over ceiling = rotation genuinely
+            # not engaging. A single high reading is normal: pre-rotation-era
+            # telemetry or a one-turn spike; rotation fires at next turn start.
+            rep.add("context", "fail", f"rotation not firing: {detail}")
+        elif frac >= 1.1:
+            rep.add("context", "warn", f"rotation pending next turn: {detail}")
+        else:
+            rep.add("context", "ok", detail)
+        return
     limit = line.get("autocompact_threshold") or line.get("max_tokens") or 0
     if not total or not limit:
         rep.add("context", "ok", "telemetry incomplete")
