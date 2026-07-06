@@ -69,6 +69,13 @@ class DiscordMessageSink(Sink):
     """Edits a discord.Message at a throttled interval so token streaming
     doesn't trip Discord's edit rate limit (~5/5s per channel)."""
 
+    # After this many seconds of turn duration, finalize() sends a fresh
+    # bottom message in addition to the in-place edit. Edits never fire a
+    # new-message event, so a long turn otherwise completes with zero
+    # notification and zero unread badge. To the operator it reads as the
+    # agent going silent even though the full reply is sitting there.
+    FINALIZE_PING_AFTER_S = 90.0
+
     def __init__(
         self,
         message,
@@ -78,6 +85,7 @@ class DiscordMessageSink(Sink):
         agent_name: str | None = None,
     ) -> None:
         self._agent_name = agent_name
+        self._created = time.monotonic()
         # `messages` grows as the reply overflows past `max_length`. The
         # first element is the placeholder we were handed; subsequent ones
         # are sent via channel.send as continuations land.
@@ -162,7 +170,7 @@ class DiscordMessageSink(Sink):
         await self._flush(text, finalizing=True)
         # Visibility guard (2026-07-06): if other messages landed below our
         # placeholder while the turn ran (approval gates, agent posts), the
-        # final reply arrives as a silent EDIT above them — no notification,
+        # final reply arrives as a silent EDIT above them: no notification,
         # no bump. The operator sees gates, then apparent silence. Drop a
         # pointer at the bottom so the reply is discoverable. Fail-open: any
         # error here must never eat the (already delivered) reply.
@@ -170,11 +178,19 @@ class DiscordMessageSink(Sink):
             channel = self.messages[0].channel
             last_id = getattr(channel, "last_message_id", None)
             our_ids = {m.id for m in self.messages}
-            if last_id is not None and last_id not in our_ids:
+            buried = last_id is not None and last_id not in our_ids
+            long_turn = (
+                time.monotonic() - self._created > self.FINALIZE_PING_AFTER_S
+            )
+            if buried:
                 await channel.send(
                     "-# ⬆️ reply finished above (streamed into the earlier "
                     "message, before the messages below)"
                 )
+            elif long_turn:
+                # Edits fire no notification. After a long turn, emit a real
+                # message event so the channel goes unread and pings land.
+                await channel.send("-# ✅ done, reply above ⬆️")
         except Exception as e:
             log.warning("relay finalize: bottom-pointer failed: %s", e)
 
