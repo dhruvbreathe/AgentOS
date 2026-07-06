@@ -1114,6 +1114,23 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
     sandbox_cfg = agent_cfg.get("sandbox") or defaults.get("sandbox")
 
     subagents = _load_subagents(agent_dir, agent_cfg)
+    # Phase-2 quality loops (2026-07-05): fleet-default subagents from
+    # config.yaml `defaults.subagents`, merged UNDER per-agent ones —
+    # agent.yaml wins on name collision. Definitions here must use inline
+    # prompts (prompt_file would resolve against each agent's own dir,
+    # which is wrong for shared definitions).
+    _default_subs_cfg = defaults.get("subagents")
+    if _default_subs_cfg:
+        try:
+            _default_subs = _load_subagents(
+                agent_dir, {"subagents": _default_subs_cfg}
+            )
+            if _default_subs:
+                subagents = {**_default_subs, **(subagents or {})}
+        except Exception as _e:  # noqa: BLE001 — defaults must not break load
+            logging.getLogger("agent-loader").warning(
+                "[%s] default subagents skipped: %s", name, _e
+            )
     on_stop, on_precompact = _build_session_log_hooks(name)
     on_subagent_start = _build_subagent_start_hook(name)
 

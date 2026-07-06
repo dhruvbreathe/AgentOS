@@ -99,6 +99,12 @@ def check(agent_name: str, session_id: str | None, cfg: dict | None) -> str | No
         if not session_id or not cfg.get("enabled", True):
             return None
         ceiling = int(cfg.get("max_context_tokens", DEFAULT_MAX_CONTEXT_TOKENS))
+        # Phase-2 compaction tuning: optional per-agent ceiling override
+        # (config.yaml defaults.session_rotation.per_agent.<name>). Lets
+        # heavy-payload agents (e.g. media) rotate earlier than the fleet.
+        _per_agent = cfg.get("per_agent") or {}
+        if agent_name in _per_agent:
+            ceiling = int(_per_agent[agent_name])
         tokens = _last_context_tokens(session_id)
         if tokens is None or tokens < ceiling:
             return None

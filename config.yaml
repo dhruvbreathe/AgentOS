@@ -103,6 +103,62 @@ defaults:
   session_rotation:
     enabled: true
     max_context_tokens: 150000
+    # per_agent: {media: 100000}   # Phase-2: optional earlier rotation for heavy-payload agents
+
+  # Phase-2 memory recall (2026-07-05 masterplan item 8). Before each
+  # Discord-relayed turn, memory_recall.py lexically matches the incoming
+  # message against Sessions/ (30d), Topics/, Company/FACTS.md,
+  # Company/DECISIONS.md + the agent's own daily memory (7d) and prepends
+  # the top-k snippets to the prompt. Lexical v1 on purpose — the
+  # smart-connections MCP is session-scoped, unreachable from the relay
+  # pre-turn. Fail-open; ~0.1ms/query on a 10-min cached index.
+  memory_recall:
+    enabled: true
+    k: 4
+    max_chars: 1200
+    min_message_chars: 20
+
+  # Phase-2 quality loops (2026-07-05 masterplan item 9). Fleet-default
+  # subagents merged into every agent's set (agent.yaml wins on name
+  # collision). Inline prompts only — prompt_file would resolve against
+  # each agent's own dir. Descriptions carry the usage trigger.
+  subagents:
+    code-reviewer:
+      description: "MUST run before any git push of app/production code: reviews a diff for bugs, security issues, missing error handling. Not for style."
+      prompt: |
+        You review code diffs before they ship. Flag ONLY real bugs,
+        security issues (injection, auth bypass, secret exposure), missing
+        error handling on external calls, data-loss risks, obvious
+        performance traps. Skip style, naming, formatting. For each finding
+        give file:line, what breaks, one-line fix. If clean say clean plus
+        the ONE riskiest spot you would watch. Under 250 words.
+      tools: [Read, Grep, Glob, Bash]
+      model: sonnet
+      max_turns: 12
+    digest-verifier:
+      description: "Run on any digest/report BEFORE posting: verifies every number and claim against its stated source; catches stale metrics and unit errors."
+      prompt: |
+        You verify a draft digest/report before it posts. For EVERY number
+        and factual claim, check it against the stated source (file, API
+        output, log). Flag numbers with no source, stale values, unit or
+        magnitude errors, percentages that do not recompute, conf:estimate
+        figures presented as hard facts. Output VERIFIED or a numbered list
+        of problems with the correct value. Under 200 words.
+      tools: [Read, Grep, Glob, Bash]
+      model: sonnet
+      max_turns: 10
+    claim-checker:
+      description: "Run before sending anything outbound (investor, customer, public) that cites metrics: checks each figure against Company/FACTS.md conf tiers."
+      prompt: |
+        You check outbound copy against Company/FACTS.md in the vault. For
+        each metric or claim in the draft, find the matching FACTS entry and
+        report its conf tier and date. Flag figures absent from FACTS,
+        conf:estimate or unverified presented as precise facts, stale
+        entries, rounding UP beyond the source. Output a table of claim,
+        FACTS value, tier, verdict. Under 250 words.
+      tools: [Read, Grep, Glob]
+      model: sonnet
+      max_turns: 8
 
   # Session transcript mirror (SDK >= 0.2.110 SessionStore). Every session's
   # JSONL is mirrored so transcripts survive the CLI's cleanup sweep and

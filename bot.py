@@ -18,6 +18,7 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
+import memory_recall
 import session_rotation
 import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
@@ -454,6 +455,17 @@ class RelayBot(discord.Client):
 
         async with self._channel_lock(channel_id):
             resume = self.sessions.get(channel_id)
+            # Phase-2 memory recall (2026-07-05): prepend top-k vault/memory
+            # matches for the incoming message so the agent starts the turn
+            # already holding its most relevant notes. Keys off the raw
+            # message body (not routing headers). Fail-open: build() returns
+            # None on any error and the prompt is untouched.
+            _rec_note = memory_recall.build(
+                agent.name, body,
+                (self.global_cfg.get("defaults", {}) or {}).get("memory_recall"),
+            )
+            if _rec_note:
+                prompt = f"{_rec_note}\n\n{prompt}"
             # Phase-0 session rotation (2026-07-05): when the session's last
             # reported context exceeds the ceiling, start FRESH seeded with a
             # memory handoff instead of resuming a bloated session. Fail-open:
