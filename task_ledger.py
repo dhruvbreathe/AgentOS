@@ -128,10 +128,10 @@ def update_task(task_id_prefix: str, **fields: Any) -> dict:
     status = fields.get("status")
     if status and status not in STATUSES:
         raise ValueError(f"bad status {status!r}; allowed: {sorted(STATUSES)}")
-    matches = _request(
-        "GET",
-        f"tasks?select=id,status&id=like.{task_id_prefix}*&limit=5",
-    )
+    # PostgREST returns 404 for a `like` filter on the uuid `id` column, so
+    # prefix-resolution is done client-side: fetch ids, filter in Python.
+    all_ids = _request("GET", "tasks?select=id,status")
+    matches = [r for r in all_ids if r["id"].startswith(task_id_prefix)][:5]
     if not matches:
         raise ValueError(f"no task with id prefix {task_id_prefix!r}")
     if len(matches) > 1:

@@ -131,3 +131,25 @@ EOF
 - One dev-browser run = 1 Bash tool call + ~200B of JSON stdout.
 - Same task via WebFetch on a JS-rendered page = N page fetches + full HTML in context per fetch. Order of magnitude more tokens.
 - Prefer dev-browser for anything ≥2 steps or anything SPA-rendered.
+
+## Vision loop (browser-agent mode)
+
+When selectors are a guessing game (unknown UIs, canvas, shadow DOM, A/B-tested layouts, visual QA), stop guessing and look at the page:
+
+1. **Act + screenshot** in one dev-browser call, always on a **named page** so state persists:
+   ```bash
+   dev-browser <<'EOF'
+   const page = await browser.getPage("mission");
+   await page.goto("https://target.example.com", { waitUntil: "networkidle" });
+   console.log(await saveScreenshot(await page.screenshot(), "step1.png"));
+   EOF
+   ```
+2. **Read the screenshot** with the Read tool at `/Users/celainc/.dev-browser/tmp/step1.png` (absolute path; Read renders images, so you see what a user sees).
+3. **Decide** the next action from what you saw. State it in one line before acting (audit trail).
+4. **Act again** on the same named page, screenshot again. Repeat until done.
+
+Rules:
+- Cap at ~6 loop iterations. Not converging? Dump `document.body.innerText.slice(0,800)` and rethink, or bail and report what you saw.
+- Viewport screenshots (default), not `fullPage`, unless layout itself is the question. Faster, smaller.
+- If selectors ARE knowable, use plain DOM extraction. The vision loop is for when they aren't.
+- Full playbook, worked example, and failure modes: `references/vision-loop.md` next to this file.
