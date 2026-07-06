@@ -135,6 +135,18 @@ defaults:
     enabled: true
     threshold: 5
 
+  # Phase-1 heartbeats (2026-07-05 orchestration master plan). Relay-level
+  # scheduler (heartbeat.py) resumes each pilot agent's channel session on a
+  # cadence with its HEARTBEAT.md checklist. Output is DISCARDED; posting is
+  # an action the agent takes deliberately, so beats stay silent unless
+  # something warrants it. An agent must also have agents/<name>/HEARTBEAT.md
+  # or it is skipped. Fail-open everywhere; state in logs/heartbeats.json.
+  heartbeat:
+    enabled: true
+    interval_minutes: 240          # per-agent beat cadence
+    active_hours: [8, 22]          # local-time window, [start, end)
+    agents: [main, project-manager, backend-developer, marketing]
+
 # Save-to-vault gate. Operator reacts `emoji` on any agent message to
 # persist the most recent turn (last user prompt + assistant outputs)
 # into $VAULT_PATH/Sessions/. The bot reacts `ack_emoji` on success or
