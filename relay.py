@@ -160,6 +160,23 @@ class DiscordMessageSink(Sink):
 
     async def finalize(self, text: str) -> None:
         await self._flush(text, finalizing=True)
+        # Visibility guard (2026-07-06): if other messages landed below our
+        # placeholder while the turn ran (approval gates, agent posts), the
+        # final reply arrives as a silent EDIT above them — no notification,
+        # no bump. The operator sees gates, then apparent silence. Drop a
+        # pointer at the bottom so the reply is discoverable. Fail-open: any
+        # error here must never eat the (already delivered) reply.
+        try:
+            channel = self.messages[0].channel
+            last_id = getattr(channel, "last_message_id", None)
+            our_ids = {m.id for m in self.messages}
+            if last_id is not None and last_id not in our_ids:
+                await channel.send(
+                    "-# ⬆️ reply finished above (streamed into the earlier "
+                    "message, before the messages below)"
+                )
+        except Exception as e:
+            log.warning("relay finalize: bottom-pointer failed: %s", e)
 
 
 # ---- Trajectory logger ------------------------------------------------
