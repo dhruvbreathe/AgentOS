@@ -14,13 +14,24 @@ Design rules:
   - `updated_at` is stamped explicitly on every write — no DB trigger assumed.
 
 CLI (agents run via Bash):
-  ./.venv/bin/python task_ledger.py create --title "..." --to backend-developer
+  ./.venv/bin/python task_ledger.py create --title "..." --to backend-developer \
+      [--done-when "acceptance criteria"]
   ./.venv/bin/python task_ledger.py list [--to X] [--status open] [--json]
-  ./.venv/bin/python task_ledger.py update <id-prefix> --status done --result "..."
+  ./.venv/bin/python task_ledger.py update <id-prefix> --status done \
+      --evidence "how the done_when contract is met"
   ./.venv/bin/python task_ledger.py sweep [--days 3] [--json]
+  ./.venv/bin/python task_ledger.py orphans [--hours 48] [--json]
 
 Status vocabulary (matches existing rows + seed_tasks.py):
   open | in_progress | blocked | waiting | done
+
+Ledger v2 (Wave 3 P0-4, 2026-07-18 — Hermes completion contracts):
+  - `done_when`: acceptance criteria captured AT CREATION. A task that
+    carries a contract cannot be closed without `--evidence` (or --result)
+    stating how the contract is met. Kills "I think I fixed it".
+  - `orphans`: active tasks whose to_agent is not in the live agents/
+    roster (retired agent, typo). Surface these to the operator — they rot
+    silently otherwise (the Mira-retirement failure, Jul 15).
 """
 from __future__ import annotations
 
@@ -29,6 +40,7 @@ import logging
 import os
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("task-ledger")
@@ -42,8 +54,29 @@ STATUSES = {"open", "in_progress", "blocked", "waiting", "done"}
 ACTIVE_STATUSES = ("open", "in_progress", "blocked", "waiting", "todo")
 
 
+_AGENTS_DIR = Path(__file__).parent / "agents"
+# Human owners: tasks assigned to the operator are owned, not orphaned.
+_HUMAN_OWNERS = {"dhruv", "operator"}
+
+
 def _now_z() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _roster() -> set[str]:
+    """Live agent names = dirs under agents/ that hold an agent.yaml.
+    Empty set on any FS problem — callers must treat that as 'unknown',
+    never 'everyone is an orphan'."""
+    try:
+        return {
+            p.name
+            for p in _AGENTS_DIR.iterdir()
+            if p.is_dir()
+            and not p.name.startswith(("_", "."))
+            and (p / "agent.yaml").exists()
+        }
+    except OSError:
+        return set()
 
 
 def _base_url() -> str | None:
@@ -103,6 +136,7 @@ def create_task(
     priority: str = "medium",
     due_at: str | None = None,
     task_type: str = "task",
+    done_when: str | None = None,
 ) -> dict:
     now = _now_z()
     row = {
@@ -114,6 +148,7 @@ def create_task(
         "status": "open",
         "priority": priority,
         "due_at": due_at,
+        "done_when": (done_when or "")[:1000] or None,
         "assigned_at": now,
         "created_at": now,
         "updated_at": now,
@@ -124,20 +159,40 @@ def create_task(
 
 def update_task(task_id_prefix: str, **fields: Any) -> dict:
     """Update by full UUID or unambiguous prefix. Auto-stamps updated_at,
-    plus started_at / completed_at on the matching transitions."""
+    plus started_at / completed_at on the matching transitions.
+
+    Completion-contract enforcement (v2): a task whose row carries
+    `done_when` cannot transition to done unless evidence exists — either
+    an incoming `evidence`/`result` field or one already on the row. The
+    contract was stated at creation; closing means showing your work."""
     status = fields.get("status")
     if status and status not in STATUSES:
         raise ValueError(f"bad status {status!r}; allowed: {sorted(STATUSES)}")
     # PostgREST returns 404 for a `like` filter on the uuid `id` column, so
     # prefix-resolution is done client-side: fetch ids, filter in Python.
-    all_ids = _request("GET", "tasks?select=id,status")
+    all_ids = _request("GET", "tasks?select=id,status,done_when,result,evidence")
     matches = [r for r in all_ids if r["id"].startswith(task_id_prefix)][:5]
     if not matches:
         raise ValueError(f"no task with id prefix {task_id_prefix!r}")
     if len(matches) > 1:
         ids = ", ".join(m["id"][:8] for m in matches)
         raise ValueError(f"ambiguous prefix {task_id_prefix!r}: {ids}")
-    task_id = matches[0]["id"]
+    row = matches[0]
+    task_id = row["id"]
+    if status == "done" and row.get("done_when"):
+        evidence = (
+            fields.get("evidence")
+            or fields.get("result")
+            or row.get("evidence")
+            or row.get("result")
+        )
+        if not (evidence or "").strip():
+            raise ValueError(
+                f"task {task_id[:8]} carries a done_when contract: "
+                f"{row['done_when']!r}\n"
+                f"Closing it requires evidence — rerun with "
+                f"--evidence \"<how the contract is met>\""
+            )
     fields["updated_at"] = _now_z()
     if status == "in_progress" and "started_at" not in fields:
         fields["started_at"] = fields["updated_at"]
@@ -155,7 +210,7 @@ def list_tasks(
 ) -> list[dict]:
     q = [
         "select=id,title,type,from_agent,to_agent,status,priority,"
-        "blocked_reason,due_at,created_at,updated_at",
+        "blocked_reason,due_at,done_when,created_at,updated_at",
         f"limit={limit}",
         "order=updated_at.desc",
     ]
@@ -176,12 +231,48 @@ def sweep(days: int = 3) -> list[dict]:
     )
     q = (
         "tasks?select=id,title,from_agent,to_agent,status,priority,"
-        f"blocked_reason,due_at,created_at,updated_at"
+        f"blocked_reason,due_at,done_when,created_at,updated_at"
         f"&status=in.({','.join(ACTIVE_STATUSES)})"
         f"&updated_at=lt.{cutoff}"
         "&order=updated_at.asc&limit=100"
     )
     return _request("GET", q)
+
+
+def orphans(min_hours: float = 0.0) -> list[dict]:
+    """Active tasks whose to_agent is not a live agent (and not a human
+    owner) — work that will NEVER be picked up. The Mira retirement (Jul 15)
+    left 3-4 of these rotting silently.
+
+    `min_hours` filters to tasks untouched for at least that long; the
+    escalation contract is 48h → surface to the operator. Returns [] when
+    the roster can't be read (unknown ≠ everyone-is-an-orphan)."""
+    roster = _roster()
+    if not roster:
+        return []
+    known = roster | _HUMAN_OWNERS
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=min_hours)
+    out = []
+    rows = list_tasks(limit=200)
+    if len(rows) >= 200:
+        # No silent caps: past the fetch limit, unscanned tasks would rot
+        # invisibly, exactly what the orphan sweep exists to prevent.
+        log.warning(
+            "orphan sweep hit the 200-row fetch cap; active tasks beyond "
+            "it were NOT scanned. Raise the limit or page."
+        )
+    for t in rows:
+        if (t.get("to_agent") or "") in known:
+            continue
+        try:
+            upd = datetime.fromisoformat(
+                (t.get("updated_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            upd = None
+        if upd is None or upd <= cutoff:
+            out.append(t)
+    return out
 
 
 # ---- Async fire-and-forget for the send_to_agent hook ------------------
@@ -252,6 +343,8 @@ def _print_rows(rows: list[dict]) -> None:
     if not rows:
         print("(no tasks)")
         return
+    roster = _roster()
+    known = (roster | _HUMAN_OWNERS) if roster else set()
     for t in rows:
         overdue = ""
         if t.get("due_at"):
@@ -262,11 +355,18 @@ def _print_rows(rows: list[dict]) -> None:
             except Exception:
                 pass
         blocked = f"  [{t['blocked_reason']}]" if t.get("blocked_reason") else ""
+        contract = "  dw✓" if t.get("done_when") else ""
+        no_owner = (
+            "  ⚠️ NO-OWNER"
+            if known and (t.get("to_agent") or "") not in known
+            and t.get("status") != "done"
+            else ""
+        )
         print(
             f"{t['id'][:8]}  {t['status']:<12} {t['priority']:<7} "
             f"{t['from_agent']}→{t['to_agent']:<14} "
             f"age {_fmt_age(t.get('updated_at')):<4} {t['title'][:70]}"
-            f"{blocked}{overdue}"
+            f"{contract}{blocked}{overdue}{no_owner}"
         )
 
 
@@ -286,6 +386,8 @@ def main() -> int:
                    choices=["low", "medium", "high", "urgent"])
     c.add_argument("--due", default=None, help="YYYY-MM-DD")
     c.add_argument("--type", default="task", dest="task_type")
+    c.add_argument("--done-when", default=None, dest="done_when",
+                   help="acceptance criteria; closing then requires --evidence")
 
     ls = sub.add_parser("list", help="list active tasks")
     ls.add_argument("--to", default=None, dest="to_agent")
@@ -297,6 +399,11 @@ def main() -> int:
     u.add_argument("task_id")
     u.add_argument("--status", default=None, choices=sorted(STATUSES))
     u.add_argument("--result", default=None)
+    u.add_argument("--evidence", default=None,
+                   help="how the done_when contract is met (required to "
+                        "close a contracted task)")
+    u.add_argument("--done-when", default=None, dest="done_when",
+                   help="add/replace the acceptance contract")
     u.add_argument("--blocked-reason", default=None, dest="blocked_reason")
     u.add_argument("--priority", default=None,
                    choices=["low", "medium", "high", "urgent"])
@@ -306,6 +413,15 @@ def main() -> int:
     sw.add_argument("--days", type=int, default=3)
     sw.add_argument("--json", action="store_true")
 
+    orp = sub.add_parser(
+        "orphans",
+        help="active tasks assigned to no live agent (retired/typo owner)",
+    )
+    orp.add_argument("--hours", type=float, default=48,
+                     help="only tasks untouched this long (default 48 — "
+                          "the operator-escalation threshold)")
+    orp.add_argument("--json", action="store_true")
+
     args = ap.parse_args()
 
     if args.cmd == "create":
@@ -313,9 +429,10 @@ def main() -> int:
         t = create_task(
             args.title, args.to_agent, from_agent=args.from_agent,
             description=args.desc, priority=args.priority, due_at=due,
-            task_type=args.task_type,
+            task_type=args.task_type, done_when=args.done_when,
         )
-        print(f"created {t['id'][:8]}  {t['title']}")
+        dw = "  (contract set)" if args.done_when else ""
+        print(f"created {t['id'][:8]}  {t['title']}{dw}")
     elif args.cmd == "list":
         rows = list_tasks(
             to_agent=args.to_agent, status=args.status, include_done=args.all
@@ -330,6 +447,10 @@ def main() -> int:
             fields["status"] = args.status
         if args.result:
             fields["result"] = args.result
+        if args.evidence:
+            fields["evidence"] = args.evidence
+        if args.done_when:
+            fields["done_when"] = args.done_when
         if args.blocked_reason:
             fields["blocked_reason"] = args.blocked_reason
             fields.setdefault("status", "blocked")
@@ -352,6 +473,19 @@ def main() -> int:
             else:
                 print(f"{len(rows)} task(s) stale {args.days}d+ (oldest first):")
                 _print_rows(rows)
+    elif args.cmd == "orphans":
+        rows = orphans(min_hours=args.hours)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        elif not rows:
+            print(f"clean: no ownerless active task untouched {args.hours:.0f}h+")
+        else:
+            print(
+                f"{len(rows)} ownerless active task(s) untouched "
+                f"{args.hours:.0f}h+ — reassign or close (escalate to "
+                f"operator per 48h contract):"
+            )
+            _print_rows(rows)
     return 0
 
 

@@ -96,6 +96,11 @@ class HeartbeatScheduler:
     def __init__(self, bot) -> None:
         self.bot = bot
         self._task: asyncio.Task | None = None
+        # One-shot warning registry — a misconfigured pilot (retired agent
+        # still listed, checklist missing/empty) logs ONCE per process
+        # instead of silently rotting (the marketing-stale-17h failure) or
+        # spamming every 5-min tick.
+        self._warned: set[str] = set()
 
     def start(self) -> None:
         """Idempotent — on_ready re-fires on every reconnect."""
@@ -120,6 +125,23 @@ class HeartbeatScheduler:
                 log.exception("[%s] heartbeat tick failed", self.bot.label)
             await asyncio.sleep(_TICK_SECONDS)
 
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning(msg)
+
+    @staticmethod
+    def _checklist_is_empty(text: str) -> bool:
+        """True when the checklist has no actionable content — only blanks,
+        markdown headings, comments, or horizontal rules. OpenClaw
+        suppression-pack semantics: no checklist items, no beat."""
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith(("#", "<!--", "---", ">")):
+                continue
+            return False
+        return True
+
     async def _tick(self) -> None:
         cfg = self._config()
         if not cfg.get("enabled"):
@@ -132,6 +154,18 @@ class HeartbeatScheduler:
         now_hour = datetime.now().hour  # local time — bot runs on the laptop
         if not (start_h <= now_hour < end_h):
             return
+
+        # Pilot hygiene (Wave 3 P0-3): a configured pilot with no loaded
+        # agent is invisible forever — that's how marketing's beat went
+        # stale for 17h with zero errors after the agent was retired. Say
+        # it loudly, once.
+        loaded = {a.name for a in self.bot.agents.values()}
+        for missing in sorted(pilots - loaded):
+            self._warn_once(
+                f"pilot-missing:{missing}",
+                f"[heartbeat] configured pilot '{missing}' has no loaded "
+                f"agent (retired?) — remove it from defaults.heartbeat.agents",
+            )
 
         state = _load_state()
         now = time.time()
@@ -146,19 +180,53 @@ class HeartbeatScheduler:
                 continue
             hb_file = ROOT / "agents" / agent.name / "HEARTBEAT.md"
             if not hb_file.exists():
-                continue  # opted in by config but no checklist yet — skip
+                self._warn_once(
+                    f"no-checklist:{agent.name}",
+                    f"[heartbeat] pilot '{agent.name}' has no HEARTBEAT.md — "
+                    f"skipping its beats",
+                )
+                continue
+            # skip_when_busy (OpenClaw suppression pack): a beat queued
+            # behind a live operator turn would land minutes late into a
+            # conversation nobody invited it to. Skip WITHOUT stamping so
+            # the beat retries on the next 5-min tick once the channel is
+            # free.
+            if cfg.get("skip_when_busy", True) and self.bot._channel_lock(
+                channel_id
+            ).locked():
+                log.debug("[%s] heartbeat deferred — channel busy", agent.name)
+                continue
+            try:
+                checklist_text = hb_file.read_text()
+            except Exception as e:
+                self._warn_once(
+                    f"unreadable:{agent.name}",
+                    f"[heartbeat] unreadable {hb_file}: {e}",
+                )
+                continue
+            # skip-when-empty: no actionable checklist items, no model run.
+            if self._checklist_is_empty(checklist_text):
+                self._warn_once(
+                    f"empty-checklist:{agent.name}",
+                    f"[heartbeat] pilot '{agent.name}' checklist is empty — "
+                    f"skipping its beats until it has items",
+                )
+                continue
             # Stamp BEFORE running: a crashing beat must not re-fire every
             # tick and hammer the model. Missing one beat is fine.
             state[agent.name] = now
             _save_state(state)
-            await self._run_beat(channel_id, agent, hb_file)
+            await self._run_beat(channel_id, agent, hb_file, cfg)
 
-    async def _run_beat(self, channel_id: str, agent, hb_file: Path) -> None:
+    async def _run_beat(
+        self, channel_id: str, agent, hb_file: Path, cfg: dict | None = None
+    ) -> None:
         # Imports deferred to avoid a bot↔heartbeat import cycle at load.
         from bot import _save_session
         from relay import CollectingSink, run_agent
         import session_rotation
 
+        cfg = cfg or self._config()
         try:
             checklist = hb_file.read_text().strip()
         except Exception as e:
@@ -170,20 +238,30 @@ class HeartbeatScheduler:
         t0 = time.time()
         async with self.bot._channel_lock(channel_id):
             resume = self.bot.sessions.get(channel_id)
-            rot_note = session_rotation.check(
-                agent.name,
-                resume,
-                (self.bot.global_cfg.get("defaults", {}) or {}).get(
-                    "session_rotation"
-                ),
+            rot_cfg = (self.bot.global_cfg.get("defaults", {}) or {}).get(
+                "session_rotation"
             )
+            rot_note = session_rotation.check(agent.name, resume, rot_cfg)
             if rot_note is not None:
+                # Wave 3 P0-1: same pre-rotation flush as the message path —
+                # a beat that triggers rotation must not amnesia the session.
+                if await session_rotation.flush(agent, resume, rot_cfg):
+                    rot_note = (
+                        session_rotation.check(agent.name, resume, rot_cfg)
+                        or rot_note
+                    )
                 resume = None
                 prompt = f"{rot_note}\n\n{prompt}"
             sink = CollectingSink()
             try:
+                # Utility-model beats (Wave 3 P0-3, OpenClaw utilityModel):
+                # the pulse runs on a cheaper model + lower effort than the
+                # agent's real turns. Config: defaults.heartbeat.model /
+                # .effort; omit either to inherit the agent's own.
                 final_text, session_id = await run_agent(
-                    agent, prompt, sink, resume_session_id=resume
+                    agent, prompt, sink, resume_session_id=resume,
+                    model_override=cfg.get("model"),
+                    effort_override=cfg.get("effort"),
                 )
             except Exception:
                 log.exception("[%s] heartbeat run failed", agent.name)

@@ -377,6 +377,9 @@ async def run_agent(
     current_hop: int = 0,
     max_hops: int = 8,
     chain: str = "",
+    model_override: str | None = None,
+    effort_override: str | None = None,
+    max_turns_override: int | None = None,
 ) -> tuple[str, str | None]:
     """Run `prompt` through the agent and stream into `sink`.
 
@@ -386,6 +389,13 @@ async def run_agent(
     this message), which lets `send_to_agent` refuse cycles at any depth. The
     agent_comms MCP server is mounted fresh each turn with these values
     closure-captured, so the tool enforces both guards automatically.
+
+    The `*_override` params support utility runs (OpenClaw utilityModel
+    semantics, Wave 3 P0): heartbeats and pre-rotation memory flushes run
+    the SAME agent identity on a cheaper model / lower effort / tighter
+    turn cap. They apply to this turn's options copy only — the cached
+    AgentConfig is never mutated, so the next operator turn is back on the
+    agent's real model.
 
     Returns (final_text, session_id). session_id can be persisted by the
     caller to resume a conversation in the same Discord thread next time.
@@ -403,6 +413,14 @@ async def run_agent(
     # Always assign (never conditionally): a stale resume id from a previous
     # turn would leak into a fresh conversation if we only set it when truthy.
     options.resume = resume_session_id or None
+    # Utility-run overrides (heartbeat / rotation flush). Scalar reassignment
+    # on the per-turn copy — see the shallow-copy contract above.
+    if model_override:
+        options.model = model_override
+    if effort_override:
+        options.effort = effort_override
+    if max_turns_override:
+        options.max_turns = max_turns_override
 
     # Mount the agent-comms MCP server with this turn's hop context.
     comms_server = build_comms_server(

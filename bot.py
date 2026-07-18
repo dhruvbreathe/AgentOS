@@ -470,11 +470,22 @@ class RelayBot(discord.Client):
             # reported context exceeds the ceiling, start FRESH seeded with a
             # memory handoff instead of resuming a bloated session. Fail-open:
             # check() returns None on any error and we resume as before.
-            _rot_note = session_rotation.check(
-                agent.name, resume,
-                (self.global_cfg.get("defaults", {}) or {}).get("session_rotation"),
+            _rot_cfg = (self.global_cfg.get("defaults", {}) or {}).get(
+                "session_rotation"
             )
+            _rot_note = session_rotation.check(agent.name, resume, _rot_cfg)
             if _rot_note is not None:
+                # Wave 3 P0-1 (2026-07-18): pre-rotation memory flush. Run one
+                # silent distillation turn in the OLD session so working state
+                # (especially in-flight background work) lands in the daily
+                # memory file, then rebuild the handoff from that fresh
+                # memory. Fail-open: flush() False → rotate with the original
+                # note, exactly the pre-flush behavior.
+                if await session_rotation.flush(agent, resume, _rot_cfg):
+                    _rot_note = (
+                        session_rotation.check(agent.name, resume, _rot_cfg)
+                        or _rot_note
+                    )
                 resume = None
                 prompt = f"{_rot_note}\n\n{prompt}"
             try:

@@ -23,8 +23,10 @@ Design constraints:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -86,6 +88,76 @@ def _memory_tail(agent_name: str) -> str:
             break
     text = "\n".join(chunks)
     return text[-_HANDOFF_CHAR_BUDGET:] if text else "(no recent memory notes)"
+
+
+FLUSH_PROMPT = """\
+[pre-rotation memory flush] This session has crossed its context ceiling and \
+will be ROTATED after this turn: your next turn starts a fresh session that \
+sees only your system prompt plus a short tail of your daily memory file. \
+Anything not written down now is gone.
+
+Do this, quickly and silently (your final text here is discarded, nothing \
+posts to Discord):
+1. Append a compact working-state block to today's daily memory file \
+(agents/<you>/memory/YYYY-MM-DD.md) using the Write/Edit tools: current \
+task and its exact state, decisions taken this session that aren't yet in \
+a durable file, next concrete step, and any operator asks still open.
+2. IN-FLIGHT WORK IS THE PRIORITY: if you launched background agents, \
+tasks, or long-running jobs this session, record for EACH one: its goal, \
+its full relaunch prompt (verbatim or a file path to it), and how far it \
+got. Background processes DIE with this session — the note is how your \
+next self relaunches them.
+3. Do NOT start new work, do NOT post to any webhook, do NOT route to \
+other agents. Under ~10 tool calls.
+4. Reply with exactly FLUSH_DONE when the memory file is written.
+"""
+
+
+async def flush(agent, session_id: str | None, cfg: dict | None) -> bool:
+    """OpenClaw-style pre-rotation memory flush (Wave 3 P0-1, 2026-07-18).
+
+    Runs ONE silent distillation turn in the about-to-rotate session so the
+    agent writes its working state to the daily memory file — which is
+    exactly what `check()` builds the fresh-session handoff from. Caller
+    should re-run check() afterwards to rebuild the handoff note on top of
+    the freshly-flushed memory.
+
+    Fail-open by contract: any error/timeout returns False and rotation
+    proceeds with whatever memory already existed. Returns True only when
+    the flush turn completed.
+    """
+    try:
+        cfg = cfg or {}
+        fcfg = cfg.get("flush") or {}
+        if not fcfg.get("enabled", False) or not session_id:
+            return False
+        # Deferred import — relay imports agent_loader; importing relay at
+        # module load would cycle through bot.py's import graph.
+        from relay import CollectingSink, run_agent
+
+        timeout_s = float(fcfg.get("timeout_seconds", 240))
+        t0 = time.time()
+        await asyncio.wait_for(
+            run_agent(
+                agent,
+                FLUSH_PROMPT,
+                CollectingSink(),
+                resume_session_id=session_id,
+                model_override=fcfg.get("model"),
+                effort_override=fcfg.get("effort"),
+                max_turns_override=int(fcfg.get("max_turns", 8)),
+            ),
+            timeout=timeout_s,
+        )
+        log.info(
+            "[%s] pre-rotation flush completed in %.0fs (session %s)",
+            agent.name, time.time() - t0, session_id,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — flush must never block rotation
+        log.warning("[%s] pre-rotation flush failed open: %s",
+                    getattr(agent, "name", "?"), e)
+        return False
 
 
 def check(agent_name: str, session_id: str | None, cfg: dict | None) -> str | None:

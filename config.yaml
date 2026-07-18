@@ -48,6 +48,14 @@ defaults:
   # coding config. Per-agent override via `effort:` in agent.yaml — noisy
   # ack-only agents can drop to "medium"/"low" to save cost/latency.
   effort: max
+  # MCP schema diet (2026-07-18 Wave-3 P0-2). strict_mcp_config=true makes
+  # the CLI skip claude.ai-wide MCP servers (~175k deferred-schema tokens of
+  # per-turn tax) for agents that never use them. agent_loader auto-exempts
+  # any agent whose config declares MCP integration notes (KEEP set as of
+  # 2026-07-18: main, project-manager, web-developer, deepali,
+  # market-intelligence-engine) and honors per-agent strict_mcp_config
+  # overrides in agent.yaml.
+  strict_mcp_config: true
 
   # Exec-approval gate. When a Bash command matches one of these regex
   # patterns, the agent's PreToolUse hook posts an approval request to
@@ -103,6 +111,18 @@ defaults:
   session_rotation:
     enabled: true
     max_context_tokens: 150000
+    # Pre-rotation memory flush (2026-07-18 Wave-3 P0-1, OpenClaw adopt).
+    # Before a rotated turn starts fresh, a short silent side-run has the
+    # OLD session write its working state + relaunch prompt into daily
+    # memory, so rotation stops amnesia-ing in-flight work. Cheap model on
+    # purpose (scan/summarize-shaped, not reasoning-shaped); fail-open —
+    # a flush error or timeout never blocks the incoming turn.
+    flush:
+      enabled: true
+      model: claude-sonnet-4-6
+      effort: low
+      timeout_seconds: 240
+      max_turns: 8
     # per_agent: {media: 100000}   # Phase-2: optional earlier rotation for heavy-payload agents
 
   # Phase-2 memory recall (2026-07-05 masterplan item 8). Before each
@@ -197,11 +217,19 @@ defaults:
   # an action the agent takes deliberately, so beats stay silent unless
   # something warrants it. An agent must also have agents/<name>/HEARTBEAT.md
   # or it is skipped. Fail-open everywhere; state in logs/heartbeats.json.
+  # 2026-07-18 Wave-3 P0-3 (heartbeat suppression pack): beats run on a
+  # cheap model at low effort — the checklist is scan-shaped, not
+  # reasoning-shaped — and skip when the channel lock is busy so a beat
+  # never queues behind a live operator turn. marketing dropped from
+  # pilots: beat stale 17h+, HEARTBEAT.md unmaintained post-Mira-rebuild.
   heartbeat:
     enabled: true
     interval_minutes: 240          # per-agent beat cadence
     active_hours: [8, 22]          # local-time window, [start, end)
-    agents: [main, project-manager, backend-developer, marketing]
+    model: claude-haiku-4-5-20251001
+    effort: low
+    skip_when_busy: true
+    agents: [main, project-manager, backend-developer]
 
 # Save-to-vault gate. Operator reacts `emoji` on any agent message to
 # persist the most recent turn (last user prompt + assistant outputs)

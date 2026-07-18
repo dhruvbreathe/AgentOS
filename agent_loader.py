@@ -942,6 +942,24 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         else:
             mcp_notes.append((mcp_name, note))
 
+    # P0-2 MCP schema diet (2026-07-18 Wave 3). The claude.ai account
+    # connectors (Apollo/Gmail/GCal/GDrive/Mixpanel/Supermetrics/higgsfield,
+    # ~200 tools) ride into EVERY agent subprocess via the subscription
+    # OAuth — context telemetry measured them at ~175k tokens of deferred
+    # schemas per turn, fleet-wide. strict_mcp_config=True makes the CLI
+    # mount ONLY options.mcp_servers (per-agent real configs above + the
+    # per-turn agent_comms server relay.py injects), stripping account,
+    # user (~/.claude.json) and project MCP.
+    # Resolution order: explicit `strict_mcp_config` in agent.yaml always
+    # wins; otherwise the fleet default applies EXCEPT for agents that
+    # declare `type: mcp` notes — a declared parent-MCP dependency IS the
+    # opt-out. Self-maintaining: document an integration in agent.yaml and
+    # the agent keeps the connectors; no declaration, it diets.
+    strict_mcp = agent_cfg.get("strict_mcp_config")
+    if strict_mcp is None:
+        strict_mcp = bool(defaults.get("strict_mcp_config", False)) and not mcp_notes
+    strict_mcp = bool(strict_mcp)
+
     blocks: list[str] = []
     if mcp_notes:
         lines = [f"- **{n}** — {d}" for n, d in mcp_notes]
@@ -1296,6 +1314,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         setting_sources=setting_sources,
         sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
+        strict_mcp_config=strict_mcp,
         thinking=thinking_cfg,
         agents=subagents,
         hooks={
