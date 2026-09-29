@@ -19,6 +19,9 @@ from pathlib import Path
 
 VAULT = Path(os.environ.get("VAULT_PATH", "/Users/celainc/Documents/Vayu/Vayu"))
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:[|#][^\]]+)?\]\]")
+# Date-prefixed targets (2026-07-13-store-digest, 2026-05-rollup, 2026-07-20)
+# are session/rollup/daily-note crosslinks, not topic candidates.
+SESSION_LIKE_RE = re.compile(r"^\d{4}-\d{2}(-|$)")
 
 
 def main():
@@ -56,7 +59,9 @@ def main():
     # Gaps = referenced >= min, no Topics/ note
     gaps = [
         (name, count) for name, count in counts.most_common()
-        if count >= args.min and name.lower() not in existing
+        if count >= args.min
+        and name.lower() not in existing
+        and not SESSION_LIKE_RE.match(name)
     ]
 
     out_lines = [

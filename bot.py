@@ -611,6 +611,22 @@ async def _run_all(default_token: str | None) -> None:
     if not groups:
         raise SystemExit("No agents with bot tokens to run.")
 
+    # Pilot hygiene (Wave 3 P0-3), fleet-wide: a configured heartbeat pilot
+    # with no loaded agent anywhere is invisible forever (the marketing
+    # stale-17h failure). Must run against the union of all clients; each
+    # client alone only sees its own token's agents and would false-warn
+    # for pilots owned by sibling clients.
+    hb_cfg = (load_global().get("defaults", {}) or {}).get("heartbeat") or {}
+    if hb_cfg.get("enabled"):
+        fleet = {a.name for grp in groups.values() for a in grp.values()}
+        for missing in sorted(set(hb_cfg.get("agents") or []) - fleet):
+            log.warning(
+                "[heartbeat] configured pilot '%s' has no loaded agent "
+                "anywhere in the fleet (retired?): remove it from "
+                "defaults.heartbeat.agents",
+                missing,
+            )
+
     clients: list[tuple[RelayBot, str]] = []
     for token, agents in groups.items():
         label = ",".join(sorted({a.name for a in agents.values()}))

@@ -155,17 +155,9 @@ class HeartbeatScheduler:
         if not (start_h <= now_hour < end_h):
             return
 
-        # Pilot hygiene (Wave 3 P0-3): a configured pilot with no loaded
-        # agent is invisible forever — that's how marketing's beat went
-        # stale for 17h with zero errors after the agent was retired. Say
-        # it loudly, once.
-        loaded = {a.name for a in self.bot.agents.values()}
-        for missing in sorted(pilots - loaded):
-            self._warn_once(
-                f"pilot-missing:{missing}",
-                f"[heartbeat] configured pilot '{missing}' has no loaded "
-                f"agent (retired?) — remove it from defaults.heartbeat.agents",
-            )
+        # Pilot hygiene lives in bot._run_all (fleet-wide). A per-client
+        # pilots-vs-loaded diff false-warns for every pilot owned by a
+        # different token's client, drowning the real-retirement signal.
 
         state = _load_state()
         now = time.time()
