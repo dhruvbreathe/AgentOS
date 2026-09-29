@@ -41,7 +41,7 @@ subagents:
       - Obvious perf problems (N+1, unbounded loops)
       Skip style, formatting, naming. Under 200 words total.
     tools: [Read, Grep, Glob]
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5-5
     max_turns: 3
 
   # ── Synthesizer — distill a pile of notes into a crisp summary. Sonnet.
@@ -55,7 +55,7 @@ subagents:
       - 3 open questions
       No filler. No preamble. Under 300 words.
     tools: [Read, Glob, Grep]
-    model: claude-sonnet-4-6
+    model: claude-sonnet-5-5
     max_turns: 3
 
   # ── Vault searcher — semantic + keyword search of the Obsidian vault. Haiku.

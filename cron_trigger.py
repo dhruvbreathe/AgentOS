@@ -115,7 +115,7 @@ async def _run(agent_name: str, task_name: str) -> int:
         # Default lite cron fires to Sonnet. Mechanical housekeeping
         # (memory maintenance, doctor checks, health pings, audits) doesn't
         # need Opus-grade reasoning. Task frontmatter `model:` overrides.
-        lite_model = str(fm.get("model", "")).strip() or "claude-sonnet-4-6"
+        lite_model = str(fm.get("model", "")).strip() or "claude-sonnet-5-5"
         if getattr(agent.options, "model", None) != lite_model:
             try:
                 agent.options.model = lite_model

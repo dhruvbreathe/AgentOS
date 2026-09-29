@@ -421,6 +421,11 @@ async def run_agent(
         options.effort = effort_override
     if max_turns_override:
         options.max_turns = max_turns_override
+    # The CLI refuses to start when --fallback-model equals --model; a model
+    # override (e.g. rotation flush on Sonnet) can collide with the default
+    # fallback. Same guard as cron_trigger's lite downshift.
+    if options.fallback_model and options.fallback_model == options.model:
+        options.fallback_model = None
 
     # Mount the agent-comms MCP server with this turn's hop context.
     comms_server = build_comms_server(

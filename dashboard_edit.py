@@ -49,9 +49,11 @@ router = APIRouter()
 
 KNOWN_MODELS = [
     ("", "inherit from config.yaml"),
-    ("claude-opus-4-7", "opus 4.7 (latest, strategic)"),
+    ("claude-opus-5-5", "opus 5.5 (latest, strategic)"),
+    ("claude-sonnet-5-5", "sonnet 5.5 (latest, balanced)"),
+    ("claude-opus-4-7", "opus 4.7"),
     ("claude-opus-4-6", "opus 4.6"),
-    ("claude-sonnet-4-6", "sonnet 4.6 (balanced)"),
+    ("claude-sonnet-4-6", "sonnet 4.6"),
     ("claude-haiku-4-5-20251001", "haiku 4.5 (fast, cheap)"),
     ("opus", "opus (alias)"),
     ("sonnet", "sonnet (alias)"),

@@ -5,8 +5,8 @@ guild_id_env: DISCORD_GUILD_ID
 
 # Defaults applied to every agent unless overridden in agent.yaml.
 defaults:
-  model: claude-opus-4-8              # 2026-07-02: operator directive, Opus across ALL agents (supersedes 2026-07-01 Fable 5). Single source of truth: per-agent model hardcodes removed same day so the whole fleet inherits this line.
-  fallback_model: claude-sonnet-4-6   # 2026-07-02: Sonnet 4.6 fallback. Distinct from primary; lite-cron downshift collision handled by cron_trigger guard (2026-06-25).
+  model: claude-opus-5-5              # 2026-09-29: operator directive, latest models (supersedes 2026-07-21 Sonnet token diet). Needs SDK >= 0.2.161 (bundled CLI >= 2.1.280). Single source of truth: whole fleet inherits this line.
+  fallback_model: claude-sonnet-5-5   # 2026-09-29: latest Sonnet, distinct from Opus primary; lite-cron/flush collisions cleared by cron_trigger + relay guards.
   permission_mode: acceptEdits
   max_turns: 40                       # was 20 — long exploration chains were getting clipped mid-turn
   # Isolate each agent's CLI subprocess from ~/.claude/settings.json — the
@@ -48,6 +48,11 @@ defaults:
   # coding config. Per-agent override via `effort:` in agent.yaml — noisy
   # ack-only agents can drop to "medium"/"low" to save cost/latency.
   effort: max
+  # Interactive effort cap (2026-09-29, operator-approved latency fix).
+  # Operator Discord turns run at no more than this effort; agent-to-agent
+  # routed turns, crons and heartbeats keep their own. Only ever LOWERS
+  # effort — agents already at or below the cap are untouched.
+  interactive_effort: medium
   # MCP schema diet (2026-07-18 Wave-3 P0-2). strict_mcp_config=true makes
   # the CLI skip claude.ai-wide MCP servers (~175k deferred-schema tokens of
   # per-turn tax) for agents that never use them. agent_loader auto-exempts
@@ -119,7 +124,7 @@ defaults:
     # a flush error or timeout never blocks the incoming turn.
     flush:
       enabled: true
-      model: claude-sonnet-4-6
+      model: claude-sonnet-5-5
       effort: low
       timeout_seconds: 240
       max_turns: 8

@@ -58,10 +58,10 @@ def _agent_model(agent: str) -> str:
     if y.exists():
         try:
             cfg = yaml.safe_load(y.read_text()) or {}
-            return cfg.get("model") or "claude-opus-4-8"
+            return cfg.get("model") or "claude-opus-5-5"
         except Exception:
             pass
-    return "claude-opus-4-8"
+    return "claude-opus-5-5"
 
 
 def _cost(row: dict, fam: str) -> float:

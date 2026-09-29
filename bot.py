@@ -108,6 +108,20 @@ def _save_session(key: str, session_id: str) -> None:
     session_store.set_session(key, session_id)
 
 
+_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+
+
+def _interactive_effort(agent: AgentConfig, cap: str | None) -> str | None:
+    """Effort override for an operator Discord turn, or None to keep the
+    agent's own. The cap only ever lowers effort (defaults.interactive_effort)."""
+    current = getattr(agent.options, "effort", None)
+    if cap not in _EFFORT_ORDER or current not in _EFFORT_ORDER:
+        return None
+    if _EFFORT_ORDER.index(current) <= _EFFORT_ORDER.index(cap):
+        return None
+    return cap
+
+
 # Heuristic for the Hermes-style auto-save 💾 reaction. A reply counts as
 # "substantive" if it is long enough OR has the kind of structure that
 # signals a real decision/handoff rather than a quick ack.
@@ -515,6 +529,17 @@ class RelayBot(discord.Client):
                             "[%s] typing rate-limited (%s) on channel %s — skipping indicator for %ds",
                             self.label, getattr(e, "code", e.status), channel_id, cool_for_s,
                         )
+                # Operator turns are latency-sensitive: cap effort. Routed
+                # agent-to-agent turns (sender set) keep the agent's own.
+                _effort = None if sender else _interactive_effort(
+                    agent,
+                    (self.global_cfg.get("defaults", {}) or {}).get(
+                        "interactive_effort"
+                    ),
+                )
+                if _effort:
+                    log.info("[%s] interactive effort cap: %s -> %s",
+                             agent.name, agent.options.effort, _effort)
                 try:
                     final_text, session_id = await run_agent(
                         agent,
@@ -524,6 +549,7 @@ class RelayBot(discord.Client):
                         current_hop=current_hop,
                         max_hops=max_hops,
                         chain=chain,
+                        effort_override=_effort,
                     )
                 finally:
                     if typing_started:

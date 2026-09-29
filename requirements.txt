@@ -1,4 +1,4 @@
-claude-agent-sdk>=0.2.110
+claude-agent-sdk>=0.2.161
 discord.py>=2.4.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
