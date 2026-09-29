@@ -219,6 +219,37 @@ def _build_index(agent_name: str, vault: Path | None) -> list[_Doc]:
             except OSError:
                 pass
 
+    # Archived LEARNINGS/MEMORY overflow (2026-09-29 memory caps). The live
+    # files are capped because they ride in every system prompt; whatever was
+    # consolidated out stays reachable here. One doc per "## " section, long
+    # sections split per bullet so a single lesson can surface on its own.
+    for arch in ("LEARNINGS-archive.md", "MEMORY-archive.md"):
+        p = AGENTS_DIR / agent_name / arch
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for section in re.split(r"\n(?=#{2,3} )", text):
+            lines = section.strip().splitlines()
+            if not lines:
+                continue
+            head = lines[0].lstrip("# ").strip()
+            parts = (re.split(r"\n(?=[-*] )", "\n".join(lines[1:]))
+                     if len(section) > 1500 else ["\n".join(lines[1:])])
+            for part in parts:
+                part = part.strip()
+                if len(part) < 40:
+                    continue
+                docs.append(_Doc(
+                    label=f"{arch}",
+                    title_tokens=_tokens(head),
+                    tokens=_tokens(head + " " + part[:1200]),
+                    snippet=(head + " — " + part.lstrip("-* ").replace("\n", " "))[:_SNIPPET_CHARS],
+                    weight=0.95,
+                ))
+
     # Agent's own daily memory — "## " sections of the last N days.
     mem_dir = AGENTS_DIR / agent_name / "memory"
     if mem_dir.is_dir():

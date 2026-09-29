@@ -53,6 +53,28 @@ defaults:
   # routed turns, crons and heartbeats keep their own. Only ever LOWERS
   # effort — agents already at or below the cap are untouched.
   interactive_effort: medium
+  # Warm sessions (2026-09-29, session_pool.py; OpenClaw liveSession): the
+  # operator's turns in these agents' channels reuse one live CLI process
+  # instead of spawning + reconnecting MCP + reloading the session per turn.
+  # Other turn kinds stay per-turn. Recycled on idle, on max lifetime (OAuth
+  # can't refresh inside store-resumed processes), on option changes and on
+  # rotation; any failure falls back to a per-turn client.
+  warm_sessions:
+    enabled: true
+    agents: [main]
+    idle_seconds: 900
+    max_lifetime_seconds: 1800
+  # Burst debounce (2026-09-29, OpenClaw 9.6): same-author operator messages
+  # arriving within this window (extended per message, max 3s) become one
+  # turn, so a paste Discord splits into pieces gets one reply. 0 disables.
+  debounce_ms: 500
+  # Memory caps (2026-09-29, Hermes memory_tool): LEARNINGS.md / MEMORY.md
+  # ride in every system prompt. Over-cap writes are refused with a
+  # "consolidate first" message; overflow goes to <FILE>-archive.md, which
+  # memory_recall indexes. Per-agent override: memory_caps in agent.yaml.
+  memory_caps:
+    LEARNINGS.md: 12000
+    MEMORY.md: 8000
   # MCP schema diet (2026-07-18 Wave-3 P0-2). strict_mcp_config=true makes
   # the CLI skip claude.ai-wide MCP servers (~175k deferred-schema tokens of
   # per-turn tax) for agents that never use them. agent_loader auto-exempts
@@ -116,6 +138,11 @@ defaults:
   session_rotation:
     enabled: true
     max_context_tokens: 150000
+    # 2026-09-29 (OpenClaw compaction): past soft_tokens (default 80% of the
+    # ceiling) the flush + rotation runs in the BACKGROUND after the reply is
+    # delivered, at background lane priority, and new input cancels it. The
+    # inline rotation at max_context_tokens remains the backstop.
+    # soft_tokens: 120000
     # Pre-rotation memory flush (2026-07-18 Wave-3 P0-1, OpenClaw adopt).
     # Before a rotated turn starts fresh, a short silent side-run has the
     # OLD session write its working state + relaunch prompt into daily

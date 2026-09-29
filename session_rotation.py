@@ -146,6 +146,7 @@ async def flush(agent, session_id: str | None, cfg: dict | None) -> bool:
                 model_override=fcfg.get("model"),
                 effort_override=fcfg.get("effort"),
                 max_turns_override=int(fcfg.get("max_turns", 8)),
+                origin="flush",
             ),
             timeout=timeout_s,
         )
@@ -180,24 +181,38 @@ def check(agent_name: str, session_id: str | None, cfg: dict | None) -> str | No
         tokens = _last_context_tokens(session_id)
         if tokens is None or tokens < ceiling:
             return None
-        note = (
-            f"[Automatic session rotation] Your previous conversation session "
-            f"reached ~{tokens // 1000}k context tokens and was rotated for "
-            f"performance; this is a fresh session in the same Discord "
-            f"channel and the SAME ongoing conversation with the operator — "
-            f"do not re-introduce yourself. Durable knowledge is already in "
-            f"your system prompt (LEARNINGS/MEMORY). Recent working state "
-            f"from your daily memory:\n\n{_memory_tail(agent_name)}\n\n"
-            f"If the operator's message below references something not "
-            f"covered here, check Sessions/ in the vault or your trajectory "
-            f"logs before asking them to repeat it.\n"
-            f"--- operator message follows ---"
-        )
         log.info(
             "[%s] rotating session %s at %sk tokens (ceiling %sk)",
             agent_name, session_id, tokens // 1000, ceiling // 1000,
         )
-        return note
+        return handoff_note(agent_name, tokens)
     except Exception as e:  # noqa: BLE001 — rotation must never break a turn
         log.warning("[%s] rotation check failed open: %s", agent_name, e)
         return None
+
+
+def handoff_note(agent_name: str, tokens: int | None) -> str:
+    """The fresh-session seed: rotation notice + daily-memory tail."""
+    size = f"~{tokens // 1000}k" if tokens else "a large"
+    return (
+        f"[Automatic session rotation] Your previous conversation session "
+        f"reached {size} context tokens and was rotated for "
+        f"performance; this is a fresh session in the same Discord "
+        f"channel and the SAME ongoing conversation with the operator — "
+        f"do not re-introduce yourself. Durable knowledge is already in "
+        f"your system prompt (LEARNINGS/MEMORY). Recent working state "
+        f"from your daily memory:\n\n{_memory_tail(agent_name)}\n\n"
+        f"If the operator's message below references something not "
+        f"covered here, check Sessions/ in the vault or your trajectory "
+        f"logs before asking them to repeat it.\n"
+        f"--- operator message follows ---"
+    )
+
+
+def soft_threshold(agent_name: str, cfg: dict | None) -> int:
+    """Context size at which a post-reply background rotation is scheduled
+    (default 80% of the hard ceiling), so the operator never waits on it."""
+    cfg = cfg or {}
+    ceiling = int((cfg.get("per_agent") or {}).get(
+        agent_name, cfg.get("max_context_tokens", DEFAULT_MAX_CONTEXT_TOKENS)))
+    return int(cfg.get("soft_tokens") or ceiling * 0.8)

@@ -27,6 +27,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -390,6 +392,96 @@ def check_env_completeness(rep: AgentReport, cfg: dict, dotenv: dict[str, str]) 
 
 # ---- Per-agent runner -------------------------------------------------------
 
+def check_quota(rep: AgentReport) -> None:
+    """Subscription quota breaker state (quota_state.py, logs/quota.json)."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        import quota_state
+        s = quota_state.summary()
+    except Exception as e:
+        rep.add("quota", "warn", f"unreadable: {e}")
+        return
+    wins = ", ".join(
+        f"{k}={w.get('status')}"
+        + (f" {w['utilization']:.0%}" if isinstance(w.get("utilization"), (int, float)) else "")
+        for k, w in (s.get("windows") or {}).items()
+    ) or "no readings yet"
+    if s["blocked"]:
+        rep.add("quota", "fail",
+                f"{s['blocked_window']} exhausted until {s['blocked_until']}; turns queued ({wins})")
+    elif not s["background_allowed"]:
+        rep.add("quota", "warn", f"background standing down: {s['background_reason']} ({wins})")
+    else:
+        rep.add("quota", "ok", wins)
+
+
+def check_claude_auth(rep: AgentReport, dotenv: dict[str, str]) -> None:
+    """Store-backed resume strips the OAuth refresh token from the temp
+    config, so long-lived runs can't refresh (the Aug 26-28 401 streak).
+    A `claude setup-token` token in CLAUDE_CODE_OAUTH_TOKEN avoids it."""
+    recent_auth = 0
+    metrics = ROOT / "logs" / "turn-metrics.jsonl"
+    cutoff = time.time() - 86400
+    try:
+        for line in metrics.read_text().splitlines()[-2000:]:
+            d = json.loads(line)
+            if d.get("error") == "authentication_failed":
+                ts = datetime.fromisoformat(d["ts"]).timestamp()
+                recent_auth += ts >= cutoff
+    except Exception:
+        pass
+    if recent_auth:
+        rep.add("claude-auth", "fail",
+                f"{recent_auth} authentication_failed turn(s) in 24h; run `claude setup-token`")
+    elif not resolve_env("CLAUDE_CODE_OAUTH_TOKEN", dotenv):
+        rep.add("claude-auth", "warn",
+                "CLAUDE_CODE_OAUTH_TOKEN unset: resumed sessions can't refresh OAuth "
+                "(run `claude setup-token`, add to .env; still subscription billing)")
+    else:
+        rep.add("claude-auth", "ok", "long-lived subscription token set")
+
+
+def check_memory_caps(rep: AgentReport, agent_dir: Path, cfg: dict) -> None:
+    caps = {"LEARNINGS.md": 12000, "MEMORY.md": 8000}
+    try:
+        gcfg = yaml.safe_load((ROOT / "config.yaml").read_text()) or {}
+        caps.update((gcfg.get("defaults") or {}).get("memory_caps") or {})
+    except Exception:
+        pass
+    caps.update(cfg.get("memory_caps") or {})
+    over = []
+    for name, cap in caps.items():
+        p = agent_dir / name
+        if p.exists() and cap and len(p.read_text()) > cap:
+            over.append(f"{name} {len(p.read_text()):,}/{cap:,}")
+    if over:
+        rep.add("memory-caps", "warn", "over cap (writes refused until consolidated): " + "; ".join(over))
+    else:
+        rep.add("memory-caps", "ok")
+
+
+def check_turn_latency(rep: AgentReport, agent_name: str) -> None:
+    """Median time-to-first-output of operator turns in the last 24h."""
+    metrics = ROOT / "logs" / "turn-metrics.jsonl"
+    cutoff = time.time() - 86400
+    ttfts = []
+    try:
+        for line in metrics.read_text().splitlines()[-5000:]:
+            d = json.loads(line)
+            if (d.get("agent") == agent_name and d.get("origin") == "operator"
+                    and d.get("ttft_s") is not None
+                    and datetime.fromisoformat(d["ts"]).timestamp() >= cutoff):
+                ttfts.append(float(d["ttft_s"]))
+    except Exception:
+        return
+    if not ttfts:
+        return
+    ttfts.sort()
+    p50 = ttfts[len(ttfts) // 2]
+    rep.add("latency", "warn" if p50 > 20 else "ok",
+            f"operator TTFT p50 {p50:.1f}s over {len(ttfts)} turn(s)/24h")
+
+
 def check_agent(agent_dir: Path, dotenv: dict[str, str]) -> AgentReport:
     rep = AgentReport(agent=agent_dir.name)
     cfg_path = agent_dir / "agent.yaml"
@@ -411,6 +503,8 @@ def check_agent(agent_dir: Path, dotenv: dict[str, str]) -> AgentReport:
     check_trajectory(rep, agent_dir.name)
     check_context_usage(rep, agent_dir.name)
     check_env_completeness(rep, cfg, dotenv)
+    check_memory_caps(rep, agent_dir, cfg)
+    check_turn_latency(rep, agent_dir.name)
     return rep
 
 
@@ -568,6 +662,8 @@ def main() -> int:
     # Global vault check — add to first report or emit separately
     vault_rep = AgentReport(agent="(global)")
     check_vault(vault_rep)
+    check_quota(vault_rep)
+    check_claude_auth(vault_rep, dotenv)
     reports.append(vault_rep)
 
     for agent_dir in targets:

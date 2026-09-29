@@ -8,6 +8,8 @@ Run: python bot.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import heapq
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ from dotenv import load_dotenv
 
 import memory_recall
 import quota_state
+import session_pool
 import session_rotation
 import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
@@ -109,6 +112,66 @@ def _save_session(key: str, session_id: str) -> None:
     session_store.set_session(key, session_id)
 
 
+class LaneLock:
+    """Per-channel turn lock with priority lanes (2026-09-29, OpenClaw
+    command-queue). Still one turn at a time per channel, but when several
+    wait, operator turns go before routed agent-to-agent turns, which go
+    before background work (post-reply rotation). Never preempts a running
+    turn; background work is made cancellable by its owner instead."""
+
+    FOREGROUND, NORMAL, BACKGROUND = 0, 1, 2
+
+    def __init__(self, name: str = "") -> None:
+        self.name = name
+        self._held = False
+        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._seq = 0
+
+    def locked(self) -> bool:
+        return self._held
+
+    def depth(self) -> int:
+        return len(self._waiters)
+
+    async def acquire(self, priority: int) -> None:
+        if not self._held and not self._waiters:
+            self._held = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        heapq.heappush(self._waiters, (priority, self._seq, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # granted just as we were cancelled: pass it on
+            else:
+                self._waiters = [w for w in self._waiters if w[2] is not fut]
+                heapq.heapify(self._waiters)
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                fut.set_result(True)  # ownership transfers; _held stays True
+                return
+        self._held = False
+
+    @contextlib.asynccontextmanager
+    async def lane(self, priority: int):
+        t0 = time.monotonic()
+        await self.acquire(priority)
+        waited = time.monotonic() - t0
+        if waited > 2:
+            log.info("lane %s: waited %.1fs (priority %d, %d still queued)",
+                     self.name, waited, priority, len(self._waiters))
+        try:
+            yield
+        finally:
+            self.release()
+
+
 _EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 
 
@@ -162,7 +225,13 @@ class RelayBot(discord.Client):
         self.streaming_cfg = self.global_cfg.get("streaming", {}) or {}
         self.save_cfg = self.global_cfg.get("save", {}) or {}
         self.sessions = _load_sessions()
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, LaneLock] = {}
+        # Post-reply background rotation (OpenClaw compaction: flush after
+        # delivery, cancelled by new input) and its handoff notes.
+        self._bg_rotation: dict[str, asyncio.Task] = {}
+        self._rotation_notes: dict[str, str] = {}
+        # Burst debounce: (channel, author) -> messages awaiting one turn.
+        self._debounce: dict[tuple[str, int], list[discord.Message]] = {}
         # channel_id → unix-time after which we'll try typing again. When
         # Discord returns 40062 ("service resource is being rate limited")
         # we mark the channel for 30 min and skip typing entirely. Without
@@ -226,6 +295,112 @@ class RelayBot(discord.Client):
             for m in queued:
                 asyncio.create_task(self.on_message(m))
 
+    async def _debounce_burst(
+        self, message: discord.Message, channel_id: str
+    ) -> list[discord.Message] | None:
+        """Collect same-author messages arriving within `debounce_ms` of each
+        other (max 3s total). Returns the burst for the first message's
+        handler; None for later messages, which it absorbs."""
+        window = float(
+            (self.global_cfg.get("defaults", {}) or {}).get("debounce_ms", 500)
+        ) / 1000
+        if window <= 0:
+            return [message]
+        key = (channel_id, message.author.id)
+        if key in self._debounce:
+            self._debounce[key].append(message)
+            return None
+        buf = self._debounce[key] = [message]
+        deadline = time.monotonic() + 3.0
+        seen = 0
+        while len(buf) != seen and time.monotonic() < deadline:
+            seen = len(buf)
+            await asyncio.sleep(window)
+        return self._debounce.pop(key)
+
+    def _maybe_schedule_rotation(self, channel_id: str, agent, session_id: str) -> None:
+        """Past the soft threshold (80% of the ceiling), flush + rotate in the
+        background after the reply is delivered, instead of making the next
+        operator turn pay for the flush (OpenClaw compaction)."""
+        try:
+            rot_cfg = (self.global_cfg.get("defaults", {}) or {}).get(
+                "session_rotation") or {}
+            if not rot_cfg.get("enabled", True):
+                return
+            tokens = session_rotation._last_context_tokens(session_id)
+            if tokens is None or tokens < session_rotation.soft_threshold(agent.name, rot_cfg):
+                return
+            prev = self._bg_rotation.get(channel_id)
+            if prev is not None and not prev.done():
+                return
+            self._bg_rotation[channel_id] = asyncio.create_task(
+                self._bg_rotate(channel_id, agent, session_id, tokens, rot_cfg)
+            )
+        except Exception as e:  # noqa: BLE001 — scheduling must never break a turn
+            log.warning("[%s] rotation scheduling skipped: %s", agent.name, e)
+
+    async def _bg_rotate(self, channel_id: str, agent, session_id: str,
+                         tokens: int, rot_cfg: dict) -> None:
+        try:
+            await asyncio.sleep(5)  # give a quick follow-up the chance to land
+            async with self._channel_lock(channel_id).lane(LaneLock.BACKGROUND):
+                if self.sessions.get(channel_id) != session_id:
+                    return  # the conversation moved on
+                t0 = time.monotonic()
+                await session_rotation.flush(agent, session_id, rot_cfg)
+                # Past the last await: nothing below can be cancelled halfway.
+                self._rotation_notes[channel_id] = session_rotation.handoff_note(
+                    agent.name, tokens)
+                self.sessions.pop(channel_id, None)
+                session_store.update({channel_id: None})
+                log.info("[%s] background rotation done in %.0fs (session %s at %sk)",
+                         agent.name, time.monotonic() - t0, session_id, tokens // 1000)
+            await session_pool.POOL.evict(channel_id)  # its process holds the old session
+        except asyncio.CancelledError:
+            log.info("[%s] background rotation cancelled by new input", agent.name)
+        except Exception:
+            log.exception("[%s] background rotation failed", agent.name)
+
+    async def system_turn(self, channel_id: str, prompt: str, origin: str) -> None:
+        """A turn with no Discord message behind it (task-board wake-up):
+        runs in the channel session, streams into the channel, normal-lane."""
+        agent = self.agents.get(channel_id)
+        if agent is None:
+            return
+        try:
+            channel = self.get_channel(int(channel_id)) or await self.fetch_channel(int(channel_id))
+            placeholder = await channel.send(self.streaming_cfg.get("thinking_indicator", "…"))
+        except Exception as e:
+            log.warning("[%s] system turn: cannot post to %s: %s", self.label, channel_id, e)
+            return
+        sink = DiscordMessageSink(
+            placeholder,
+            edit_interval=float(self.streaming_cfg.get("edit_interval_seconds", 1.2)),
+            max_length=int(self.streaming_cfg.get("max_message_length", 1900)),
+            agent_name=agent.name,
+        )
+        _bg = self._bg_rotation.get(channel_id)
+        if _bg is not None and not _bg.done():
+            _bg.cancel()
+        async with self._channel_lock(channel_id).lane(LaneLock.NORMAL):
+            resume = self.sessions.get(channel_id)
+            _bg_note = self._rotation_notes.pop(channel_id, None)
+            if _bg_note and resume is None:
+                prompt = f"{_bg_note}\n\n{prompt}"
+            try:
+                _, session_id = await run_agent(
+                    agent, prompt, sink, resume_session_id=resume, origin=origin,
+                )
+            except Exception as e:
+                log.exception("[%s] system turn failed", agent.name)
+                await sink.finalize(f"⚠️ `{agent.name}` error: {e}")
+                return
+            if session_id:
+                self.sessions[channel_id] = session_id
+                _save_session(channel_id, session_id)
+                self._remember_msg_sessions(sink, session_id)
+                self._maybe_schedule_rotation(channel_id, agent, session_id)
+
     async def _quota_hold(self, message: discord.Message, channel_id: str) -> bool:
         """True if the message was queued because every model is out."""
         is_blocked, window, until = quota_state.blocked()
@@ -264,9 +439,9 @@ class RelayBot(discord.Client):
             return False
         return True
 
-    def _channel_lock(self, channel_id: str) -> asyncio.Lock:
+    def _channel_lock(self, channel_id: str) -> LaneLock:
         if channel_id not in self._locks:
-            self._locks[channel_id] = asyncio.Lock()
+            self._locks[channel_id] = LaneLock(channel_id)
         return self._locks[channel_id]
 
     async def _download_attachments(
@@ -418,6 +593,20 @@ class RelayBot(discord.Client):
         if await self._quota_hold(message, channel_id):
             return
 
+        # Burst debounce (OpenClaw 9.6): a long paste Discord splits into
+        # several messages, or rapid follow-ups, become ONE operator turn.
+        burst: list[discord.Message] = [message]
+        if not sender:
+            merged = await self._debounce_burst(message, channel_id)
+            if merged is None:
+                return  # folded into an earlier message's turn
+            if len(merged) > 1:
+                burst = merged
+                message = merged[-1]
+                body = "\n\n".join(m.content for m in merged if m.content.strip())
+                log.info("[%s] merged %d burst messages into one turn",
+                         agent.name, len(merged))
+
         author = (
             f"@{sender} (agent, hop {current_hop}/{max_hops})"
             if sender
@@ -428,7 +617,9 @@ class RelayBot(discord.Client):
         # agent can Read them (PDFs, images, text, etc.). Discord delivers
         # these as .attachments, not in .content, so they're invisible
         # unless we surface them explicitly.
-        attach_paths = await self._download_attachments(message)
+        attach_paths: list[Path] = []
+        for m in burst:
+            attach_paths += await self._download_attachments(m)
 
         # Transcribe any audio attachments — voice messages are just .ogg
         # files in Discord. We inject the transcript inline so the agent
@@ -514,8 +705,19 @@ class RelayBot(discord.Client):
             agent_name=agent.name,
         )
 
-        async with self._channel_lock(channel_id):
+        # New input cancels a pending post-reply rotation; it retries after
+        # a later turn (and the hard-ceiling inline rotation still backstops).
+        _bg = self._bg_rotation.get(channel_id)
+        if _bg is not None and not _bg.done():
+            _bg.cancel()
+        _prio = LaneLock.NORMAL if sender else LaneLock.FOREGROUND
+        async with self._channel_lock(channel_id).lane(_prio):
             resume = self.sessions.get(channel_id)
+            # A background rotation finished since the last turn: this turn
+            # starts the fresh session, seeded with its handoff.
+            _bg_note = self._rotation_notes.pop(channel_id, None)
+            if _bg_note and resume is None:
+                prompt = f"{_bg_note}\n\n{prompt}"
             # Phase-2 memory recall (2026-07-05): prepend top-k vault/memory
             # matches for the incoming message so the agent starts the turn
             # already holding its most relevant notes. Keys off the raw
@@ -603,6 +805,12 @@ class RelayBot(discord.Client):
                         chain=chain,
                         effort_override=_effort,
                         origin="routed" if sender else "operator",
+                        warm_pool=(
+                            session_pool.POOL
+                            if not sender and session_pool.POOL.enabled_for(agent.name)
+                            else None
+                        ),
+                        warm_key=channel_id,
                     )
                 finally:
                     if typing_started:
@@ -616,6 +824,7 @@ class RelayBot(discord.Client):
                     # A5: remember which messages belong to this session so
                     # a later 💾 on them saves the right turn.
                     self._remember_msg_sessions(sink, session_id)
+                    self._maybe_schedule_rotation(channel_id, agent, session_id)
 
                 # Mirror the agent's outbound reply into the web chat too,
                 # so operators watching the web UI see the answer alongside
@@ -707,6 +916,115 @@ async def _deferred_cron_loop() -> None:
             log.exception("deferred cron replay failed")
 
 
+async def _kanban_loop(clients: list[RelayBot]) -> None:
+    """Task-board dispatcher (kanban.py). One per machine: a non-blocking
+    flock guards against a second bot process (double launchd start)."""
+    import fcntl
+
+    import kanban
+    from agent_tools import _post_to_webhook
+    from relay import CollectingSink
+
+    lock_fh = open(kanban.DISPATCH_LOCK, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.warning("kanban: another process holds the dispatcher lock; not dispatching")
+        return
+    lost = kanban.reclaim(all_running=True)  # a restart killed in-flight workers
+    if lost:
+        log.info("kanban: requeued %d card(s) lost to restart: %s", len(lost), lost)
+
+    def _agent(name: str):
+        for c in clients:
+            for a in c.agents.values():
+                if a.name == name:
+                    return c, a
+        return None, None
+
+    async def _notice(agent, text: str) -> None:
+        if agent is not None and agent.webhook_url:
+            try:
+                await _post_to_webhook(agent.webhook_url, text, username=f"{agent.name} (task board)")
+            except Exception as e:
+                log.warning("kanban notice failed: %s", e)
+
+    def _mirror(card: dict) -> None:
+        if not card.get("ledger_id"):
+            return
+        try:
+            import task_ledger
+            status = "done" if card["status"] == "done" else "blocked"
+            fields = {"status": status, "result": (card.get("summary") or "")[:2000]}
+            if status == "blocked":
+                fields["blocked_reason"] = (card.get("summary") or card["status"])[:500]
+            task_ledger.update_task(card["ledger_id"], **fields)
+        except Exception as e:  # noqa: BLE001 — mirror is best-effort
+            log.warning("kanban ledger update failed for %s: %s", card["id"], e)
+
+    async def _run_card(card: dict) -> None:
+        _, agent = _agent(card["to_agent"])
+        if agent is None:
+            kanban.complete(card["id"], "failed", f"no loaded agent @{card['to_agent']}")
+            return
+        await _notice(agent, f"🗂️ **{card['id']}** from @{card['from_agent']}: {card['title']}")
+        outcome: dict = {}
+        text = ""
+        try:
+            text, _ = await asyncio.wait_for(
+                run_agent(
+                    agent, kanban.worker_prompt(card), CollectingSink(),
+                    origin="task", outcome=outcome,
+                    task_ctx={"task_id": card["id"], "chain": card["chain"],
+                              "depth": card["depth"]},
+                ),
+                timeout=kanban.CLAIM_TTL_S - 60,
+            )
+        except asyncio.TimeoutError:
+            text = "worker timed out"
+            outcome["error"] = "timeout"
+        except Exception as e:
+            log.exception("kanban worker %s crashed", card["id"])
+            text, outcome["error"] = f"worker crashed: {e}", "crash"
+        if outcome.get("error") in ("rate_limit", "billing_error"):
+            # Out of quota mid-task: run it again after the reset.
+            if kanban.requeue(card["id"]):
+                log.warning("kanban: %s requeued (quota)", card["id"])
+                return
+        closed = kanban.get(card["id"])
+        if closed and closed["status"] == "running":
+            ok = bool(text.strip()) and not outcome.get("error")
+            closed = kanban.complete(card["id"], "done" if ok else "failed",
+                                     text.strip()[:3000] or "(no output)") or closed
+        if closed and closed["status"] in kanban.TERMINAL:
+            icon = {"done": "✅", "blocked": "⛔", "failed": "❌"}[closed["status"]]
+            await _notice(agent, f"{icon} **{closed['id']}** {closed['status']}: "
+                                 f"{(closed.get('summary') or '')[:1500]}")
+            await asyncio.to_thread(_mirror, closed)
+
+    running: dict[str, asyncio.Task] = {}
+    while True:
+        await asyncio.sleep(5)
+        try:
+            running = {k: t for k, t in running.items() if not t.done()}
+            kanban.reclaim()
+            kanban.promote()
+            if not quota_state.blocked()[0]:
+                for card in kanban.claim_next(busy_agents=set(running)):
+                    log.info("kanban: %s -> @%s: %s", card["id"], card["to_agent"], card["title"])
+                    running[card["to_agent"]] = asyncio.create_task(_run_card(card))
+            for batch in kanban.take_settled_batches():
+                client, req = _agent(batch["requester"])
+                if client is None:
+                    log.warning("kanban: requester @%s not loaded; results unread", batch["requester"])
+                    continue
+                log.info("kanban: waking @%s with %d result(s)", req.name, len(batch["tasks"]))
+                asyncio.create_task(client.system_turn(
+                    req.channel_id, kanban.wake_prompt(batch), origin="wake"))
+        except Exception:
+            log.exception("kanban dispatcher tick failed")
+
+
 async def _run_all(default_token: str | None) -> None:
     groups = _group_agents_by_token(default_token)
     if not groups:
@@ -734,6 +1052,7 @@ async def _run_all(default_token: str | None) -> None:
     for token, agents in groups.items():
         label = ",".join(sorted({a.name for a in agents.values()}))
         clients.append((RelayBot(label=label, agents=agents), token))
+    asyncio.create_task(_kanban_loop([c for c, _ in clients]))
 
     # Stagger startup by ~150ms per client so N>~12 websocket handshakes
     # don't all race DNS resolution at once (saw a gaierror burst at 9).

@@ -120,6 +120,36 @@ async def _run(agent_name: str, task_name: str) -> int:
             quota_state.defer_cron(agent_name, task_name, reason)
             return 0
 
+    # Script gate (2026-09-29, Hermes cron/scheduler.py). `script:` runs a
+    # cheap pre-check before any model call:
+    #   non-zero exit          -> wake the agent with the failure (still alerts)
+    #   empty stdout           -> nothing changed: no model call, no post
+    #   last line {"wakeAgent": false, "deliver": "..."} -> no model call; the
+    #                             optional `deliver` text is posted as-is
+    #   `no_agent: true`       -> stdout posted as-is, never a model call
+    #   otherwise              -> stdout appended to the prompt
+    script_block = ""
+    if fm.get("script"):
+        rc, out, err = await _run_gate_script(
+            str(fm["script"]), float(fm.get("script_timeout", 120))
+        )
+        out = out.strip()
+        wake, deliver = _parse_wake_gate(out) if rc == 0 else (True, None)
+        if rc == 0 and (not out or not wake or fm.get("no_agent")):
+            text = deliver if deliver is not None else (out if fm.get("no_agent") else "")
+            log.info("gate %s/%s: no model call (%s)", agent_name, task_name,
+                     "delivered" if text else "nothing to report")
+            if text:
+                return await _deliver(load_agent(agent_name, lite=True), task_name, text, silent)
+            return 0
+        if rc != 0:
+            script_block = (
+                f"\n\n## Script Output (gate script FAILED, exit {rc})\n"
+                f"```\n{(out + chr(10) + err).strip()[:8000]}\n```"
+            )
+        else:
+            script_block = f"\n\n## Script Output\n```\n{out[:12000]}\n```"
+
     agent = load_agent(agent_name, lite=lite)
     if lite:
         log.info("Loaded %s in lite-bootstrap mode (task=%s)", agent_name, task_name)
@@ -152,6 +182,9 @@ async def _run(agent_name: str, task_name: str) -> int:
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "
         f"{datetime.now().isoformat(timespec='seconds')}]\n\n{body}"
+        + script_block
+        + "\n\nIf after checking there is genuinely nothing worth posting, reply "
+        "with exactly `[SILENT]` and nothing will be posted."
     )
 
     sink = CollectingSink()
@@ -170,30 +203,74 @@ async def _run(agent_name: str, task_name: str) -> int:
             log.error("auth failed on %s/%s: %s", agent.name, task_name, text[:200])
             return 5
 
-        if silent:
-            log.info(
-                "systemEvent task %s/%s completed (kind=%s) — output in trajectory, no webhook post",
-                agent.name, task_name, kind or "silent",
-            )
-            print(text)
-        elif not agent.webhook_url:
-            log.warning(
-                "Agent %s has no webhook_url; printing to stdout instead", agent.name
-            )
-            print(text)
-        else:
-            header = f"**[{task_name}]**\n"
-            posted = await _post_webhook(
-                agent.webhook_url, header + text, username=f"{agent.name} (scheduled)"
-            )
-            if not posted:
-                # Output exists in the trajectory + task log, but the operator
-                # never saw it. Nonzero exit so launchd logs show the failure.
-                return 3
-        return 0
+        if text.strip().startswith("[SILENT]"):
+            log.info("task %s/%s replied [SILENT]: nothing posted", agent.name, task_name)
+            return 0
+        return await _deliver(agent, task_name, text, silent)
     finally:
         if oneshot:
             _cleanup_oneshot(agent_name, task_name, task_file)
+
+
+async def _deliver(agent, task_name: str, text: str, silent: bool) -> int:
+    """Post a task's output to the agent's channel (or stdout when silent)."""
+    if silent:
+        log.info("systemEvent task %s/%s completed: output in trajectory, no webhook post",
+                 agent.name, task_name)
+        print(text)
+        return 0
+    if not agent.webhook_url:
+        log.warning("Agent %s has no webhook_url; printing to stdout instead", agent.name)
+        print(text)
+        return 0
+    posted = await _post_webhook(
+        agent.webhook_url, f"**[{task_name}]**\n" + text,
+        username=f"{agent.name} (scheduled)",
+    )
+    # Output exists in the trajectory + task log, but the operator never saw
+    # it. Nonzero exit so launchd logs show the failure.
+    return 0 if posted else 3
+
+
+async def _run_gate_script(script: str, timeout: float) -> tuple[int, str, str]:
+    """Run a gate script (path relative to the AgentOS root). .py runs on the
+    venv interpreter, .sh on bash, anything else is exec'd directly."""
+    root = Path(__file__).resolve().parent
+    path = Path(script) if Path(script).is_absolute() else root / script
+    if path.suffix == ".py":
+        argv = [str(root / ".venv" / "bin" / "python"), str(path)]
+    elif path.suffix == ".sh":
+        argv = ["/bin/bash", str(path)]
+    else:
+        argv = [str(path)]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(root),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, "", f"gate script timed out after {timeout:.0f}s"
+    except Exception as e:  # noqa: BLE001 — a broken gate must still wake the agent
+        return 127, "", f"gate script failed to start: {e}"
+
+
+def _parse_wake_gate(out: str) -> tuple[bool, str | None]:
+    """Last stdout line {"wakeAgent": false, "deliver": "..."} skips the model."""
+    import json as _json
+    last = out.strip().splitlines()[-1] if out.strip() else ""
+    if not last.startswith("{"):
+        return True, None
+    try:
+        d = _json.loads(last)
+    except ValueError:
+        return True, None
+    if not isinstance(d, dict) or d.get("wakeAgent", True):
+        return True, None
+    deliver = d.get("deliver")
+    return False, str(deliver) if deliver else None
 
 
 def _cleanup_oneshot(agent_name: str, task_name: str, task_file: Path) -> None:

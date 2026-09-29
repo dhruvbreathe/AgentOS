@@ -638,6 +638,61 @@ def _build_facts_hygiene_hook(agent_name: str, enabled: bool = True):
     return _gate
 
 
+DEFAULT_MEMORY_CAPS = {"LEARNINGS.md": 12_000, "MEMORY.md": 8_000}
+
+
+def _build_memory_cap_hook(agent_name: str, agent_dir: Path, caps: dict[str, int]):
+    """PreToolUse gate: refuse a Write/Edit that would push this agent's
+    LEARNINGS.md / MEMORY.md past its cap (2026-09-29, Hermes memory_tool:
+    "usage X/Y, consolidate first"). These files are inlined into every
+    turn's system prompt, so unbounded growth is latency and quota. Overflow
+    belongs in <FILE>-archive.md, which memory_recall indexes. Fail-open.
+    """
+    targets = {
+        (agent_dir / name).resolve(): (name, int(cap))
+        for name, cap in (caps or {}).items() if cap
+    }
+
+    async def _gate(input_data, tool_use_id, context):
+        try:
+            tool = input_data.get("tool_name")
+            if tool not in ("Write", "Edit"):
+                return {}
+            ti = input_data.get("tool_input", {}) or {}
+            fp = str(ti.get("file_path", "") or "")
+            hit = targets.get(Path(fp).resolve()) if fp else None
+            if not hit:
+                return {}
+            name, cap = hit
+            if tool == "Write":
+                proposed = ti.get("content", "") or ""
+            else:
+                current = Path(fp).read_text() if Path(fp).exists() else ""
+                old, new = ti.get("old_string", ""), ti.get("new_string", "")
+                proposed = (current.replace(old, new) if ti.get("replace_all")
+                            else current.replace(old, new, 1))
+            if len(proposed) <= cap:
+                return {}
+            archive = name.replace(".md", "-archive.md")
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"{name} would be {len(proposed):,}/{cap:,} chars (cap). "
+                        f"Consolidate first: merge or tighten existing entries, "
+                        f"and move detail or resolved incidents to {archive} in "
+                        f"the same folder (append-only, still found by memory "
+                        f"recall). Then retry with the file under the cap."
+                    ),
+                }
+            }
+        except Exception:
+            return {}  # fail-open
+
+    return _gate
+
+
 def _build_loop_guard_hook(agent_name: str, threshold: int = 5, enabled: bool = True):
     """Build a PreToolUse hook that aborts phantom / runaway tool-call loops
     early, before `max_turns` burns out the whole budget.
@@ -861,7 +916,9 @@ async def _block_raw_crontab(input_data, tool_use_id, context):
     }
 
 
-def _load_layered_prompt(agent_dir: Path, lite: bool = False) -> str:
+def _load_layered_prompt(
+    agent_dir: Path, lite: bool = False, caps: dict[str, int] | None = None
+) -> str:
     """Concatenate OpenClaw-style per-agent files (if present) into a single
     system prompt. Each file starts with its own H1, so we just separate with
     blank lines.
@@ -875,7 +932,18 @@ def _load_layered_prompt(agent_dir: Path, lite: bool = False) -> str:
     for name in files:
         p = agent_dir / name
         if p.exists():
-            chunks.append(p.read_text().rstrip())
+            text = p.read_text().rstrip()
+            cap = (caps or {}).get(name)
+            if cap:
+                # Usage header (Hermes memory_tool): the agent sees how close
+                # it is to the cap before it tries to add more.
+                text = (
+                    f"<!-- {name}: {len(text):,}/{cap:,} chars "
+                    f"({len(text) / cap:.0%} of cap). Over-cap writes are refused; "
+                    f"overflow goes to {name.replace('.md', '-archive.md')}. -->\n"
+                    + text
+                )
+            chunks.append(text)
     return "\n\n".join(chunks)
 
 
@@ -1027,15 +1095,20 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
     # legacy system_prompt.md + skills + inline integration notes.
     # `lite=True` skips SHARED + skills + legacy and uses LAYERED_FILES_LITE
     # for the layered chunk — keeps the integration notes (cheap, scope-aware).
+    memory_caps = {
+        **DEFAULT_MEMORY_CAPS,
+        **(defaults.get("memory_caps") or {}),
+        **(agent_cfg.get("memory_caps") or {}),
+    }
     native_skills: list[str] = []
     if lite:
         shared = ""
-        layered = _load_layered_prompt(agent_dir, lite=True)
+        layered = _load_layered_prompt(agent_dir, lite=True, caps=memory_caps)
         legacy_sp = ""
         skills = ""
     else:
         shared = _load_shared_prompt()
-        layered = _load_layered_prompt(agent_dir)
+        layered = _load_layered_prompt(agent_dir, caps=memory_caps)
         legacy_name = agent_cfg.get("system_prompt_file", "system_prompt.md")
         legacy_sp = ""
         if legacy_name:
@@ -1223,6 +1296,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         defaults.get("facts_hygiene_gate", True),
     )
     on_facts_hygiene = _build_facts_hygiene_hook(name, enabled=bool(_facts_gate_enabled))
+    on_memory_cap = _build_memory_cap_hook(name, agent_dir, memory_caps)
 
     # Approval gate config — merge per-agent override on top of defaults.
     _approval_defaults = defaults.get("approval") or {}
@@ -1385,6 +1459,8 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
                 HookMatcher(matcher="Write", hooks=[on_facts_hygiene]),
                 HookMatcher(matcher="Edit", hooks=[on_facts_hygiene]),
+                HookMatcher(matcher="Write", hooks=[on_memory_cap]),
+                HookMatcher(matcher="Edit", hooks=[on_memory_cap]),
                 # A2: protected-path gate AFTER the cheap local checks (it
                 # may await a Discord reaction), BEFORE the checkpoint.
                 HookMatcher(matcher="Write", hooks=[write_gate_hook]),
