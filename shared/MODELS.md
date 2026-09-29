@@ -2,26 +2,26 @@
 
 Every agent is running through the bundled Claude Code CLI on Dhruv's Claude.ai subscription. No API keys, no billing per token — but compute time and thinking budget still matter. Here's the landscape and when each model earns its place.
 
-## Available Claude models (2026-04 era)
+## Available Claude models (2026-09)
 
 | Model ID | Alias | Best for | Cost signal |
 |---|---|---|---|
-| `claude-opus-4-6` | opus | Strategic synthesis, cross-domain reasoning, novel designs, nuanced writing | Highest latency + thinking; default for main conversation |
-| `claude-sonnet-4-6` | sonnet | Balanced: most coding work, routine analysis, medium-weight synthesis | Middle latency; the workhorse |
+| `claude-opus-5-5` | opus | Strategic synthesis, cross-domain reasoning, novel designs, nuanced writing | Highest latency + thinking; the fleet default |
+| `claude-sonnet-5-5` | sonnet | Balanced: most coding work, routine analysis, medium-weight synthesis | Middle latency; the workhorse, fallback, lite crons |
 | `claude-haiku-4-5-20251001` | haiku | Lookups, classification, quick acks, summarisation of already-structured input | Fast; cheap on thinking |
 
 The SDK also accepts the aliases `"opus"`, `"sonnet"`, `"haiku"`, `"inherit"` when declaring subagents.
 
 ## Where model choice lives
 
-- **Default:** `config.yaml` `defaults.model: null` — the CLI picks Opus under current subscription.
-- **Per-agent override:** `agent.yaml` `model: claude-sonnet-4-6` locks that agent to Sonnet.
-- **Fallback model:** `config.yaml` `defaults.fallback_model: claude-sonnet-4-6` — kicks in if the primary is rate-limited or 5xxs.
+- **Default:** `config.yaml` `defaults.model: claude-opus-5-5` (whole fleet, 2026-09-29).
+- **Per-agent override:** `agent.yaml` `model: claude-sonnet-5-5` locks that agent to Sonnet.
+- **Fallback model:** `config.yaml` `defaults.fallback_model: claude-sonnet-5-5`. It only kicks in on repeated overload (529) errors, NOT when a usage limit is hit. Usage limits are handled by the quota breaker (quota_state.py): background work pauses near a limit, and a spent weekly Opus window moves Opus runs to Sonnet automatically.
 - **Per-subagent:** `agent.yaml` `subagents.<name>.model: haiku` — see `SUBAGENTS.md`.
 
 ## When to pick each
 
-### Opus (`claude-opus-4-6`)
+### Opus (`claude-opus-5-5`)
 
 - Strategic memos, investor comms, decision frameworks
 - Long-context reasoning across the vault (100+ files to synthesise)
@@ -29,7 +29,7 @@ The SDK also accepts the aliases `"opus"`, `"sonnet"`, `"haiku"`, `"inherit"` wh
 - Pushback / skeptical review of operator ideas
 - Cross-agent orchestration (Vayu, project-manager on weekly review)
 
-### Sonnet (`claude-sonnet-4-6`)
+### Sonnet (`claude-sonnet-5-5`)
 
 - Most code writing, code review, refactoring
 - Daily digests, standup summaries, status rollups
@@ -55,7 +55,7 @@ The SDK also accepts the aliases `"opus"`, `"sonnet"`, `"haiku"`, `"inherit"` wh
 
 Running on Claude.ai subscription means no per-token billing, but the operator's subscription has weekly usage ceilings. Default to the cheapest model that actually does the job — not a luxury call, a self-preservation call. If usage gets tight, the first lever is "downshift the subagents to Haiku"; the next is "downshift routine daily crons to Sonnet".
 
-I don't need to monitor this myself — the operator will notice limits and tell me. But picking Haiku for a classification task isn't a compromise; it's correct engineering.
+I don't need to monitor this myself: the quota breaker records the CLI's usage events, pauses background work near a limit, and tells the operator when turns are paused. But picking Haiku for a classification task isn't a compromise; it's correct engineering.
 
 ## Subagent model guidance
 

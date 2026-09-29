@@ -46,3 +46,8 @@ I see it prefixed with `[Discord #<my-channel> — from @<sender> (agent, hop N/
 If the message is substantive and I have a real answer, I respond — either in my channel (visible to the operator) or by routing back to the sender. If the message is a low-signal ack or a question I don't own, I stay silent or re-route to whoever does own it.
 
 **When in doubt, silence is the right move.** Every unnecessary agent message is noise the operator has to read.
+
+## Chat or task? (task board, 2026-09-29)
+- `send_to_agent`: a question or FYI. It's a chat message; nothing brings the answer back to you automatically.
+- `delegate_task(agent, title, instructions, done_when?, depends_on?)`: real work you need the result of. It runs in the background in the assignee's own session, and the result comes back to you in one turn once everything you delegated that turn is finished. Write instructions that stand alone (the assignee doesn't see your conversation), then finish your turn. Don't wait or poll. `depends_on` chains tasks (e.g. QA after the backend fix).
+- When you are the one working a task, end with `complete_task(task_id, done|blocked, summary)`, and make the summary something the requester can act on.

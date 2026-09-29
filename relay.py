@@ -14,6 +14,7 @@ import asyncio
 import copy
 import json
 import logging
+import secrets
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -403,6 +404,9 @@ async def run_agent(
     max_turns_override: int | None = None,
     origin: str = "turn",
     outcome: dict | None = None,
+    task_ctx: dict | None = None,
+    warm_pool=None,
+    warm_key: str | None = None,
 ) -> tuple[str, str | None]:
     """Run `prompt` through the agent and stream into `sink`.
 
@@ -462,20 +466,31 @@ async def run_agent(
         options.fallback_model = None
 
     # Mount the agent-comms MCP server with this turn's hop context.
+    # With a warm session the server built on its FIRST turn stays mounted,
+    # so per-turn values go through a shared holder (session_pool.ctx_for).
+    comms_ctx = warm_pool.ctx_for(warm_key) if (warm_pool is not None and warm_key) else {}
+    comms_ctx["batch"] = f"{agent.name}:{secrets.token_hex(4)}"
     comms_server = build_comms_server(
         sender_name=agent.name,
         current_hop=current_hop,
         max_hops=max_hops,
         chain=chain,
+        task_ctx=task_ctx,
+        ctx=comms_ctx,
     )
     mcp_servers = dict(options.mcp_servers) if isinstance(options.mcp_servers, dict) else {}
     mcp_servers["agent_comms"] = comms_server
     options.mcp_servers = mcp_servers
 
-    # Pre-approve the tool so Claude doesn't hit a permission prompt.
-    tool_id = "mcp__agent_comms__send_to_agent"
-    if tool_id not in options.allowed_tools:
-        options.allowed_tools = [*options.allowed_tools, tool_id]
+    # Pre-approve the comms tools so Claude doesn't hit a permission prompt
+    # (send_to_agent + the task-board tools: delegate/status/complete).
+    new_tools = [
+        f"mcp__agent_comms__{t}"
+        for t in ("send_to_agent", "delegate_task", "task_status", "complete_task")
+    ]
+    options.allowed_tools = [
+        *options.allowed_tools, *(t for t in new_tools if t not in options.allowed_tools)
+    ]
 
     traj = TrajectoryLogger(agent.name, resume_session_id)
     traj.prompt(prompt)
@@ -583,59 +598,81 @@ async def run_agent(
             had_final_text = True
 
     final = ""
-    try:
-        async with ClaudeSDKClient(options=options) as client:
-            timing["connect_s"] = round(time.monotonic() - t0, 2)
-            t_query = time.monotonic()
-            await client.query(prompt)
+    started = False  # any reply received: a failed warm turn can't be retried
+
+    async def _turn(client) -> tuple[str, str | None]:
+        """The turn body. `client` is a fresh ClaudeSDKClient or a warm
+        session's adapter (same query/receive_response/get_context_usage)."""
+        nonlocal t_query, final, started
+        timing["connect_s"] = round(time.monotonic() - t0, 2)
+        t_query = time.monotonic()
+        await client.query(prompt)
+        started = True
+        await _drain(client)
+
+        # Auto-continue if the turn ended on tool_use WITHOUT a final text
+        # reply. The Claude Agent SDK splits work into rounds capped by
+        # max_turns; a routing-heavy turn can burn rounds on tool calls
+        # and end before wrapping up. Nudge the model to finish.
+        continues = 0
+        while (
+            stop_reason == "tool_use"
+            and not had_final_text
+            and continues < MAX_CONTINUES
+        ):
+            continues += 1
+            await client.query(
+                "Continue — wrap up the task with a short final reply "
+                "summarising what you did and any next step. If there's "
+                "genuinely nothing more to say, reply with a single line."
+            )
             await _drain(client)
 
-            # Auto-continue if the turn ended on tool_use WITHOUT a final text
-            # reply. The Claude Agent SDK splits work into rounds capped by
-            # max_turns; a routing-heavy turn can burn rounds on tool calls
-            # and end before wrapping up. Nudge the model to finish.
-            continues = 0
-            while (
-                stop_reason == "tool_use"
-                and not had_final_text
-                and continues < MAX_CONTINUES
-            ):
-                continues += 1
-                await client.query(
-                    "Continue — wrap up the task with a short final reply "
-                    "summarising what you did and any next step. If there's "
-                    "genuinely nothing more to say, reply with a single line."
-                )
-                await _drain(client)
+        # Only surface the warning if we actually have no final text
+        # after auto-continuing. Otherwise the agent wrapped up cleanly
+        # and the footer is noise.
+        footer = ""
+        if (
+            stop_reason
+            and stop_reason not in ("end_turn", "stop_sequence", None)
+            and not had_final_text
+        ):
+            footer = (
+                f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
+                f"final text reply. Ask me to continue and I'll pick up from here."
+            )
+        final = (buffer.strip() or "*(agent returned no text)*") + footer
+        # Deliver BEFORE post-turn telemetry: get_context_usage can take
+        # up to 10s and the operator shouldn't wait on it.
+        await sink.finalize(final)
+        try:
+            _emit_turn_metrics(
+                agent.name, session_id, origin, options, timing, result_meta,
+                total_s=time.monotonic() - t0, outcome=run_outcome,
+            )
+        except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
+            log.debug("turn metrics skipped: %s", e)
 
-            # Only surface the warning if we actually have no final text
-            # after auto-continuing. Otherwise the agent wrapped up cleanly
-            # and the footer is noise.
-            footer = ""
-            if (
-                stop_reason
-                and stop_reason not in ("end_turn", "stop_sequence", None)
-                and not had_final_text
-            ):
-                footer = (
-                    f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
-                    f"final text reply. Ask me to continue and I'll pick up from here."
-                )
-            final = (buffer.strip() or "*(agent returned no text)*") + footer
-            # Deliver BEFORE post-turn telemetry: get_context_usage can take
-            # up to 10s and the operator shouldn't wait on it.
-            await sink.finalize(final)
+        # Post-turn context telemetry — needs the live CLI, after all drains
+        # so it reflects the whole turn.
+        await _capture_context_usage(client, agent.name, session_id)
+        return final, session_id
+
+    try:
+        done = False
+        if warm_pool is not None and warm_key:
             try:
-                _emit_turn_metrics(
-                    agent.name, session_id, origin, options, timing, result_meta,
-                    total_s=time.monotonic() - t0, outcome=run_outcome,
-                )
-            except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
-                log.debug("turn metrics skipped: %s", e)
-
-            # Post-turn context telemetry — inside the async with (needs the
-            # live CLI), after all drains so it reflects the whole turn.
-            await _capture_context_usage(client, agent.name, session_id)
+                await warm_pool.run(warm_key, options, _turn, timing)
+                done = True
+            except Exception as e:
+                await warm_pool.evict(warm_key)
+                if started:
+                    raise  # the reply already began: retrying would repeat it
+                log.warning("[%s] warm session unavailable (%s); per-turn client",
+                            agent.name, e)
+        if not done:
+            async with ClaudeSDKClient(options=options) as client:
+                await _turn(client)
     finally:
         traj.close()
 
@@ -660,6 +697,7 @@ def _emit_turn_metrics(
         "origin": origin,
         "model": options.model,
         "effort": options.effort,
+        "warm": timing.get("warm"),
         "connect_s": timing.get("connect_s"),
         "ttft_s": timing.get("ttft_s"),
         "total_s": round(total_s, 2),
