@@ -388,8 +388,14 @@ class RelayBot(discord.Client):
             if _bg_note and resume is None:
                 prompt = f"{_bg_note}\n\n{prompt}"
             try:
+                # Wake-ups are conversational (they land in the operator's
+                # channel), so they get the same effort cap as operator turns.
                 _, session_id = await run_agent(
                     agent, prompt, sink, resume_session_id=resume, origin=origin,
+                    effort_override=_interactive_effort(
+                        agent,
+                        (self.global_cfg.get("defaults", {}) or {}).get("interactive_effort"),
+                    ),
                 )
             except Exception as e:
                 log.exception("[%s] system turn failed", agent.name)
