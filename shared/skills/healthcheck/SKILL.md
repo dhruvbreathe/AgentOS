@@ -17,7 +17,7 @@ description: Run a self-diagnostic on the agent stack. Use when the operator ask
 One command:
 
 ```bash
-cd {AGENTOS_ROOT}
+cd $AGENTOS_ROOT
 ./.venv/bin/python scripts/doctor.py           # all agents
 ./.venv/bin/python scripts/doctor.py --agent main  # one agent
 ./.venv/bin/python scripts/doctor.py --fix     # attempt auto-fix where safe

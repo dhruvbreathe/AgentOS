@@ -19,6 +19,7 @@ import discord
 from dotenv import load_dotenv
 
 import memory_recall
+import quota_state
 import session_rotation
 import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
@@ -172,11 +173,19 @@ class RelayBot(discord.Client):
         # posted, so a 💾 on an OLDER message saves THAT turn, not whatever
         # session the channel currently points at. In-memory, bounded.
         self._msg_sessions: dict[int, str] = {}
-        # Phase-1 heartbeats (2026-07-05): scheduled in-session self-checks,
-        # silent unless action taken. Runs under the same channel locks as
-        # on_message so beats can never race a live turn.
+        # Phase-1 heartbeats (2026-07-05): scheduled self-checks, silent
+        # unless action taken. Since 2026-09-29 they run in their own fresh
+        # session; a beat that ACTS leaves a note here for the channel's next
+        # operator turn instead of writing into the operator session.
         from heartbeat import HeartbeatScheduler
         self._heartbeat = HeartbeatScheduler(self)
+        self._pending_notes: dict[str, list[str]] = {}
+        # Quota breaker (2026-09-29): messages that arrived while the
+        # subscription was out, replayed once it resets. In-memory: a restart
+        # while blocked drops the queue (the operator was told it's paused).
+        self._quota_queue: list[discord.Message] = []
+        self._quota_noticed: dict[str, float] = {}
+        self._quota_task: asyncio.Task | None = None
 
     def _remember_msg_sessions(self, sink, session_id: str) -> None:
         """Map every message this turn's sink posted to its session id.
@@ -201,6 +210,41 @@ class RelayBot(discord.Client):
         )
         # Idempotent — on_ready re-fires on reconnect; start() guards.
         self._heartbeat.start()
+        if self._quota_task is None or self._quota_task.done():
+            self._quota_task = asyncio.create_task(self._quota_replay_loop())
+
+    async def _quota_replay_loop(self) -> None:
+        """Replay messages queued while the subscription was out of quota."""
+        while True:
+            await asyncio.sleep(60)
+            if not self._quota_queue or quota_state.blocked()[0]:
+                continue
+            queued, self._quota_queue = self._quota_queue, []
+            self._quota_noticed.clear()
+            log.info("[%s] quota reset: replaying %d queued message(s)",
+                     self.label, len(queued))
+            for m in queued:
+                asyncio.create_task(self.on_message(m))
+
+    async def _quota_hold(self, message: discord.Message, channel_id: str) -> bool:
+        """True if the message was queued because every model is out."""
+        is_blocked, window, until = quota_state.blocked()
+        if not is_blocked:
+            return False
+        self._quota_queue.append(message)
+        if self._quota_noticed.get(channel_id) != until:
+            self._quota_noticed[channel_id] = until
+            when = time.strftime("%a %H:%M", time.localtime(until)) if until else "soon"
+            try:
+                await message.channel.send(
+                    f"-# ⏸️ Claude subscription out of quota ({window} window), "
+                    f"resets {when}. Queued; I'll pick this up then."
+                )
+            except Exception as e:
+                log.warning("[%s] quota notice failed: %s", self.label, e)
+        log.warning("[%s] quota blocked (%s): queued message in %s",
+                    self.label, window, channel_id)
+        return True
 
     def _should_respond(self, message: discord.Message, agent: AgentConfig) -> bool:
         if message.author == self.user:
@@ -371,6 +415,9 @@ class RelayBot(discord.Client):
                     max_hops,
                 )
 
+        if await self._quota_hold(message, channel_id):
+            return
+
         author = (
             f"@{sender} (agent, hop {current_hop}/{max_hops})"
             if sender
@@ -480,6 +527,11 @@ class RelayBot(discord.Client):
             )
             if _rec_note:
                 prompt = f"{_rec_note}\n\n{prompt}"
+            # Heartbeat actions since the last operator turn (beats run in
+            # their own session, so this is how the conversation hears).
+            _notes = None if sender else self._pending_notes.pop(channel_id, None)
+            if _notes:
+                prompt = "\n".join(_notes) + f"\n\n{prompt}"
             # Phase-0 session rotation (2026-07-05): when the session's last
             # reported context exceeds the ceiling, start FRESH seeded with a
             # memory handoff instead of resuming a bloated session. Fail-open:
@@ -550,6 +602,7 @@ class RelayBot(discord.Client):
                         max_hops=max_hops,
                         chain=chain,
                         effort_override=_effort,
+                        origin="routed" if sender else "operator",
                     )
                 finally:
                     if typing_started:
@@ -632,6 +685,28 @@ def _group_agents_by_token(
     return by_token
 
 
+async def _deferred_cron_loop() -> None:
+    """Fleet-wide: re-run crons that stood down under quota pressure once
+    background work is allowed again. One process, not one per client."""
+    python = ROOT / ".venv" / "bin" / "python"
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if not quota_state.background_allowed()[0]:
+                continue
+            for agent_name, task in quota_state.take_deferred_crons():
+                log.info("replaying deferred cron %s/%s", agent_name, task)
+                logf = (ROOT / "logs" / f"{agent_name}-{task}.log").open("ab")
+                proc = await asyncio.create_subprocess_exec(
+                    str(python), str(ROOT / "cron_trigger.py"), agent_name, task,
+                    cwd=str(ROOT), stdout=logf, stderr=logf,
+                )
+                await proc.wait()  # one at a time: don't stampede on reset
+                logf.close()
+        except Exception:
+            log.exception("deferred cron replay failed")
+
+
 async def _run_all(default_token: str | None) -> None:
     groups = _group_agents_by_token(default_token)
     if not groups:
@@ -652,6 +727,8 @@ async def _run_all(default_token: str | None) -> None:
                 "defaults.heartbeat.agents",
                 missing,
             )
+
+    asyncio.create_task(_deferred_cron_loop())
 
     clients: list[tuple[RelayBot, str]] = []
     for token, agents in groups.items():

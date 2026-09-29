@@ -23,6 +23,7 @@ import aiohttp
 import yaml
 from dotenv import load_dotenv
 
+import quota_state
 from agent_loader import load_agent
 from relay import CollectingSink, run_agent
 
@@ -109,6 +110,16 @@ async def _run(agent_name: str, task_name: str) -> int:
     bootstrap = str(fm.get("bootstrap", "")).strip().lower()
     lite = bootstrap in ("lite", "minimal", "light")
 
+    # Quota breaker (2026-09-29): under quota pressure, stand down and let
+    # bot.py replay this run after the window resets. `critical: true` in
+    # the frontmatter opts a task out (it runs regardless).
+    if not fm.get("critical"):
+        ok, reason = quota_state.background_allowed()
+        if not ok:
+            log.warning("quota: deferring %s/%s (%s)", agent_name, task_name, reason)
+            quota_state.defer_cron(agent_name, task_name, reason)
+            return 0
+
     agent = load_agent(agent_name, lite=lite)
     if lite:
         log.info("Loaded %s in lite-bootstrap mode (task=%s)", agent_name, task_name)
@@ -145,7 +156,19 @@ async def _run(agent_name: str, task_name: str) -> int:
 
     sink = CollectingSink()
     try:
-        text, _session = await run_agent(agent, prompt, sink)
+        outcome: dict = {}
+        text, _session = await run_agent(
+            agent, prompt, sink, origin="cron", outcome=outcome
+        )
+        # A quota / auth failure comes back as assistant text ("You've hit
+        # your limit", "401 ..."). Never post that as if it were the digest.
+        if outcome.get("error") in ("rate_limit", "billing_error"):
+            log.warning("quota error on %s/%s: deferring", agent.name, task_name)
+            quota_state.defer_cron(agent_name, task_name, str(outcome["error"]))
+            return 4
+        if outcome.get("error") == "authentication_failed":
+            log.error("auth failed on %s/%s: %s", agent.name, task_name, text[:200])
+            return 5
 
         if silent:
             log.info(

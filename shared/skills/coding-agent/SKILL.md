@@ -50,7 +50,7 @@ Good for: focused code review, scoped refactor that returns a summary.
 
 ```bash
 # Create an isolated worktree so changes don't collide with your main tree
-cd {AGENTOS_ROOT}
+cd $AGENTOS_ROOT
 git worktree add ../_worktrees/feature-x -b feature-x
 
 # Launch a one-shot claude CLI session in it

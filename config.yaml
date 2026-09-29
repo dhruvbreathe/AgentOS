@@ -216,6 +216,17 @@ defaults:
     enabled: true
     threshold: 5
 
+  # Quota breaker (2026-09-29, quota_state.py). The CLI's RateLimitEvents are
+  # recorded to logs/quota.json. Heartbeats and non-critical crons stand down
+  # when a window is at allowed_warning past warn_utilization, or rejected
+  # (crons are replayed after reset; `critical: true` in task frontmatter
+  # opts out). A rejected five_hour/seven_day window pauses operator turns
+  # with a "resets HH:MM" notice and replays them. A rejected weekly Opus
+  # window moves Opus runs to opus_fallback (default: fallback_model).
+  quota:
+    warn_utilization: 0.85
+    # opus_fallback: claude-sonnet-5-5
+
   # Phase-1 heartbeats (2026-07-05 orchestration master plan). Relay-level
   # scheduler (heartbeat.py) resumes each pilot agent's channel session on a
   # cadence with its HEARTBEAT.md checklist. Output is DISCARDED; posting is

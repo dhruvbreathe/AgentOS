@@ -23,7 +23,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeSDKClient,
     MirrorErrorMessage,
+    RateLimitEvent,
     ResultMessage,
+    StreamEvent,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -31,6 +33,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
+import quota_state
 from agent_loader import AgentConfig
 from agent_tools import build_comms_server
 from text_lint import sanitize as _strip_emdash
@@ -38,6 +41,7 @@ from text_lint import sanitize as _strip_emdash
 ROOT = Path(__file__).parent
 TRAJECTORY_ROOT = ROOT / "logs" / "trajectories"
 CONTEXT_USAGE_LOG = ROOT / "logs" / "context-usage.jsonl"
+TURN_METRICS_LOG = ROOT / "logs" / "turn-metrics.jsonl"
 
 # relay.py used `log` in two exception paths without ever defining it — a
 # latent NameError that only fired when Discord message allocation failed.
@@ -308,6 +312,23 @@ def _write_context_line(line: dict) -> None:
         f.write(json.dumps(line, ensure_ascii=False) + "\n")
 
 
+def _write_turn_metrics(line: dict) -> None:
+    """One line per turn: where the time went and how much was cached.
+    connect_s = CLI spawn + init; ttft_s = query() to first stream event.
+    (The CLI's duration_api_ms isn't usable for an overhead split: it came
+    out larger than duration_ms on every bench turn.)"""
+    try:
+        if (
+            TURN_METRICS_LOG.exists()
+            and TURN_METRICS_LOG.stat().st_size > _CONTEXT_LOG_MAX_BYTES
+        ):
+            TURN_METRICS_LOG.replace(TURN_METRICS_LOG.with_suffix(".jsonl.1"))
+        with TURN_METRICS_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.debug("turn-metrics write skipped: %s", e)
+
+
 async def _capture_context_usage(
     client: ClaudeSDKClient, agent_name: str, session_id: str | None
 ) -> None:
@@ -380,6 +401,8 @@ async def run_agent(
     model_override: str | None = None,
     effort_override: str | None = None,
     max_turns_override: int | None = None,
+    origin: str = "turn",
+    outcome: dict | None = None,
 ) -> tuple[str, str | None]:
     """Run `prompt` through the agent and stream into `sink`.
 
@@ -396,6 +419,11 @@ async def run_agent(
     turn cap. They apply to this turn's options copy only — the cached
     AgentConfig is never mutated, so the next operator turn is back on the
     agent's real model.
+
+    `origin` tags the turn in logs/turn-metrics.jsonl (operator / routed /
+    heartbeat / flush / cron). Pass a dict as `outcome` to receive
+    {"error": <AssistantMessageError or None>, "is_error": bool,
+    "api_error_status": int | None} for classifying the run.
 
     Returns (final_text, session_id). session_id can be persisted by the
     caller to resume a conversation in the same Discord thread next time.
@@ -421,6 +449,12 @@ async def run_agent(
         options.effort = effort_override
     if max_turns_override:
         options.max_turns = max_turns_override
+    # Quota breaker: weekly Opus window exhausted -> run on the fallback.
+    _swapped = quota_state.model_for(options.model)
+    if _swapped != options.model:
+        log.warning("[%s] opus window exhausted: %s -> %s",
+                    agent.name, options.model, _swapped)
+        options.model = _swapped
     # The CLI refuses to start when --fallback-model equals --model; a model
     # override (e.g. rotation flush on Sonnet) can collide with the default
     # fallback. Same guard as cron_trigger's lite downshift.
@@ -456,11 +490,33 @@ async def run_agent(
 
     MAX_CONTINUES = 3
 
+    t0 = time.monotonic()
+    timing: dict[str, float | None] = {"connect_s": None, "ttft_s": None}
+    t_query: float | None = None
+    result_meta: dict = {}
+    run_outcome = outcome if outcome is not None else {}
+    run_outcome.update({"error": None, "is_error": False, "api_error_status": None})
+
     async def _drain(client) -> None:
         nonlocal buffer, session_id, stop_reason, had_final_text
         this_round_had_text = False
         async for msg in client.receive_response():
+            if (
+                timing["ttft_s"] is None
+                and t_query is not None
+                and isinstance(msg, (StreamEvent, AssistantMessage))
+            ):
+                timing["ttft_s"] = round(time.monotonic() - t_query, 2)
+            if isinstance(msg, RateLimitEvent):
+                quota_state.record_event(msg.rate_limit_info)
+                continue
             if isinstance(msg, AssistantMessage):
+                if getattr(msg, "error", None):
+                    run_outcome["error"] = msg.error
+                    quota_state.record_error(
+                        msg.error,
+                        " ".join(b.text for b in msg.content if isinstance(b, TextBlock)),
+                    )
                 if msg.session_id:
                     session_id = msg.session_id
                 for block in msg.content:
@@ -492,18 +548,45 @@ async def run_agent(
                 if getattr(msg, "session_id", None):
                     session_id = msg.session_id
                 stop_reason = getattr(msg, "stop_reason", None)
+                if msg.is_error:
+                    run_outcome["is_error"] = True
+                    run_outcome["api_error_status"] = msg.api_error_status
+                    if msg.api_error_status == 429:
+                        quota_state.record_error(
+                            "rate_limit", "; ".join(msg.errors or []) or "HTTP 429"
+                        )
+                model_usage = {
+                    m: (u if isinstance(u, dict) else getattr(u, "__dict__", str(u)))
+                    for m, u in (msg.model_usage or {}).items()
+                }
+                # Auto-continue rounds each emit a result: sum the counters.
+                for k in ("duration_ms", "duration_api_ms", "num_turns"):
+                    result_meta[k] = result_meta.get(k, 0) + (getattr(msg, k) or 0)
+                result_meta["usage"] = msg.usage
+                result_meta["model_usage"] = model_usage
                 traj.result(
                     {
                         "session_id": session_id,
                         "stop_reason": stop_reason,
                         "usage": getattr(msg, "usage", None),
+                        "model_usage": model_usage or None,
+                        "duration_ms": msg.duration_ms,
+                        "duration_api_ms": msg.duration_api_ms,
+                        "num_turns": msg.num_turns,
+                        "terminal_reason": msg.terminal_reason,
+                        "is_error": msg.is_error,
+                        "api_error_status": msg.api_error_status,
+                        "timing": dict(timing),
                     }
                 )
         if this_round_had_text:
             had_final_text = True
 
+    final = ""
     try:
         async with ClaudeSDKClient(options=options) as client:
+            timing["connect_s"] = round(time.monotonic() - t0, 2)
+            t_query = time.monotonic()
             await client.query(prompt)
             await _drain(client)
 
@@ -525,26 +608,68 @@ async def run_agent(
                 )
                 await _drain(client)
 
+            # Only surface the warning if we actually have no final text
+            # after auto-continuing. Otherwise the agent wrapped up cleanly
+            # and the footer is noise.
+            footer = ""
+            if (
+                stop_reason
+                and stop_reason not in ("end_turn", "stop_sequence", None)
+                and not had_final_text
+            ):
+                footer = (
+                    f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
+                    f"final text reply. Ask me to continue and I'll pick up from here."
+                )
+            final = (buffer.strip() or "*(agent returned no text)*") + footer
+            # Deliver BEFORE post-turn telemetry: get_context_usage can take
+            # up to 10s and the operator shouldn't wait on it.
+            await sink.finalize(final)
+            try:
+                _emit_turn_metrics(
+                    agent.name, session_id, origin, options, timing, result_meta,
+                    total_s=time.monotonic() - t0, outcome=run_outcome,
+                )
+            except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
+                log.debug("turn metrics skipped: %s", e)
+
             # Post-turn context telemetry — inside the async with (needs the
             # live CLI), after all drains so it reflects the whole turn.
             await _capture_context_usage(client, agent.name, session_id)
     finally:
         traj.close()
 
-    # Only surface the warning if we actually have no final text after
-    # auto-continuing. Otherwise the agent wrapped up cleanly and the footer
-    # is noise.
-    footer = ""
-    if (
-        stop_reason
-        and stop_reason not in ("end_turn", "stop_sequence", None)
-        and not had_final_text
-    ):
-        footer = (
-            f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
-            f"final text reply. Ask me to continue and I'll pick up from here."
-        )
-
-    final = (buffer.strip() or "*(agent returned no text)*") + footer
-    await sink.finalize(final)
     return final, session_id
+
+
+def _emit_turn_metrics(
+    agent_name: str,
+    session_id: str | None,
+    origin: str,
+    options,
+    timing: dict,
+    result_meta: dict,
+    total_s: float,
+    outcome: dict,
+) -> None:
+    usage = result_meta.get("usage") or {}
+    _write_turn_metrics({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "agent": agent_name,
+        "session_id": session_id,
+        "origin": origin,
+        "model": options.model,
+        "effort": options.effort,
+        "connect_s": timing.get("connect_s"),
+        "ttft_s": timing.get("ttft_s"),
+        "total_s": round(total_s, 2),
+        "num_turns": result_meta.get("num_turns"),
+        "input_tokens": usage.get("input_tokens"),
+        "cache_read": usage.get("cache_read_input_tokens"),
+        "cache_create": usage.get("cache_creation_input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "models_used": sorted((result_meta.get("model_usage") or {}).keys()),
+        "error": outcome.get("error") or (
+            f"http_{outcome['api_error_status']}" if outcome.get("api_error_status") else None
+        ),
+    })

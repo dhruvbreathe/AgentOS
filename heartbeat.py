@@ -1,21 +1,23 @@
 """Phase-1 heartbeats (masterplan item 5): the missing "alive" feel.
 
 Agents were purely reactive — inbound messages + isolated crons. A heartbeat
-is a scheduled self-check that runs IN the agent's channel session, so it has
-full conversational context, and stays SILENT unless action is warranted.
+is a scheduled self-check that stays SILENT unless action is warranted.
 
-Why relay-level (in the bot process) instead of a launchd cron:
-  - launchd crons run in a separate process and can't hold the channel lock,
-    so a cron resuming the channel session could race a live operator turn
-    (two writers, one transcript). In-process, the scheduler acquires the
-    SAME per-channel asyncio.Lock the message handler uses — a heartbeat can
-    never collide with a real turn; it just waits its turn.
-  - The channel session is resumed (with the normal rotation check), so the
-    heartbeat sees what the operator and agent have been talking about and
-    its context lands where follow-ups happen.
+Isolated since 2026-09-29 (OpenClaw isolatedSession + lightContext, Hermes
+background_review). Beats used to resume the operator's channel session on
+a cheaper model: every beat appended its chatter to the operator's context
+(68k tokens of it in main's session) and wrote a 100k+ cache on a model the
+operator never uses. Now each beat is a FRESH session on the lite prompt,
+seeded with a short digest of the agent's daily memory instead of chat
+history. It never writes to bot.sessions and doesn't take the channel lock.
+A beat that ACTS leaves a one-line note the bot prepends to the channel's
+next operator turn, so the conversation still hears about it.
+
   - Output goes to a CollectingSink: discarded, logged in the trajectory.
     "Posting" is an ACTION the agent takes deliberately (webhook curl or
     send_to_agent), which is exactly the silent-unless-action contract.
+  - Quota breaker: beats stand down while quota_state says background work
+    should (warning past threshold, or a window rejected).
 
 Config (config.yaml → defaults.heartbeat):
     heartbeat:
@@ -63,6 +65,10 @@ ledger, or fix something small in your own workspace.
 6. Never wake the operator for something that can wait for the daily digest \
 — channel posts from a heartbeat are for things that are timely AND \
 actionable now.
+
+--- RECENT WORKING STATE (tail of your daily memory; this beat runs in a \
+fresh session, not your operator conversation) ---
+{digest}
 
 --- YOUR HEARTBEAT CHECKLIST (agents/{agent}/HEARTBEAT.md) ---
 {checklist}
@@ -154,6 +160,11 @@ class HeartbeatScheduler:
         now_hour = datetime.now().hour  # local time — bot runs on the laptop
         if not (start_h <= now_hour < end_h):
             return
+        import quota_state
+        ok, reason = quota_state.background_allowed()
+        if not ok:
+            log.info("[%s] heartbeats standing down: %s", self.bot.label, reason)
+            return
 
         # Pilot hygiene lives in bot._run_all (fleet-wide). A per-client
         # pilots-vs-loaded diff false-warns for every pilot owned by a
@@ -214,54 +225,49 @@ class HeartbeatScheduler:
         self, channel_id: str, agent, hb_file: Path, cfg: dict | None = None
     ) -> None:
         # Imports deferred to avoid a bot↔heartbeat import cycle at load.
-        from bot import _save_session
+        from agent_loader import load_agent
         from relay import CollectingSink, run_agent
         import session_rotation
 
         cfg = cfg or self._config()
         try:
             checklist = hb_file.read_text().strip()
+            # Lite prompt (identity/tools/integrations/memory): a beat is a
+            # checklist pulse, not a conversation.
+            beat_agent = load_agent(agent.name, lite=True)
         except Exception as e:
-            log.warning("[%s] heartbeat: unreadable %s: %s",
-                        agent.name, hb_file, e)
+            log.warning("[%s] heartbeat: setup failed: %s", agent.name, e)
             return
-        prompt = HEARTBEAT_PROMPT.format(agent=agent.name, checklist=checklist)
+        prompt = HEARTBEAT_PROMPT.format(
+            agent=agent.name,
+            checklist=checklist,
+            digest=session_rotation._memory_tail(agent.name),
+        )
 
         t0 = time.time()
-        async with self.bot._channel_lock(channel_id):
-            resume = self.bot.sessions.get(channel_id)
-            rot_cfg = (self.bot.global_cfg.get("defaults", {}) or {}).get(
-                "session_rotation"
+        sink = CollectingSink()
+        outcome: dict = {}
+        try:
+            # Utility-model beats (Wave 3 P0-3, OpenClaw utilityModel): the
+            # pulse runs on a cheaper model + lower effort than the agent's
+            # real turns. Config: defaults.heartbeat.model / .effort.
+            final_text, _session = await run_agent(
+                beat_agent, prompt, sink, resume_session_id=None,
+                model_override=cfg.get("model"),
+                effort_override=cfg.get("effort"),
+                origin="heartbeat",
+                outcome=outcome,
             )
-            rot_note = session_rotation.check(agent.name, resume, rot_cfg)
-            if rot_note is not None:
-                # Wave 3 P0-1: same pre-rotation flush as the message path —
-                # a beat that triggers rotation must not amnesia the session.
-                if await session_rotation.flush(agent, resume, rot_cfg):
-                    rot_note = (
-                        session_rotation.check(agent.name, resume, rot_cfg)
-                        or rot_note
-                    )
-                resume = None
-                prompt = f"{rot_note}\n\n{prompt}"
-            sink = CollectingSink()
-            try:
-                # Utility-model beats (Wave 3 P0-3, OpenClaw utilityModel):
-                # the pulse runs on a cheaper model + lower effort than the
-                # agent's real turns. Config: defaults.heartbeat.model /
-                # .effort; omit either to inherit the agent's own.
-                final_text, session_id = await run_agent(
-                    agent, prompt, sink, resume_session_id=resume,
-                    model_override=cfg.get("model"),
-                    effort_override=cfg.get("effort"),
-                )
-            except Exception:
-                log.exception("[%s] heartbeat run failed", agent.name)
-                return
-            if session_id:
-                self.bot.sessions[channel_id] = session_id
-                _save_session(channel_id, session_id)
+        except Exception:
+            log.exception("[%s] heartbeat run failed", agent.name)
+            return
 
+        if outcome.get("error") or outcome.get("is_error"):
+            # Quota / auth errors come back as text; they are not actions.
+            log.warning("[%s] heartbeat FAILED (%s) in %.0fs: %s",
+                        agent.name, outcome.get("error") or outcome.get("api_error_status"),
+                        time.time() - t0, (final_text or "")[:200])
+            return
         quiet = "HEARTBEAT_OK" in (final_text or "")
         log.info(
             "[%s] heartbeat %s in %.0fs%s",
@@ -270,3 +276,9 @@ class HeartbeatScheduler:
             time.time() - t0,
             "" if quiet else f" — {(final_text or '')[:200]}",
         )
+        if not quiet and final_text:
+            note = (
+                f"[heartbeat {datetime.now():%H:%M}, separate session] "
+                f"{final_text.strip()[:400]}"
+            )
+            self.bot._pending_notes.setdefault(channel_id, []).append(note)

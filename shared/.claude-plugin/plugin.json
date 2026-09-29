@@ -1,0 +1,5 @@
+{
+  "name": "agentos",
+  "version": "1.0.0",
+  "description": "AgentOS shared skills (shared/skills/<name>/SKILL.md), loaded natively by Claude Code with progressive disclosure."
+}

@@ -153,6 +153,30 @@ def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
     return "\n\n".join(parts)
 
 
+# Progressive skill disclosure (2026-09-29; OpenClaw passes Claude Code a
+# --plugin-dir, Hermes injects only a name+description index). shared/ is a
+# local Claude Code plugin (shared/.claude-plugin/plugin.json, name
+# "agentos"), so `skill:<name>` refs become native skills: only frontmatter
+# sits in context (measured ~18 tokens for a 15k-token skill) and the body
+# loads when the model invokes it. The explicit list also hides the CLI's
+# built-in bundled skills. `local:` and legacy path refs are still inlined.
+PLUGIN_NAME = "agentos"
+
+
+def _split_skill_refs(skill_files: list[str]) -> tuple[list[str], list[str]]:
+    """(native plugin skill names, refs that must stay inlined)."""
+    native, inline = [], []
+    for ref in skill_files:
+        ref = str(ref).split("#", 1)[0].strip()
+        if ref.startswith("skill:"):
+            name = ref.split(":", 1)[1].strip()
+            if (SHARED_DIR / "skills" / name / "SKILL.md").exists():
+                native.append(f"{PLUGIN_NAME}:{name}")
+                continue
+        inline.append(ref)
+    return native, inline
+
+
 # Order matters: identity first, then how to behave, who you serve,
 # workspace contract, env-specific config, connected services, protocols.
 LAYERED_FILES = [
@@ -1003,6 +1027,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
     # legacy system_prompt.md + skills + inline integration notes.
     # `lite=True` skips SHARED + skills + legacy and uses LAYERED_FILES_LITE
     # for the layered chunk — keeps the integration notes (cheap, scope-aware).
+    native_skills: list[str] = []
     if lite:
         shared = ""
         layered = _load_layered_prompt(agent_dir, lite=True)
@@ -1017,7 +1042,12 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
             legacy_sp_file = agent_dir / legacy_name
             if legacy_sp_file.is_file():
                 legacy_sp = legacy_sp_file.read_text()
-        skills = _load_skills(agent_dir, agent_cfg.get("skills", []) or [])
+        native_skills, inline_refs = _split_skill_refs(
+            agent_cfg.get("skills", []) or []
+        )
+        if agent_cfg.get("inline_skills"):  # escape hatch: old behaviour
+            native_skills, inline_refs = [], agent_cfg.get("skills", []) or []
+        skills = _load_skills(agent_dir, inline_refs)
 
     system_prompt = "\n\n".join(
         [
@@ -1125,6 +1155,20 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
     if _sub_only:
         for _key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"):
             env_out[_key] = ""
+
+    # Cache-stable CLI launch (2026-09-29, OpenClaw's claude-cli backend).
+    # Claude Code snapshots git status into its prompt on every process
+    # start/resume. Every agent's cwd is the vault, a git repo that crons
+    # dirty constantly, and relay spawns a fresh CLI per turn, so that
+    # snapshot kept changing and the cached prefix after it got rewritten
+    # (Jul-Aug median ~84k cache_creation tokens per interactive turn).
+    env_out.setdefault("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1")
+    # Don't block CLI startup on MCP servers (CLI >= 2.1.274); servers named
+    # in allowedTools still get up to 2s.
+    env_out.setdefault("CLAUDE_CODE_MCP_STARTUP_WAIT_MS", "0")
+    # Native skills can't see the {AGENTOS_ROOT} prompt substitution; they
+    # reference $AGENTOS_ROOT instead.
+    env_out.setdefault("AGENTOS_ROOT", str(ROOT))
 
     # Sandbox settings — macOS/Linux bash sandboxing. Opt-in per agent
     # (default off); when enabled, bash is isolated from filesystem/network
@@ -1297,8 +1341,19 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         if _ss_raw.get("flush") in ("batched", "eager"):
             _opts_extra["session_store_flush"] = _ss_raw["flush"]
 
+    if native_skills:
+        _opts_extra["plugins"] = [{"type": "local", "path": str(SHARED_DIR)}]
+        _opts_extra["skills"] = native_skills
+
     options = ClaudeAgentOptions(
-        system_prompt=system_prompt or None,
+        # snapshot=True (CLI >= 2.1.267 default, made explicit): the prompt is
+        # recorded on a session's first request and reused on every resume,
+        # so the cached prefix is stable. Consequence: edits to LEARNINGS /
+        # MEMORY / skills reach a live session only after it rotates.
+        system_prompt=(
+            {"type": "custom", "prompt": system_prompt, "snapshot": True}
+            if system_prompt else None
+        ),
         allowed_tools=allowed,
         disallowed_tools=disallowed,
         permission_mode=agent_cfg.get("permission_mode")
