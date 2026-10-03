@@ -212,11 +212,15 @@ _SUB_PAID_COLS = [
     "Pay As You Go Offer Code Subscriptions",
     "Pay Up Front Win-back Offers",
     "Pay As You Go Win-back Offers",
+    # Promotional offers. Yearly PAYG promo subs were skipped until 2026-10-03 (printed 84 vs true 86).
+    "Pay Up Front Promotional Offer Subscriptions",
+    "Pay As You Go Promotional Offer Subscriptions",
 ]
 _SUB_TRIAL_COLS = [
     "Active Free Trial Introductory Offer Subscriptions",
     "Free Trial Offer Code Subscriptions",
     "Free Trial Win-back Offers",
+    "Free Trial Promotional Offer Subscriptions",
 ]
 
 
