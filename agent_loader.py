@@ -2,6 +2,7 @@
 ClaudeAgentOptions. One agent per Discord channel."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -163,18 +164,43 @@ def _load_skills(agent_dir: Path, skill_files: list[str]) -> str:
 PLUGIN_NAME = "agentos"
 
 
-def _split_skill_refs(skill_files: list[str]) -> tuple[list[str], list[str]]:
-    """(native plugin skill names, refs that must stay inlined)."""
-    native, inline = [], []
+def _agent_plugin_name(agent_dir: Path) -> str | None:
+    """An agent dir with .claude-plugin/plugin.json is its own local plugin,
+    so its `local:` skills load natively too (2026-10-04, Mira's 17k-char
+    outreach skill). Private skills stay out of the public shared/ dir."""
+    manifest = agent_dir / ".claude-plugin" / "plugin.json"
+    if not manifest.is_file():
+        return None
+    try:
+        return json.loads(manifest.read_text()).get("name") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _split_skill_refs(
+    skill_files: list[str], agent_dir: Path | None = None
+) -> tuple[list[str], list[str], list[str]]:
+    """(native plugin skill names, refs that must stay inlined, plugin dirs)."""
+    native, inline, plugins = [], [], []
+    agent_plugin = _agent_plugin_name(agent_dir) if agent_dir else None
     for ref in skill_files:
         ref = str(ref).split("#", 1)[0].strip()
         if ref.startswith("skill:"):
             name = ref.split(":", 1)[1].strip()
             if (SHARED_DIR / "skills" / name / "SKILL.md").exists():
                 native.append(f"{PLUGIN_NAME}:{name}")
+                if str(SHARED_DIR) not in plugins:
+                    plugins.append(str(SHARED_DIR))
+                continue
+        elif ref.startswith("local:") and agent_plugin:
+            name = ref.split(":", 1)[1].strip()
+            if (agent_dir / "skills" / name / "SKILL.md").exists():
+                native.append(f"{agent_plugin}:{name}")
+                if str(agent_dir) not in plugins:
+                    plugins.append(str(agent_dir))
                 continue
         inline.append(ref)
-    return native, inline
+    return native, inline, plugins
 
 
 # Order matters: identity first, then how to behave, who you serve,
@@ -1101,6 +1127,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         **(agent_cfg.get("memory_caps") or {}),
     }
     native_skills: list[str] = []
+    plugin_dirs: list[str] = []
     if lite:
         shared = ""
         layered = _load_layered_prompt(agent_dir, lite=True, caps=memory_caps)
@@ -1115,11 +1142,12 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
             legacy_sp_file = agent_dir / legacy_name
             if legacy_sp_file.is_file():
                 legacy_sp = legacy_sp_file.read_text()
-        native_skills, inline_refs = _split_skill_refs(
-            agent_cfg.get("skills", []) or []
+        native_skills, inline_refs, plugin_dirs = _split_skill_refs(
+            agent_cfg.get("skills", []) or [], agent_dir
         )
         if agent_cfg.get("inline_skills"):  # escape hatch: old behaviour
             native_skills, inline_refs = [], agent_cfg.get("skills", []) or []
+            plugin_dirs = []
         skills = _load_skills(agent_dir, inline_refs)
 
     system_prompt = "\n\n".join(
@@ -1421,7 +1449,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
             _opts_extra["session_store_flush"] = _ss_raw["flush"]
 
     if native_skills:
-        _opts_extra["plugins"] = [{"type": "local", "path": str(SHARED_DIR)}]
+        _opts_extra["plugins"] = [{"type": "local", "path": p} for p in plugin_dirs]
         _opts_extra["skills"] = native_skills
 
     options = ClaudeAgentOptions(
