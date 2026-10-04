@@ -1345,6 +1345,11 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         enabled=bool(loop_guard_cfg.get("enabled", True)),
     )
 
+    # T-cacd32 secret guard: deny .env reads / env dumps / literal secret
+    # values in tool input; flag (names only) tool results that leaked one.
+    import secret_guard
+    secret_pre_hook, secret_post_hook = secret_guard.make_hooks(name)
+
     # Budget hook — warn / deny on monthly token cap. Per-agent override on
     # top of config.yaml defaults. Accepts either a flat int or a dict with
     # {monthly, warn_pct, block_pct}.
@@ -1440,6 +1445,15 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
         cwd=cwd,
         add_dirs=add_dirs,
         env=env_out,
+        # The SDK's default 1 MB cap on one stdout JSON message kills the
+        # turn's reader when a tool result is big: Reading a 1.6 MB Retina
+        # screenshot (base64 ~2.1 MB) crashed two operator turns in a row on
+        # 2026-09-30 ("JSON message exceeded maximum buffer size").
+        max_buffer_size=int(
+            agent_cfg.get("max_buffer_size")
+            or defaults.get("max_buffer_size")
+            or 32 * 1024 * 1024
+        ),
         setting_sources=setting_sources,
         sandbox=sandbox_cfg,
         mcp_servers=mcp_servers,
@@ -1455,6 +1469,7 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
                 # Discord reaction), then checkpoint pre-write (snapshot state
                 # before mutation). Any single deny blocks the call.
                 HookMatcher(hooks=[loop_guard_hook]),
+                HookMatcher(hooks=[secret_pre_hook]),
                 HookMatcher(matcher="Bash", hooks=[_block_raw_crontab]),
                 HookMatcher(matcher="Bash", hooks=[approval_hook]),
                 HookMatcher(matcher="Write", hooks=[on_facts_hygiene]),
@@ -1471,7 +1486,10 @@ def load_agent(name: str, lite: bool = False) -> AgentConfig:
             "Stop": [HookMatcher(hooks=[on_stop])],
             "PreCompact": [HookMatcher(hooks=[on_precompact])],
             "SubagentStart": [HookMatcher(hooks=[on_subagent_start])],
-            "PostToolUse": [HookMatcher(hooks=[on_post_write_lint])],
+            "PostToolUse": [
+                HookMatcher(hooks=[on_post_write_lint]),
+                HookMatcher(hooks=[secret_post_hook]),
+            ],
         },
         include_partial_messages=True,  # enable token-level streaming
         **_opts_extra,

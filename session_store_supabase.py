@@ -42,6 +42,8 @@ from typing import Any
 
 import httpx
 
+import secret_guard
+
 log = logging.getLogger("session-store")
 
 _SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,80}$")
@@ -219,6 +221,9 @@ class SupabaseSessionStore:
         norm = self._norm_key(key)
         if norm is None or not entries or self._breaker_open():
             return
+        # T-cacd32: never mirror .env values off-box. uuids/parentUuid are
+        # untouched, so dedup + chain_intact behave exactly as before.
+        entries = secret_guard.redact_entries(entries)
         pkey, sid, sub = norm
         k = f"{pkey}/{sid}/{sub}"
         async with self._lock_for(k):

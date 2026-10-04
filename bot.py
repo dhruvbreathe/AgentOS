@@ -27,7 +27,7 @@ import session_rotation
 import session_store
 from agent_loader import AgentConfig, load_all_agents, load_global
 from agent_tools import parse_routing_header
-from relay import DiscordMessageSink, run_agent
+from relay import DiscordMessageSink, incomplete_notice, run_agent
 from transcribe import is_audio, transcribe
 
 load_dotenv()
@@ -99,6 +99,39 @@ log.info(
 
 ROOT = Path(__file__).parent
 SESSIONS_FILE = ROOT / "logs" / "sessions.json"
+
+# Big image attachments get a downscaled copy for the agent to Read. A
+# 3024x1964 Retina screenshot (1.6 MB) crashed two operator turns on
+# 2026-09-30; the buffer cap is raised in agent_loader too, this also keeps
+# image tokens sane. GIFs skipped (sips would drop the animation).
+_SHRINK_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".webp", ".tif", ".tiff", ".bmp"}
+_SHRINK_OVER_BYTES = 700_000
+
+
+async def _readable_image(path: Path) -> Path:
+    """Return a Read-friendly JPEG copy (long edge 1600px) of a big image,
+    or the original path. Fail-open: any error returns the original."""
+    if path.suffix.lower() not in _SHRINK_SUFFIXES:
+        return path
+    proc = None
+    try:
+        if path.stat().st_size <= _SHRINK_OVER_BYTES:
+            return path
+        out = path.with_name(f"{path.stem}-readable.jpg")
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/sips", "-s", "format", "jpeg", "-s", "formatOptions", "80",
+            "-Z", "1600", str(path), "--out", str(out),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=20)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+    except Exception as e:  # noqa: BLE001 — never lose the attachment
+        log.warning("attachment downscale failed for %s: %s", path, e)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(Exception):
+                proc.kill()
+    return path
 
 
 def _load_sessions() -> dict[str, str]:
@@ -470,10 +503,12 @@ class RelayBot(discord.Client):
             local_path = attach_dir / f"{ts}-{safe_name}"
             try:
                 await att.save(local_path)
-                paths.append(local_path)
+                readable = await _readable_image(local_path)
+                paths.append(readable)
                 log.info(
-                    "[%s] saved attachment %s (%d bytes) -> %s",
-                    self.label, att.filename, att.size, local_path
+                    "[%s] saved attachment %s (%d bytes) -> %s%s",
+                    self.label, att.filename, att.size, local_path,
+                    f" (readable copy {readable.name})" if readable != local_path else "",
                 )
             except Exception as e:
                 log.warning("[%s] failed to save attachment %s: %s",
@@ -663,7 +698,15 @@ class RelayBot(discord.Client):
         non_audio = [p for p in attach_paths if not is_audio(p)]
         attach_block = ""
         if non_audio:
-            lines = [f"- `{p}`" for p in non_audio]
+            lines = [
+                f"- `{p}`" + (
+                    " (downscaled copy for reading; the full-res original "
+                    "is in the same folder, same name minus `-readable`, "
+                    "original extension)"
+                    if p.stem.endswith("-readable") else ""
+                )
+                for p in non_audio
+            ]
             attach_block = (
                 "\n\n**Attached files** (saved locally, you can `Read` "
                 "them directly):\n" + "\n".join(lines)
@@ -1000,12 +1043,23 @@ async def _kanban_loop(clients: list[RelayBot]) -> None:
         closed = kanban.get(card["id"])
         if closed and closed["status"] == "running":
             ok = bool(text.strip()) and not outcome.get("error")
+            # `text` is the worker's final reply (relay strips the trace),
+            # so this fallback summary is its answer, not its tool log.
+            summary = text.strip()[:3900] or "(no output)"
+            if not outcome.get("reply_complete", True):
+                # No final message (max_turns mid-work): `text` is progress
+                # notes, not an answer. Fail it so the requester re-plans
+                # instead of reading "done" (2026-10-01).
+                note = outcome.get("last_note") or "(none)"
+                ok = False
+                summary = (f"Worker {incomplete_notice(outcome)}\n"
+                           f"Last note: {note[:600]}{'…' if len(note) > 600 else ''}")
             closed = kanban.complete(card["id"], "done" if ok else "failed",
-                                     text.strip()[:3000] or "(no output)") or closed
+                                     summary) or closed
         if closed and closed["status"] in kanban.TERMINAL:
             icon = {"done": "✅", "blocked": "⛔", "failed": "❌"}[closed["status"]]
             await _notice(agent, f"{icon} **{closed['id']}** {closed['status']}: "
-                                 f"{(closed.get('summary') or '')[:1500]}")
+                                 f"{kanban._clip(closed.get('summary') or '', 1500)}")
             await asyncio.to_thread(_mirror, closed)
 
     running: dict[str, asyncio.Task] = {}

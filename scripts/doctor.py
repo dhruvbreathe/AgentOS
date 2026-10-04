@@ -205,8 +205,10 @@ def check_cron_runs(rep: AgentReport, agent_name: str, tasks_dir: Path) -> None:
     """
     if not tasks_dir.exists():
         return
+    # "INCOMPLETE run": cron_trigger's marker for a run that never wrote its
+    # final message (usually max_turns). Keep in sync with cron_trigger.py.
     fail_sig = ("exit code 1", "ProcessError", "Traceback (most recent call last)",
-                "Not logged in", "ModuleNotFoundError")
+                "Not logged in", "ModuleNotFoundError", "INCOMPLETE run")
     # Markers that begin a single cron run — scope failure detection to the
     # LAST run only, so a fix shows green on the next successful fire instead
     # of lingering until old tracebacks scroll out of the window.

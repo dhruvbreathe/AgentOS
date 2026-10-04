@@ -331,8 +331,19 @@ def worker_prompt(card: dict) -> str:
         + f"\nWhen finished, call `complete_task` with task_id `{card['id']}`, "
         f"status `done` (or `blocked` if you cannot finish, saying exactly what is "
         f"missing), and a summary the requester can act on without re-doing your "
-        f"work: what you did, results, file paths, anything they must decide."
+        f"work: what you did, results, file paths, anything they must decide. "
+        f"If you skip `complete_task`, your final message (the text after your "
+        f"last tool call) becomes the summary, so make that message the answer."
     )
+
+
+def _clip(text: str, limit: int) -> str:
+    """Trim to `limit` chars, saying so. A silent cut reads to the requester
+    as the worker stopping mid-thought (2026-09-30)."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n  …(truncated; full text on the card via task_status)"
 
 
 def wake_prompt(batch: dict) -> str:
@@ -340,7 +351,7 @@ def wake_prompt(batch: dict) -> str:
     for t in batch["tasks"]:
         lines.append(
             f"- **{t['id']}** @{t['to_agent']} ({t['status']}): {t['title']}\n"
-            f"  {(t.get('summary') or '(no summary)')[:1500]}"
+            f"  {_clip(t.get('summary') or '(no summary)', 3500)}"
         )
     return (
         "[task board] Results are back for work you delegated:\n\n"

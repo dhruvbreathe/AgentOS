@@ -39,6 +39,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import secret_guard
+
 log = logging.getLogger("session-store")
 
 # Session ids are UUIDs today; accept a slightly wider charset so a future
@@ -160,6 +162,7 @@ class FileSessionStore:
         path = self._path(key)
         if path is None or not entries:
             return
+        entries = secret_guard.redact_entries(entries)  # T-cacd32
         k = str(path)
         async with self._lock_for(k):
             seen = self._seen.get(k)

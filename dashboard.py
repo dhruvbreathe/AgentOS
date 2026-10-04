@@ -80,7 +80,11 @@ def _load_creds() -> tuple[str, str] | None:
     return u, pw
 
 
-if os.environ.get("DASHBOARD_AUTH") == "1":
+# T-cacd32: auth is ON by default (fail closed). The dashboard serves raw
+# trajectories, and a cloudflared/ngrok tunnel arrives from 127.0.0.1, so a
+# "localhost only" assumption does not hold. Opt out explicitly with
+# DASHBOARD_AUTH=0 for a strictly local, untunnelled run.
+if os.environ.get("DASHBOARD_AUTH", "1") != "0":
     import base64
     from fastapi import Request
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -241,7 +245,10 @@ def _read_trajectory_events(path: Path, limit: int = 50) -> list[dict]:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return events[-limit:] if limit else events
+    events = events[-limit:] if limit else events
+    # T-cacd32: pre-guard trajectories still hold .env values; never serve them.
+    import secret_guard
+    return [secret_guard.redact(e) for e in events]
 
 
 def _read_active_tasks(agent: str) -> list[dict]:

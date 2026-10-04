@@ -35,6 +35,7 @@ from claude_agent_sdk import (
 )
 
 import quota_state
+import secret_guard
 from agent_loader import AgentConfig
 from agent_tools import build_comms_server
 from text_lint import sanitize as _strip_emdash
@@ -95,6 +96,10 @@ class DiscordMessageSink(Sink):
         # first element is the placeholder we were handed; subsequent ones
         # are sent via channel.send as continuations land.
         self.messages = [message]
+        # Overflow messages deleted at finalize. Still count as "ours" for
+        # the buried-reply check: channel.last_message_id isn't updated on
+        # delete, so a retired tail would otherwise trigger a false pointer.
+        self._retired_ids: set = set()
         self.edit_interval = edit_interval
         self.max_length = max_length
         self.continuation = continuation_marker
@@ -150,6 +155,22 @@ class DiscordMessageSink(Sink):
                     )
                     break
                 return  # streaming tick — skip this flush, try again next tick
+        # The final reply is usually much shorter than the streamed trace,
+        # which may have spilled into overflow messages. Retire those so
+        # stale trace chunks don't sit under the answer.
+        if finalizing and len(self.messages) > len(chunks):
+            surplus = self.messages[len(chunks):]
+            self.messages = self.messages[:len(chunks)]
+            for msg in surplus:
+                self._retired_ids.add(msg.id)
+                try:
+                    await msg.delete()
+                except Exception as e:
+                    log.warning("relay finalize: couldn't delete overflow message: %s", e)
+                    try:
+                        await msg.edit(content="-# (progress trace collapsed)")
+                    except Exception:
+                        pass
         # Edit each message to its chunk content.
         empty_placeholder = "*(no output)*" if finalizing else self.continuation
         for msg, chunk in zip(self.messages, chunks):
@@ -182,7 +203,7 @@ class DiscordMessageSink(Sink):
         try:
             channel = self.messages[0].channel
             last_id = getattr(channel, "last_message_id", None)
-            our_ids = {m.id for m in self.messages}
+            our_ids = {m.id for m in self.messages} | self._retired_ids
             buried = last_id is not None and last_id not in our_ids
             long_turn = (
                 time.monotonic() - self._created > self.FINALIZE_PING_AFTER_S
@@ -230,6 +251,7 @@ class TrajectoryLogger:
 
     def _write(self, obj: dict) -> None:
         obj = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **obj}
+        obj = secret_guard.redact(obj)  # T-cacd32: no .env values on disk
         if self._fp is None:
             self._fp = self.path.open("a", encoding="utf-8")
         self._fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -391,6 +413,81 @@ def _block_text(block) -> str | None:
     return None
 
 
+class _ReplyTracker:
+    """Separates the deliverable reply from the progress trace.
+
+    The streamed buffer interleaves narration, 🤔 thinking snippets and 🔧
+    tool lines. Watching that live is useful; delivering it as the answer is
+    not. On 2026-09-30 a cron posted a wall of tool calls ending in a literal
+    `[SILENT]` (the silence check only looked at the start of the buffer),
+    and a task-board result reached its requester as the first 1500 chars of
+    the worker's trace, cut off before the actual answer.
+
+    The reply is the text the agent wrote after its last tool call. If that
+    is empty (turn ended on a tool call), fall back to all text blocks with
+    the trace lines removed. `complete` says which one you got: callers that
+    deliver without a human watching (cron, task board) must not pass the
+    fallback off as a deliverable. On 2026-10-01 a cron that hit max_turns
+    mid chart render posted 1.4K chars of "Checking X now" notes as its
+    report; see incomplete_notice().
+    """
+
+    def __init__(self) -> None:
+        self.tool_calls = 0
+        self._all: list[str] = []
+        self._tail: list[str] = []
+
+    def text(self, t: str | None) -> None:
+        t = (t or "").strip()
+        if t:
+            self._all.append(t)
+            self._tail.append(t)
+
+    def tool(self) -> None:
+        self.tool_calls += 1
+        self._tail = []
+
+    @property
+    def complete(self) -> bool:
+        """True when the turn ended on text, i.e. a final message exists."""
+        return bool(self._tail)
+
+    @property
+    def last_note(self) -> str:
+        """The most recent text block: where an unfinished turn got to."""
+        return self._all[-1] if self._all else ""
+
+    @property
+    def reply(self) -> str:
+        return "\n\n".join(self._tail or self._all)
+
+
+def stopped_early(outcome: dict) -> bool:
+    """The turn was cut off (max_turns, abort, budget) rather than ending on
+    its own. A turn only stops on a tool_use response when something outside
+    the model ends the loop."""
+    return outcome.get("stop_reason") == "tool_use" or outcome.get(
+        "terminal_reason"
+    ) not in (None, "completed")
+
+
+def incomplete_notice(outcome: dict) -> str:
+    """One line for a run that never wrote its final message, built from the
+    run_agent outcome dict. Callers post it INSTEAD of the narration
+    fallback, e.g. "hit max_turns (41/40) before its final message. Trace:
+    `logs/trajectories/...jsonl`"."""
+    terminal = outcome.get("terminal_reason")
+    if terminal == "max_turns":
+        why = (f"hit max_turns ({outcome.get('num_turns') or '?'}/"
+               f"{outcome.get('max_turns') or '?'}) before its final message")
+    elif stopped_early(outcome):
+        why = f"stopped before its final message ({terminal or outcome.get('stop_reason')})"
+    else:
+        why = "ended without a final message"
+    trace = outcome.get("trajectory")
+    return f"{why}." + (f" Trace: `{trace}`" if trace else "")
+
+
 async def run_agent(
     agent: AgentConfig,
     prompt: str,
@@ -429,8 +526,15 @@ async def run_agent(
     {"error": <AssistantMessageError or None>, "is_error": bool,
     "api_error_status": int | None} for classifying the run.
 
-    Returns (final_text, session_id). session_id can be persisted by the
-    caller to resume a conversation in the same Discord thread next time.
+    Returns (final_text, session_id). final_text is the reply only (see
+    _ReplyTracker): the sink streams the full trace while the turn runs,
+    then finalize() replaces it with the reply. The trace stays in the
+    trajectory log. outcome also gets tool_calls, reply_complete (False =
+    no text after the last tool call, so final_text is the narration
+    fallback), last_note, stop_reason, terminal_reason, num_turns,
+    max_turns and trajectory (path relative to the repo root).
+    session_id can be persisted by the caller to resume a conversation in
+    the same Discord thread next time.
     """
     # Work on a per-turn shallow copy, NEVER the cached `agent.options`.
     # `agent_loader.load_all_agents` stores one AgentConfig per channel, so the
@@ -495,7 +599,8 @@ async def run_agent(
     traj = TrajectoryLogger(agent.name, resume_session_id)
     traj.prompt(prompt)
 
-    buffer = ""
+    buffer = ""  # live trace: text + 🤔 + 🔧 lines, streamed to the sink
+    reply = _ReplyTracker()  # the deliverable, returned + finalized
     session_id: str | None = None
     stop_reason: str | None = None
     # Track whether the last assistant message produced any text. When
@@ -537,12 +642,14 @@ async def run_agent(
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         traj.text(block.text)
+                        reply.text(block.text)
                         if (block.text or "").strip():
                             this_round_had_text = True
                     elif isinstance(block, ThinkingBlock):
                         traj.thinking(block.thinking)
                     elif isinstance(block, ToolUseBlock):
                         traj.tool_use(block.name, block.input)
+                        reply.tool()
                     chunk = _block_text(block)
                     if chunk:
                         buffer += chunk
@@ -577,6 +684,7 @@ async def run_agent(
                 # Auto-continue rounds each emit a result: sum the counters.
                 for k in ("duration_ms", "duration_api_ms", "num_turns"):
                     result_meta[k] = result_meta.get(k, 0) + (getattr(msg, k) or 0)
+                result_meta["terminal_reason"] = getattr(msg, "terminal_reason", None)
                 result_meta["usage"] = msg.usage
                 result_meta["model_usage"] = model_usage
                 traj.result(
@@ -614,6 +722,11 @@ async def run_agent(
         # reply. The Claude Agent SDK splits work into rounds capped by
         # max_turns; a routing-heavy turn can burn rounds on tool calls
         # and end before wrapping up. Nudge the model to finish.
+        # NOTE: had_final_text is per drain round ("any text this round"),
+        # so a narrating agent never gets the nudge. Kept as is on purpose
+        # (2026-10-01): gating on reply.complete instead would let every
+        # max_turns death run up to MAX_CONTINUES more rounds of max_turns
+        # each. Needs a cost cap before it changes.
         continues = 0
         while (
             stop_reason == "tool_use"
@@ -628,20 +741,49 @@ async def run_agent(
             )
             await _drain(client)
 
-        # Only surface the warning if we actually have no final text
-        # after auto-continuing. Otherwise the agent wrapped up cleanly
-        # and the footer is noise.
+        # Only surface the warning if the turn still has no final message
+        # (text after its last tool call) after auto-continuing. Before
+        # 2026-10-01 this keyed on had_final_text, so a turn with any
+        # narration at all hit max_turns with no footer.
+        # A tool_use stop means something outside the model ended the loop
+        # (max_turns, abort), so even trailing text in that last message
+        # (text after a tool block) is narration, not a final message.
+        ended_on_text = reply.complete and stop_reason != "tool_use"
         footer = ""
         if (
             stop_reason
             and stop_reason not in ("end_turn", "stop_sequence", None)
-            and not had_final_text
+            and not ended_on_text
         ):
-            footer = (
-                f"\n\n-# ⚠️ stop_reason: `{stop_reason}` — turn ended before a "
-                f"final text reply. Ask me to continue and I'll pick up from here."
+            why = (
+                f"hit max_turns ({result_meta.get('num_turns') or '?'}/"
+                f"{options.max_turns or '?'})"
+                if result_meta.get("terminal_reason") == "max_turns"
+                else f"stop_reason: `{stop_reason}`"
             )
-        final = (buffer.strip() or "*(agent returned no text)*") + footer
+            footer = (
+                f"\n\n-# ⚠️ {why}: turn ended before a final text reply. "
+                f"Ask me to continue and I'll pick up from here."
+            )
+        # Deliver the reply, not the trace (see _ReplyTracker). The live
+        # sink already showed the trace while the turn ran.
+        final = (reply.reply or "*(agent returned no text)*") + footer
+        # What callers need to tell "delivered" from "ran out" (cron_trigger,
+        # the task board). See incomplete_notice().
+        try:
+            _trace = str(traj.path.relative_to(ROOT))
+        except ValueError:
+            _trace = str(traj.path)
+        run_outcome.update({
+            "tool_calls": reply.tool_calls,
+            "reply_complete": ended_on_text,
+            "last_note": reply.last_note,
+            "stop_reason": stop_reason,
+            "terminal_reason": result_meta.get("terminal_reason"),
+            "num_turns": result_meta.get("num_turns"),
+            "max_turns": options.max_turns,
+            "trajectory": _trace,
+        })
         # Deliver BEFORE post-turn telemetry: get_context_usage can take
         # up to 10s and the operator shouldn't wait on it.
         await sink.finalize(final)

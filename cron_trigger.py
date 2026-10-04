@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 import quota_state
 from agent_loader import load_agent
-from relay import CollectingSink, run_agent
+from relay import CollectingSink, incomplete_notice, run_agent, stopped_early
 
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 LABEL_PREFIX = "com.agentos"
@@ -179,12 +179,23 @@ async def _run(agent_name: str, task_name: str) -> int:
         except Exception:
             log.warning("Could not reconcile fallback_model; run may fail")
 
+    max_turns = getattr(agent.options, "max_turns", None)
     prompt = (
         f"[Scheduled task `{task_name}` triggered at "
         f"{datetime.now().isoformat(timespec='seconds')}]\n\n{body}"
         + script_block
-        + "\n\nIf after checking there is genuinely nothing worth posting, reply "
-        "with exactly `[SILENT]` and nothing will be posted."
+        + "\n\nOnly your FINAL message (the text after your last tool call) gets "
+        "posted. Make it the complete deliverable, not progress narration. If you "
+        "already posted the deliverable yourself (e.g. a webhook card), or there is "
+        "genuinely nothing worth posting, make the final message exactly "
+        "`[SILENT]` and nothing will be posted."
+        + (
+            f" This run stops hard at {max_turns} turns (one per tool-call round). "
+            "If it stops before your final message, only a one-line failure "
+            "notice gets posted, so budget turns to land the final message "
+            "well before the cap."
+            if max_turns else ""
+        )
     )
 
     sink = CollectingSink()
@@ -203,13 +214,57 @@ async def _run(agent_name: str, task_name: str) -> int:
             log.error("auth failed on %s/%s: %s", agent.name, task_name, text[:200])
             return 5
 
-        if text.strip().startswith("[SILENT]"):
+        action, out = _final_action(text, outcome)
+        if action == "silent":
             log.info("task %s/%s replied [SILENT]: nothing posted", agent.name, task_name)
             return 0
-        return await _deliver(agent, task_name, text, silent)
+        if action == "notice":
+            # Marker string is in doctor.py's fail signatures, keep in sync.
+            log.warning("task %s/%s INCOMPLETE run: %s\nwithheld narration (tail):\n%s",
+                        agent.name, task_name, out, text[-4000:])
+            return await _deliver(agent, task_name, out, silent) or 6
+        return await _deliver(agent, task_name, out, silent)
     finally:
         if oneshot:
             _cleanup_oneshot(agent_name, task_name, task_file)
+
+
+def _final_action(text: str, outcome: dict) -> tuple[str, str]:
+    """Decide what a finished run delivers: ("post", text), ("silent", "")
+    or ("notice", one line).
+
+    A run with no text after its last tool call has no final message, so
+    `text` is relay's narration fallback ("Pulling Sentry now", "Rendering
+    the chart"). That is never the deliverable. It gets a one-line notice
+    with the trace path instead (Aria, 2026-10-01: daily_crash_triage hit
+    max_turns 41/40 mid render and posted 1.4K chars of notes). The one
+    exception: a run that ended on its own with [SILENT] as its last note
+    still meant silence."""
+    if outcome.get("reply_complete", True):
+        return ("silent", "") if _is_silent(text) else ("post", text)
+    if not stopped_early(outcome) and _is_silent(outcome.get("last_note") or ""):
+        return ("silent", "")
+    return ("notice", "⚠️ " + incomplete_notice(outcome))
+
+
+def _is_silent(text: str) -> bool:
+    """[SILENT] as the reply's first or last non-empty line. run_agent now
+    returns the reply without the trace, but an agent that writes one
+    closing line before the marker ("Card posted.\\n\\n[SILENT]") must still
+    stay silent. Before 2026-09-30 only startswith() was checked, against a
+    buffer that began with tool lines, so [SILENT] never matched after a
+    tool call and the whole trace got posted."""
+    lines = [_bare(ln) for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    return lines[0].startswith("[SILENT]") or lines[-1].endswith("[SILENT]")
+
+
+def _bare(line: str) -> str:
+    """Drop markdown wrapping and trailing punctuation so `[SILENT]` in
+    backticks, **[SILENT]** and "[SILENT]." all count. The prompt itself
+    quotes the marker in backticks, so models echo them (review 2026-10-01)."""
+    return line.strip().strip("`*_ ").rstrip(".!").rstrip("`*_ ")
 
 
 async def _deliver(agent, task_name: str, text: str, silent: bool) -> int:

@@ -216,6 +216,8 @@ def _append_history(agent: str, role: str, content: str,
     }
     if meta:
         rec["meta"] = meta
+    import secret_guard  # T-cacd32: no .env values in web chat history
+    rec = secret_guard.redact(rec)
     with p.open("a") as f:
         f.write(json.dumps(rec) + "\n")
     _touch_thread(agent, thread_id)
